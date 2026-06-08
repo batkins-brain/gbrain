@@ -349,6 +349,17 @@ function classifySync(path: string, opts: SyncableOptions = {}): SyncableReason 
   const segments = path.split('/');
   if (segments.some(p => !pruneDir(p))) return 'pruned-dir';
 
+  // Skip test-fixture markdown. Code repos often contain intentionally
+  // malformed docs under tests/data to exercise validators; those files are
+  // not user knowledge pages and should not make source-wide frontmatter
+  // health fail.
+  if (
+    isMarkdownFilePath(path) &&
+    segments.some((segment, idx) => segment === 'tests' && segments[idx + 1] === 'data')
+  ) {
+    return 'pruned-dir';
+  }
+
   // Skip meta files that aren't pages
   const basename = segments[segments.length - 1] || '';
   if ((SYNC_SKIP_FILES as readonly string[]).includes(basename)) return 'metafile';

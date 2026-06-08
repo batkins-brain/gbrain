@@ -156,4 +156,22 @@ describe('runCycle last_full_cycle_at exit hook', () => {
       expect(new Date(second!).getTime()).toBeGreaterThan(new Date(first!).getTime());
     });
   });
+
+  test('repairs non-object source config before writing timestamp', async () => {
+    await withEnv({ GBRAIN_HOME: gbrainHome }, async () => {
+      await seedSource('epsilon');
+      await engine.executeRaw(
+        `UPDATE sources SET config = '["{}", {"legacy": true}]'::jsonb WHERE id = $1`,
+        ['epsilon'],
+      );
+
+      await runCycle(engine, { brainDir, sourceId: 'epsilon', phases: ['lint'] });
+
+      const sources = await engine.listAllSources();
+      const source = sources.find(x => x.id === 'epsilon')!;
+      expect(Array.isArray(source.config)).toBe(false);
+      expect(typeof source.config?.last_full_cycle_at).toBe('string');
+    });
+  });
+
 });

@@ -60,6 +60,11 @@ describe('isSyncable with strategy', () => {
     expect(isSyncable('ops/migrate.py', { strategy: 'code' })).toBe(false);
     // .raw/ sidecar always skipped
     expect(isSyncable('dir/.raw/code.ts', { strategy: 'code' })).toBe(false);
+    // tests/data markdown fixtures may intentionally contain malformed frontmatter and
+    // are not user knowledge pages, but code fixtures remain syncable for code indexing.
+    expect(isSyncable('tools/foo/tests/data/invalid_bad_yaml.md', { strategy: 'markdown' })).toBe(false);
+    expect(isSyncable('tools/foo/tests/data/fixture.ts', { strategy: 'code' })).toBe(true);
+    expect(isSyncable('tools/foo/tests/data/fixture.ts', { strategy: 'auto' })).toBe(true);
   });
 
   test('include globs whitelist specific patterns', () => {
