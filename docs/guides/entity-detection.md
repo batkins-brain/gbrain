@@ -122,6 +122,19 @@ is_notable(entity):
 | Company mentioned | `brain/companies/{slug}.md` |
 | Media referenced | `brain/media/{type}/{slug}.md` |
 
+### Typed Relations
+
+After the page exists, promote entity mentions into typed edges when the page type and field make the relationship explicit:
+
+- `company` / `companies` on a person page → `works_at`
+- `founded` on a person page → `founded`
+- `investors` on a deal or company page → `invested_in`
+- `attendees` on a meeting page → `attended`
+- `related` / `see_also` on any page → `related_to`
+- Narrative body wikilinks without a stronger field match → `mentions`
+
+The body text still matters. If a mention is only a passing reference, keep it as a narrative link. If the frontmatter says the page is a durable relationship, write the typed edge.
+
 ### The Iron Law of Back-Linking
 
 Every entity mention MUST create a back-link FROM the entity page TO the

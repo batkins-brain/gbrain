@@ -27,12 +27,12 @@ on enrich(entity, trigger):
 
     # Step 3: Determine tier -- scale spend to importance
     tier = classify_tier(entity):
-        # Tier 1 (10-15 API calls): key people, inner circle, business partners,
-        #         portfolio companies. Full pipeline, ALL data sources.
-        # Tier 2 (3-5 API calls): notable people, occasional interactions.
+        # Full dossier (10-15 API calls): key people, inner circle, business
+        #         partners, portfolio companies. Full pipeline, ALL data sources.
+        # Web-enrich (3-5 API calls): notable people, occasional interactions.
         #         Web search + social + brain cross-reference.
-        # Tier 3 (1-2 API calls): minor mentions, everyone else worth tracking.
-        #         Brain cross-reference + social lookup if handle known.
+        # Stub (1-2 API calls): minor mentions, everyone else worth tracking.
+        #         Brain cross-reference + minimal source-only capture.
 
     # Step 4: Run external lookups (priority order, stop when enough signal)
     data = {}
@@ -93,7 +93,7 @@ on enrich(entity, trigger):
 
 ## How to Verify
 
-1. Enrich a Tier 1 person. Run `gbrain get <slug>` and confirm the page has Executive Summary, State, What They Believe, Contact, and Timeline sections populated from multiple sources.
+1. Enrich a Full dossier person. Run `gbrain get <slug>` and confirm the page has Executive Summary, State, What They Believe, Contact, and Timeline sections populated from multiple sources.
 2. Run `gbrain get_raw_data <slug>`. Confirm raw API responses are stored with `sources.{provider}.fetched_at` timestamps.
 3. Run `gbrain get_links <slug>`. Confirm cross-reference links exist to the person's company page, deal pages, and related entities.
 4. Check a page that was enriched AND has a user-written Assessment. Confirm the Assessment section was preserved, not overwritten by API data.

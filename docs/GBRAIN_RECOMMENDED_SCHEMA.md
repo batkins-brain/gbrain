@@ -52,6 +52,49 @@ Every time any signal touches a person or company — meeting, email, tweet, cal
 
 This is what distinguishes an operational brain from Karpathy's research wiki. He describes ingesting sources you manually add. An operational brain goes further — every pipeline (meetings, email, social media, contacts) automatically triggers enrichment on every entity it touches. You never have to remember to update someone's page. The system does it because the plumbing is wired correctly.
 
+### Typed Relations and Auto-Linking
+
+Every entity page should use the same typed edge vocabulary so auto-linking stays predictable across note types. The current canonical set is:
+
+| Relation | Primary meaning | Typical frontmatter fields | Typical syntax |
+| --- | --- | --- | --- |
+| `works_at` | person ↔ company employment or affiliation | `company`, `companies`, `key_people` | `company: companies/acme` or `[[companies/acme]]` |
+| `founded` | person → company founding relationship | `founded` | `founded: companies/acme` |
+| `invested_in` | investor ↔ deal/company investment relation | `investors`, `lead` | `investors: [companies/sequoia]` |
+| `attended` | person → meeting attendance | `attendees` | `attendees: [people/sarah-chen]` |
+| `related_to` | general cross-note adjacency | `related`, `see_also` | `related: [concepts/entity-resolution]` |
+| `mentions` | narrative mention with no stronger typed edge | body wikilinks, loose references | `[[companies/acme]]` |
+| `advises` | advisor ↔ company or project guidance | `advisors`, `advises` | `advisors: [people/alex]` |
+
+The rule of thumb is simple:
+
+1. Use frontmatter for typed, durable edges that belong in compiled truth.
+2. Use body wikilinks for narrative mentions, then let the extractor upgrade them when context supports a stronger relation.
+3. Keep field names aligned with the relation type so the auto-link pass can infer the edge without extra prompt work.
+
+### Sample Auto-Link
+
+```markdown
+---
+title: Sarah Chen
+type: person
+context: business
+tags: [engineering, acme-corp]
+company: companies/acme
+---
+
+# Sarah Chen
+
+VP Engineering at Acme.
+
+---
+
+## Timeline
+- **2026-07-16** | Added to the brain with a typed employment edge.
+```
+
+When `put_page` writes this page, the frontmatter `company: companies/acme` resolves to a typed `works_at` edge automatically. If the body also contains `[[companies/acme]]`, that mention is preserved as narrative context and can be upgraded by the extractor when the surrounding prose is strong enough.
+
 ## Wiring It Into Your Agent
 
 The brain must be referenced in your agent's configuration (AGENTS.md or equivalent) as a hard rule, not a suggestion. Specifically:
@@ -411,9 +454,17 @@ For a new company:
 
 ### Enrichment tiers (don't over-enrich)
 
-- **Tier 1 (key people):** Full pipeline — all sources. Inner circle, business partners, important collaborators.
-- **Tier 2 (notable):** Web search + social + brain cross-reference. People you interact with occasionally.
-- **Tier 3 (minor mentions):** Extract signal from source only, append to timeline. Everyone else worth tracking.
+The canonical names are:
+
+- **Full dossier:** full pipeline across all sources. Inner circle, business partners, important collaborators.
+- **Web-enrich:** web search + social + brain cross-reference. People you interact with occasionally.
+- **Stub:** source-only signal capture. Everyone else worth tracking.
+
+Back-compat mapping:
+
+- Full dossier = old Tier 1
+- Web-enrich = old Tier 2
+- Stub = old Tier 3
 
 A thin page with real interaction data is better than a fat page stuffed with generic web results. Don't waste 10 API calls on someone with no public presence.
 
@@ -505,7 +556,7 @@ These skills contain the *logic* — they decide what to do, then delegate to da
 
 **The enrich skill** is the most important orchestration skill. It decides:
 - Is this a CREATE (new page) or UPDATE (new signal)?
-- What tier is this entity? (determines which data sources to call)
+- Is this a Stub, Web-enrich, or Full dossier page? (determines which data sources to call)
 - What signal types to extract from the source material?
 - Which data source skills to call, in what order?
 - How to write the results to the brain?
@@ -519,7 +570,7 @@ Other orchestration skills:
 
 These are the user-facing skills that chain multiple orchestration and data source skills together:
 - **Morning briefing** — reads calendar + tasks + brain state + recent signals → produces a briefing
-- **Person research** — given a name, runs full Tier 1 enrichment and presents the result
+- **Person research** — given a name, runs a Full dossier enrichment pass and presents the result
 - **Weekly brain maintenance** — runs lint, flags stale pages, suggests enrichment targets
 
 ### How they compose
@@ -528,7 +579,7 @@ These are the user-facing skills that chain multiple orchestration and data sour
 User says "tell me about Jane Doe"
   → Agent searches brain (grep/index)
   → Page is thin → calls enrich skill (orchestration)
-    → enrich determines Tier 1
+    → enrich determines Full dossier
     → calls happenstance skill (data source) → gets LinkedIn URL
     → calls crustdata skill (data source) → gets full profile
     → calls exa skill (data source) → finds personal writing
@@ -572,9 +623,9 @@ Webhooks ────────────────┴──────�
 Every arrow into the enrich skill carries a **signal** (the raw information from the source) and an **entity** (the person or company to enrich). The enrich skill:
 
 1. **Checks brain state** — does a page exist? Is it thin?
-2. **Determines tier** — Tier 1 (full pipeline), Tier 2 (web + social + cross-ref), Tier 3 (source extraction only)
+2. **Determines level** — Full dossier (full pipeline), Web-enrich (web + social + cross-ref), Stub (source extraction only)
 3. **Extracts signal** from the source material (beliefs, motivations, trajectory, facts)
-4. **Calls data source skills** based on tier (each skill is a named, documented module)
+4. **Calls data source skills** based on the enrichment level (each skill is a named, documented module)
 5. **Writes to brain** — CREATE (via RESOLVER.md) or UPDATE (append timeline, update compiled truth)
 6. **Cross-references** — updates all linked entity pages
 7. **Saves raw data** to `.raw/` sidecar

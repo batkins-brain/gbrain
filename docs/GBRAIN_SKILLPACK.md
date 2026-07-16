@@ -34,7 +34,7 @@ Getting data in and keeping it current.
 
 | Guide | What It Covers |
 |-------|---------------|
-| [Enrichment Pipeline](guides/enrichment-pipeline.md) | 7-step protocol, tier system (Tier 1/2/3 by importance) |
+| [Enrichment Pipeline](guides/enrichment-pipeline.md) | 7-step protocol, stub / web-enrich / full dossier ladder (Tier 1/2/3 back-compat) |
 | [Meeting Ingestion](guides/meeting-ingestion.md) | Always pull complete transcript, propagate to all entity pages |
 | [Content & Media Ingestion](guides/content-media.md) | YouTube, social media bundles, PDFs/documents |
 | [Diligence Ingestion](guides/diligence-ingestion.md) | Data room materials: pitch decks, financial models, cap tables |
