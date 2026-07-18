@@ -747,7 +747,16 @@ export function attributeKnob<K extends keyof ModeBundle>(
 // to post-fix lookups. Same one-time global cold-miss pattern as the bumps
 // above (the hash is global, not per-provider); refills within
 // cache.ttl_seconds (3600s default).
-export const KNOBS_HASH_VERSION = 11;
+//
+// bump 11→12 (issue #1, F14b): hard-exclude prefixes + source-boost map now
+// fold into the hash via KnobsHashContext. Pre-fix, changing
+// GBRAIN_SEARCH_EXCLUDE / GBRAIN_SOURCE_BOOST (or per-call
+// exclude_slug_prefixes) did NOT invalidate cache rows, so a row written
+// before an exclude was configured kept serving the excluded (quarantined)
+// content for up to cache.ttl_seconds — and the expansion-ON knob row could
+// leak while the expansion-OFF row, written fresh, looked correctly filtered.
+// Same one-time global cold-miss pattern as the bumps above.
+export const KNOBS_HASH_VERSION = 12;
 
 /**
  * v0.36 (D8 / CDX-2) — second-arg context for the cache key. The
@@ -776,6 +785,22 @@ export interface KnobsHashContext {
    */
   schemaPack?: string;
   schemaPackVersion?: string;
+  /**
+   * v=12 (issue #1 / F14b): retrieval-policy isolation. The resolved
+   * hard-exclude prefix list (defaults ∪ GBRAIN_SEARCH_EXCLUDE ∪ per-call
+   * exclude_slug_prefixes, minus include_slug_prefixes) participates in the
+   * key so a policy change invalidates prior rows instead of serving
+   * now-excluded (e.g. quarantined) content until TTL. Undefined falls back
+   * to the literal 'none' for callers that don't thread policy.
+   */
+  hardExcludes?: string[];
+  /**
+   * v=12 (issue #1 / F14b): resolved source-boost map (defaults merged with
+   * GBRAIN_SOURCE_BOOST). A demotion change re-ranks the result set, so it
+   * must segregate cache rows the same way reranker/floor knobs do.
+   * Undefined falls back to the literal 'default'.
+   */
+  sourceBoosts?: Record<string, number>;
 }
 
 export function knobsHash(
@@ -863,6 +888,17 @@ export function knobsHash(
     // test/model-pricing.test.ts-style drift guards and the mode tests.
     `rel=${knobs.relationalRetrieval ? 1 : 0}`,
     `reld=${knobs.relational_retrieval_depth ?? 2}`,
+    // v=12 additions (issue #1 / F14b, append-only): retrieval policy.
+    // Sorted/canonicalized so map iteration order can't split the key.
+    `hx=${ctx?.hardExcludes?.length ? [...ctx.hardExcludes].sort().join(',') : 'none'}`,
+    `sb=${
+      ctx?.sourceBoosts
+        ? Object.entries(ctx.sourceBoosts)
+          .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+          .map(([k, v]) => `${k}:${v}`)
+          .join(',')
+        : 'default'
+    }`,
   ];
   const h = createHash('sha256');
   h.update(parts.join('|'));

@@ -43,6 +43,7 @@ import {
   SemanticQueryCache,
   loadCacheConfig,
 } from './query-cache.ts';
+import { resolveHardExcludes, resolveBoostMap } from './source-boost.ts';
 
 export const RRF_K = 60;
 const COMPILED_TRUTH_BOOST = 2.0;
@@ -56,6 +57,23 @@ const pendingCacheWrites = new Set<Promise<unknown>>();
  * candidate pool. Fail-open: the warning is best-effort and never breaks search.
  * Mirrors the stampEvidence post-fusion precedent (T4).
  */
+/**
+ * Issue #1 (F14b) — final hard-exclude enforcement.
+ *
+ * The engine-level searchKeyword/searchVector arms already filter excluded
+ * prefixes at SQL level, but results can re-enter the pool AFTER those arms:
+ * alias-hop page injection, two-pass hydrateChunks, the relational recall
+ * arm, and (the observed leak) semantic-cache rows written before the
+ * current exclude policy existed. This filter is the single post-pipeline
+ * enforcement point applied to every return path so no side channel can
+ * surface an excluded (e.g. quarantined) slug. Same startsWith semantics as
+ * buildHardExcludeClause's `slug LIKE prefix || '%'`.
+ */
+export function filterHardExcluded(results: SearchResult[], prefixes: string[]): SearchResult[] {
+  if (prefixes.length === 0 || results.length === 0) return results;
+  return results.filter(r => !prefixes.some(p => r.slug.startsWith(p)));
+}
+
 export async function stampContentFlags(engine: BrainEngine, results: SearchResult[]): Promise<void> {
   if (results.length === 0) return;
   try {
@@ -912,11 +930,23 @@ export async function hybridSearch(
     // ordering means we can't lazy-spread the full opts).
     sourceId: opts?.sourceId,
     sourceIds: opts?.sourceIds,
+    // Issue #1 (F14b): thread per-call exclude/include prefixes through the
+    // explicit rebuild — same drop class as the #861 source-scope leak this
+    // comment block warns about. Engine arms resolve env defaults on their
+    // own, but per-call opts were silently discarded here.
+    exclude_slug_prefixes: opts?.exclude_slug_prefixes,
+    include_slug_prefixes: opts?.include_slug_prefixes,
     // v0.36 (D11): pass the pre-validated descriptor into the engine so
     // it never has to read config. Engines normalize string-or-descriptor
     // via normalizeEngineColumn; the descriptor path is the strict one.
     embeddingColumn: resolvedCol,
   };
+  // Issue #1 (F14b): resolved once per call — feeds the final enforcement
+  // filter on every return path below.
+  const resolvedHardExcludes = resolveHardExcludes(
+    opts?.exclude_slug_prefixes,
+    opts?.include_slug_prefixes,
+  );
   // Track what actually ran for the optional onMeta callback (v0.25.0).
   // Caller leaves onMeta undefined → these flags are computed but never
   // surfaced. Capture wrapper passes a closure to receive the meta and
@@ -1292,10 +1322,13 @@ export async function hybridSearch(
       await runPostFusionStages(engine, fallbackResults, postFusionOpts);
       fallbackResults.sort((a, b) => b.score - a.score);
     }
-    const kwHopped = await applyAliasHop(engine, dedupResults(fallbackResults), query, {
-      sourceId: opts?.sourceId,
-      sourceIds: opts?.sourceIds,
-    });
+    const kwHopped = filterHardExcluded(
+      await applyAliasHop(engine, dedupResults(fallbackResults), query, {
+        sourceId: opts?.sourceId,
+        sourceIds: opts?.sourceIds,
+      }),
+      resolvedHardExcludes,
+    );
     stampEvidence(kwHopped);
     const kwSliced = kwHopped.slice(offset, offset + limit);
     // v0.32.3 search-lite: budget enforcement on the keyword-fallback path too.
@@ -1465,10 +1498,13 @@ export async function hybridSearch(
   // T3 — free-text alias hop. Runs AFTER rerank so a query that is a page's
   // declared chosen name reliably surfaces that page regardless of how the
   // reranker scored body chunks. Fail-open on pre-v110 brains.
-  const aliasHopped = await applyAliasHop(engine, reranked, query, {
-    sourceId: opts?.sourceId,
-    sourceIds: opts?.sourceIds,
-  });
+  const aliasHopped = filterHardExcluded(
+    await applyAliasHop(engine, reranked, query, {
+      sourceId: opts?.sourceId,
+      sourceIds: opts?.sourceIds,
+    }),
+    resolvedHardExcludes,
+  );
 
   // T4 — stamp evidence + create_safety so the agent's don't-duplicate
   // decision keys off WHY a page matched, not a raw blended score. Stamp on
@@ -1628,9 +1664,20 @@ export async function hybridSearchCached(
 
   // Cache key carries the column + provider so different embedding spaces
   // never collide on the same `(source_id, query_text)` row.
+  //
+  // Issue #1 (F14b): the resolved retrieval policy (hard-excludes + boost
+  // map) folds in too, so flipping GBRAIN_SEARCH_EXCLUDE / GBRAIN_SOURCE_BOOST
+  // (or passing per-call exclude/include prefixes) can never be served a row
+  // written under the old policy.
+  const cachedHardExcludes = resolveHardExcludes(
+    opts?.exclude_slug_prefixes,
+    opts?.include_slug_prefixes,
+  );
   const cacheKnobsHash = knobsHash(resolvedForCache, {
     embeddingColumn: resolvedColCached.name,
     embeddingModel: resolvedColCached.embeddingModel,
+    hardExcludes: cachedHardExcludes,
+    sourceBoosts: resolveBoostMap(),
   });
 
   // Cache decision: opts.useCache (explicit) wins over global config; global
@@ -1714,7 +1761,12 @@ export async function hybridSearchCached(
 
       const limit = opts?.limit || 20;
       const offset = opts?.offset || 0;
-      const sliced = hit.results.slice(offset, offset + limit);
+      // Issue #1 (F14b) belt-and-braces: even a same-key row (or a row that
+      // predates the v=12 hash bump surviving via replay tooling) must not
+      // surface excluded slugs. Filter BEFORE the slice so excluded rows
+      // don't consume the page window.
+      const policyFiltered = filterHardExcluded(hit.results, cachedHardExcludes);
+      const sliced = policyFiltered.slice(offset, offset + limit);
 
       // Budget enforcement — same pipeline tail as fresh path.
       const { results: budgeted, meta: budgetMeta } = enforceTokenBudget(sliced, opts?.tokenBudget);
