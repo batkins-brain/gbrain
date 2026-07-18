@@ -228,6 +228,37 @@ describe('extractPageLinks', () => {
     expect(aliceLink!.linkType).toBe('works_at');
   });
 
+  test('typed person frontmatter company edge resolves through the supported frontmatter path', async () => {
+    const resolver = {
+      ...allowAllResolver,
+      resolve: async (name: string, dirHint?: string | string[]) => {
+        if (name === 'acme' && (dirHint === 'companies' || (Array.isArray(dirHint) && dirHint.includes('companies')))) {
+          return 'companies/acme';
+        }
+        return null;
+      },
+    };
+
+    const { candidates, unresolved } = await extractPageLinks(
+      'people/alice',
+      'Alice works at Acme.',
+      { company: 'acme' },
+      'person',
+      resolver,
+    );
+
+    expect(unresolved).toEqual([]);
+    expect(candidates).toEqual([
+      expect.objectContaining({
+        fromSlug: 'people/alice',
+        targetSlug: 'companies/acme',
+        linkType: 'works_at',
+        linkSource: 'frontmatter',
+        originField: 'company',
+      }),
+    ]);
+  });
+
   test('#2011: excerpt window slicing a non-BMP char yields well-formed context', async () => {
     // Reproduce the abort trigger: a markdown ref whose 240-char context window
     // boundary lands inside an emoji's surrogate pair. Pre-fix, the slice kept a
