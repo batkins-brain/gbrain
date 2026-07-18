@@ -10,11 +10,12 @@ that map to each relation, and the fallback behavior for body wikilinks.
 | --- | --- | --- | --- |
 | `works_at` | person ↔ company affiliation | `person`, `company` | `company`, `companies`, `key_people` |
 | `founded` | person → company founding edge | `person` | `founded` |
-| `invested_in` | investor ↔ deal/company investment edge | `company`, `deal` | `investors`, `lead` |
+| `invested_in` | investor ↔ deal/company investment edge | `company`, `deal` | `investors` |
+| `led_round` | lead investor role on a financing round | `deal` | `lead` |
 | `attended` | person → meeting attendance edge | `meeting` | `attendees` |
 | `related_to` | general cross-note adjacency | any note type | `related`, `see_also` |
 | `mentions` | narrative mention with no stronger typed edge | any note type | body wikilinks, prose mentions |
-| `advises` | advisor ↔ company/project guidance edge | `person`, `company` | `advisors`, `advises` |
+| `advises` | advisor ↔ company/project guidance edge | `person`, `company` | — (prose/context inference) |
 
 ## Auto-Linking Order
 
