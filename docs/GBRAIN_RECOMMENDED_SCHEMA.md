@@ -52,6 +52,24 @@ Every time any signal touches a person or company — meeting, email, tweet, cal
 
 This is what distinguishes an operational brain from Karpathy's research wiki. He describes ingesting sources you manually add. An operational brain goes further — every pipeline (meetings, email, social media, contacts) automatically triggers enrichment on every entity it touches. You never have to remember to update someone's page. The system does it because the plumbing is wired correctly.
 
+The canonical enrichment ladder is stub → web-enrich → full dossier; use the names and spend bands from [`docs/ENTITY_ENRICHMENT_TIERS.md`](ENTITY_ENRICHMENT_TIERS.md) when documenting or implementing enrichment behavior.
+
+### Typed Relations and Auto-Linking
+
+Typed frontmatter is how durable edges enter the graph. The current canonical relation vocabulary is:
+
+| Relation | Primary meaning | Typical frontmatter fields | Typical syntax |
+| --- | --- | --- | --- |
+| `works_at` | person ↔ company employment or affiliation | `company`, `companies`, `key_people` | `company: companies/acme-example` |
+| `founded` | person → company founding relationship | `founded` | `founded: companies/acme-example` |
+| `invested_in` | investor ↔ deal/company investment relation | `investors`, `lead` | `investors: [companies/sequoia-example]` |
+| `attended` | person → meeting attendance | `attendees` | `attendees: [people/alice-example]` |
+| `related_to` | general cross-note adjacency | `related`, `see_also` | `related: [concepts/entity-resolution]` |
+| `mentions` | narrative mention with no stronger typed edge | body wikilinks, loose references | `[[companies/acme-example]]` |
+| `advises` | advisor ↔ company or project guidance | `advisors`, `advises` | `advisors: [people/alice-example]` |
+
+Use frontmatter for typed edges, and use body wikilinks for narrative mentions. A `company` field on a person page should be treated as a `works_at` edge. If the prose only signals a loose reference, keep it as `mentions`.
+
 ## Wiring It Into Your Agent
 
 The brain must be referenced in your agent's configuration (AGENTS.md or equivalent) as a hard rule, not a suggestion. Specifically:

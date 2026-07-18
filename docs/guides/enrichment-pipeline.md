@@ -1,7 +1,7 @@
 # Enrichment Pipeline
 
 ## Goal
-Enrich brain pages from external APIs with tiered spend -- full pipeline for key people, light touch for passing mentions, raw data preserved for auditability.
+Enrich brain pages from external APIs with a canonical tier ladder -- stub, web-enrich, and full dossier -- while preserving raw data for auditability.
 
 ## What the User Gets
 Without this: brain pages are thin shells with only what the user manually typed, API calls are wasted on nobodies, and enrichment data vanishes after the agent session ends. With this: key people have rich, multi-source portraits; spend scales to importance; raw API responses are preserved for re-processing; and cross-references connect the entire graph.
@@ -27,12 +27,12 @@ on enrich(entity, trigger):
 
     # Step 3: Determine tier -- scale spend to importance
     tier = classify_tier(entity):
-        # Tier 1 (10-15 API calls): key people, inner circle, business partners,
-        #         portfolio companies. Full pipeline, ALL data sources.
-        # Tier 2 (3-5 API calls): notable people, occasional interactions.
-        #         Web search + social + brain cross-reference.
-        # Tier 3 (1-2 API calls): minor mentions, everyone else worth tracking.
-        #         Brain cross-reference + social lookup if handle known.
+        # Full dossier (10-15 API calls): key people, inner-circle collaborators,
+        #         and important companies. Full pipeline, all data sources.
+        # Web-enrich (3-5 API calls): notable people and companies with enough
+        #         signal for background research. Web + social + brain cross-reference.
+        # Stub (1-2 API calls): minor mentions and low-signal pages.
+        #         Brain cross-reference + minimal safe capture.
 
     # Step 4: Run external lookups (priority order, stop when enough signal)
     data = {}
@@ -93,7 +93,7 @@ on enrich(entity, trigger):
 
 ## How to Verify
 
-1. Enrich a Tier 1 person. Run `gbrain get <slug>` and confirm the page has Executive Summary, State, What They Believe, Contact, and Timeline sections populated from multiple sources.
+1. Enrich a Full dossier person. Run `gbrain get <slug>` and confirm the page has Executive Summary, State, What They Believe, Contact, and Timeline sections populated from multiple sources.
 2. Run `gbrain get_raw_data <slug>`. Confirm raw API responses are stored with `sources.{provider}.fetched_at` timestamps.
 3. Run `gbrain get_links <slug>`. Confirm cross-reference links exist to the person's company page, deal pages, and related entities.
 4. Check a page that was enriched AND has a user-written Assessment. Confirm the Assessment section was preserved, not overwritten by API data.
