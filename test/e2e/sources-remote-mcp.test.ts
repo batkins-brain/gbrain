@@ -30,6 +30,7 @@ const BASE = `http://localhost:${PORT}`;
 const FIXTURE_DIR = join(tmpdir(), `gbrain-e2e-sources-${process.pid}`);
 const GBRAIN_HOME = join(FIXTURE_DIR, 'gbrain-home');
 const FAKE_GIT_DIR = join(FIXTURE_DIR, 'fake-git');
+const LOCAL_ONLY_PATH = join(FIXTURE_DIR, 'local-only-source');
 const TEST_URL = 'https://github.com/example-org/test-repo';
 
 function writeFakeGit(): void {
@@ -40,10 +41,12 @@ function writeFakeGit(): void {
   const script = `#!/usr/bin/env bash
 has_clone=0
 has_remote_get_url=0
+repo_path=""
 for ((i=1; i<=$#; i++)); do
   arg="\${!i}"
   next_idx=$((i+1))
   next="\${!next_idx:-}"
+  if [ "$arg" = "-C" ]; then repo_path="$next"; fi
   if [ "$arg" = "clone" ]; then has_clone=1; fi
   if [ "$arg" = "remote" ] && [ "$next" = "get-url" ]; then has_remote_get_url=1; fi
 done
@@ -58,6 +61,7 @@ MD
   exit 0
 fi
 if [ "$has_remote_get_url" = "1" ]; then
+  if [ -f "$repo_path/.no-origin" ]; then exit 1; fi
   echo "${TEST_URL}"
   exit 0
 fi
@@ -273,6 +277,29 @@ describeE2E('sources-remote-mcp E2E (gstack /setup-gbrain Path 4)', () => {
     const result = await callMcp(token!, 'sources_status', { id: 'e2e-yc-artifacts' });
     expect(result.clone_state).toBe('healthy');
     expect(result.remote_url).toBe(TEST_URL);
+  });
+
+  test('sources_status reports clone_state=no-remote for a valid local-only checkout', async () => {
+    // Arrange: register a real on-disk checkout with no configured remote.
+    // The sentinel makes fake git emulate that repository state without
+    // contacting a network remote.
+    mkdirSync(join(LOCAL_ONLY_PATH, '.git'), { recursive: true });
+    writeFileSync(join(LOCAL_ONLY_PATH, '.no-origin'), '');
+    const { getConn } = await import('./helpers.ts');
+    const sql = getConn();
+    await sql.unsafe(
+      `INSERT INTO sources (id, name, local_path, config)
+       VALUES ($1, $2, $3, '{}'::jsonb)`,
+      ['e2e-local-only', 'e2e-local-only', LOCAL_ONLY_PATH],
+    );
+
+    // Act: traverse the real HTTP + OAuth + MCP dispatch path.
+    const result = await callMcp(token!, 'sources_status', { id: 'e2e-local-only' });
+
+    // Assert: the public MCP contract preserves the diagnostic distinction.
+    expect(result.id).toBe('e2e-local-only');
+    expect(result.clone_state).toBe('no-remote');
+    expect(result.remote_url).toBeNull();
   });
 
   test('sources_list surfaces remote_url for the new source', async () => {
