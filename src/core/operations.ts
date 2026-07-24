@@ -3848,7 +3848,8 @@ const sources_status: Operation = {
   name: 'sources_status',
   description:
     'Per-source diagnostic. Returns clone_state ("healthy" | "missing" | ' +
-    '"not-a-dir" | "no-git" | "url-drift" | "corrupted" | "not-applicable") ' +
+    '"not-a-dir" | "no-git" | "no-remote" | "url-drift" | "corrupted" | ' +
+    '"not-applicable") ' +
     'so a remote MCP caller can diagnose whether the on-disk clone is ' +
     'syncable without SSH access to the brain host.',
   params: {
