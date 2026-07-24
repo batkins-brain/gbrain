@@ -1556,6 +1556,13 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
               `gbrain sources remove ${opts.sourceId} --confirm-destructive && ` +
               `gbrain sources add ${opts.sourceId} --url ${remoteUrl}`,
           );
+        case 'no-remote':
+          throw new Error(
+            `Source "${opts.sourceId}" at ${repoPath} has no origin remote ` +
+              `although config.remote_url is set. Re-add it with: ` +
+              `gbrain sources remove ${opts.sourceId} --confirm-destructive && ` +
+              `gbrain sources add ${opts.sourceId} --url ${remoteUrl}`,
+          );
         case 'url-drift':
           throw new Error(
             `Source "${opts.sourceId}" clone at ${repoPath} has a remote ` +

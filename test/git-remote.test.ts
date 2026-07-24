@@ -36,6 +36,12 @@ function writeFakeGit(): void {
 mode=$(cat "${FAKE_GIT_MODE}" 2>/dev/null || echo ok)
 case "$mode" in
   fail) exit 1 ;;
+  no-remote)
+    case "$*" in
+      *'remote get-url'*) exit 1 ;;
+      *) exit 0 ;;
+    esac
+    ;;
   url-drift) echo "https://github.com/different/url" ;;
   url-match) echo "https://github.com/expected/url" ;;
   *) ;;
@@ -62,7 +68,7 @@ function clearArgvLog(): void {
   writeFileSync(FAKE_GIT_LOG, '');
 }
 
-function setMode(mode: 'ok' | 'fail' | 'url-drift' | 'url-match'): void {
+function setMode(mode: 'ok' | 'fail' | 'no-remote' | 'url-drift' | 'url-match'): void {
   writeFileSync(FAKE_GIT_MODE, mode);
 }
 
@@ -353,7 +359,7 @@ describe('pullRepo', () => {
 });
 
 // ---------------------------------------------------------------------------
-// validateRepoState — 6-state decision tree
+// validateRepoState — 7-state decision tree
 // ---------------------------------------------------------------------------
 
 describe('validateRepoState', () => {
@@ -378,6 +384,15 @@ describe('validateRepoState', () => {
     const p = join(fixtureDir, 'no-git-dir');
     mkdirSync(p, { recursive: true });
     expect(validateRepoState(p)).toBe('no-git');
+  });
+
+  test("returns 'no-remote' for a valid local-only checkout", async () => {
+    const p = join(fixtureDir, 'local-only-repo');
+    mkdirSync(join(p, '.git'), { recursive: true });
+    setMode('no-remote');
+    await withEnv({ PATH: fakePath() }, async () => {
+      expect(validateRepoState(p)).toBe('no-remote');
+    });
   });
 
   test("returns 'corrupted' when git remote get-url fails", async () => {
