@@ -32,7 +32,7 @@ function writeFakeGit(): void {
   writeFileSync(FAKE_GIT_LOG, '');
   const script = `#!/usr/bin/env bash
 # Fake git for git-remote.test.ts
-{ printf '['; for arg in "$@"; do printf '%s,' "$(printf '%s' "$arg" | jq -Rs .)"; done; printf 'null]\\n'; } >> "${FAKE_GIT_LOG}"
+python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "$@" >> "${FAKE_GIT_LOG}"
 mode=$(cat "${FAKE_GIT_MODE}" 2>/dev/null || echo ok)
 case "$mode" in
   fail) exit 1 ;;
