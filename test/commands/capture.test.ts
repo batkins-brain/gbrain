@@ -177,6 +177,28 @@ describe('capture — local install integration', () => {
     expect(fs.existsSync(onDisk)).toBe(true);
   });
 
+  test('explicit mixed-case quarantine slug is normalized across page and chunks', async () => {
+    const logCaptured: string[] = [];
+    const origLog = console.log;
+    console.log = (...args: unknown[]) => logCaptured.push(args.map(String).join(' '));
+    try {
+      await runCapture(engine, [
+        '--slug', 'quarantine/tan-591/20260724T230000Z',
+        '--quiet',
+        'Synthetic quarantine slug regression probe',
+      ]);
+    } finally {
+      console.log = origLog;
+    }
+
+    expect(logCaptured[0]).toBe('quarantine/tan-591/20260724t230000z');
+    const page = await engine.getPage('quarantine/tan-591/20260724t230000z');
+    expect(page).not.toBeNull();
+    const chunks = await engine.getChunks('quarantine/tan-591/20260724t230000z');
+    expect(chunks.length).toBeGreaterThan(0);
+    expect(fs.existsSync(path.join(brainDir, 'quarantine/tan-591/20260724t230000z.md'))).toBe(true);
+  });
+
   test('default slug is inbox/YYYY-MM-DD-<hash8> when --slug not provided', async () => {
     const logCaptured: string[] = [];
     const origLog = console.log;
