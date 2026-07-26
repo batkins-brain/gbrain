@@ -1,0 +1,275 @@
+/**
+ * TAN-610 graph/backlink acceptance harness.
+ *
+ * Pure read-only scoring over deterministic graph fixtures. Measures:
+ *   - valid outgoing links
+ *   - incoming backlinks
+ *   - typed relations
+ *   - unresolved targets
+ *   - broken references
+ *   - duplicate edges
+ *   - cross-source ambiguity
+ *   - authority-lifecycle compliance
+ *
+ * The harness supports two views:
+ *   1. dry-run: evaluate the expected graph from fixture rows only.
+ *   2. live-read-only: evaluate the graph as currently stored in the engine.
+ *
+ * It never mutates the DB and it does not run extraction/backfill.
+ */
+
+export type GraphRelationType =
+  | 'works_at'
+  | 'advises'
+  | 'invested_in'
+  | 'attended'
+  | 'mentions'
+  | 'source'
+  | 'successor_of';
+
+export interface GraphFixtureNode {
+  slug: string;
+  type: 'person' | 'company' | 'project' | 'advisor' | 'archive' | 'source';
+  title: string;
+  source_id: string;
+  authority_state?: 'active' | 'archived' | 'retired';
+  successor_slug?: string;
+}
+
+export interface GraphFixtureEdge {
+  from: string;
+  to: string;
+  type: GraphRelationType;
+  /** Provenance/source scope for same-source edges. */
+  source_id: string;
+  /** Explicit endpoint scopes for legitimate cross-source edges. */
+  from_source_id?: string;
+  to_source_id?: string;
+  evidence?: string;
+}
+
+export interface GraphFixtureRow {
+  kind: 'node' | 'edge';
+  node?: GraphFixtureNode;
+  edge?: GraphFixtureEdge;
+}
+
+export interface GraphGraphEdge extends GraphFixtureEdge {
+  from_type?: GraphFixtureNode['type'];
+  to_type?: GraphFixtureNode['type'];
+}
+
+export interface GraphGraphSnapshot {
+  nodes: GraphFixtureNode[];
+  edges: GraphGraphEdge[];
+}
+
+export interface GraphMetricCounts {
+  valid_outgoing: number;
+  incoming_backlinks: number;
+  typed_relations: number;
+  unresolved_targets: number;
+  broken_references: number;
+  duplicate_edges: number;
+  cross_source_ambiguity: number;
+  authority_lifecycle_compliance: number;
+}
+
+export interface GraphComparison {
+  metric: keyof GraphMetricCounts;
+  dry_run: number;
+  live_read_only: number;
+  delta: number;
+}
+
+export interface GraphIntegrationReport {
+  schema_version: 1;
+  fixture_name: string;
+  dry_run: GraphMetricCounts;
+  live_read_only?: GraphMetricCounts | null;
+  comparisons: GraphComparison[];
+  coverage: {
+    dry_run_edges: number;
+    live_read_only_edges?: number;
+    dry_run_nodes: number;
+    live_read_only_nodes?: number;
+  };
+  notes: string[];
+}
+
+export interface GraphIntegrationAdapter {
+  readSnapshot(): Promise<GraphGraphSnapshot>;
+}
+
+export interface LiveGraphNodeRow {
+  slug: string;
+  type: string;
+  title: string;
+  source_id: string;
+  frontmatter?: string | Record<string, unknown> | null;
+}
+
+export interface LiveGraphEdgeRow {
+  from_slug: string;
+  to_slug: string;
+  link_type: string;
+  from_source_id: string;
+  to_source_id: string;
+  evidence?: string | null;
+}
+
+export function parseGraphFixtureJsonl(text: string): GraphFixtureRow[] {
+  const rows: GraphFixtureRow[] = [];
+  for (const raw of text.split('\n')) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#') || line.startsWith('//')) continue;
+    rows.push(JSON.parse(line) as GraphFixtureRow);
+  }
+  return rows;
+}
+
+export function buildSnapshot(rows: GraphFixtureRow[]): GraphGraphSnapshot {
+  const nodes: GraphFixtureNode[] = [];
+  const edges: GraphGraphEdge[] = [];
+  for (const row of rows) {
+    if (row.kind === 'node' && row.node) nodes.push(row.node);
+    if (row.kind === 'edge' && row.edge) edges.push(row.edge);
+  }
+  return { nodes, edges };
+}
+
+function countBy<T>(items: T[], keyFn: (item: T) => string): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const item of items) {
+    const key = keyFn(item);
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  return counts;
+}
+
+function metricCounts(snapshot: GraphGraphSnapshot): GraphMetricCounts {
+  const nodesBySlug = new Map<string, GraphFixtureNode[]>();
+  const sourceScopedNodes = new Map<string, Map<string, GraphFixtureNode>>();
+  for (const node of snapshot.nodes) {
+    const candidates = nodesBySlug.get(node.slug) ?? [];
+    candidates.push(node);
+    nodesBySlug.set(node.slug, candidates);
+    const perSource = sourceScopedNodes.get(node.source_id) ?? new Map<string, GraphFixtureNode>();
+    perSource.set(node.slug, node);
+    sourceScopedNodes.set(node.source_id, perSource);
+  }
+
+  const edgeCounts = countBy(
+    snapshot.edges,
+    e => `${e.from_source_id ?? e.source_id}|${e.from}|${e.to_source_id ?? e.source_id}|${e.to}|${e.type}`,
+  );
+  const duplicate_edges = [...edgeCounts.values()].filter(c => c > 1).reduce((sum, c) => sum + (c - 1), 0);
+
+  let valid_outgoing = 0;
+  let incoming_backlinks = 0;
+  let typed_relations = 0;
+  let unresolved_targets = 0;
+  let broken_references = 0;
+  let cross_source_ambiguity = 0;
+  let authority_lifecycle_compliance = 0;
+
+  for (const edge of snapshot.edges) {
+    const fromSource = edge.from_source_id ?? edge.source_id;
+    const toSource = edge.to_source_id ?? edge.source_id;
+    const fromCandidates = nodesBySlug.get(edge.from) ?? [];
+    const toCandidates = nodesBySlug.get(edge.to) ?? [];
+    const fromScoped = sourceScopedNodes.get(fromSource)?.get(edge.from);
+    const toScoped = sourceScopedNodes.get(toSource)?.get(edge.to);
+    const resolved = !!fromScoped && !!toScoped;
+
+    if (resolved) {
+      valid_outgoing++;
+      incoming_backlinks++;
+      typed_relations++;
+    } else {
+      unresolved_targets++;
+      broken_references++;
+    }
+
+    // Ambiguity means endpoint qualification is absent or points at a source
+    // where the slug does not exist while another source does have it. A
+    // deliberately qualified cross-source edge is valid, not ambiguous.
+    const ambiguousQualification =
+      (!edge.from_source_id && fromCandidates.length > 1)
+      || (!edge.to_source_id && toCandidates.length > 1)
+      || (!fromScoped && fromCandidates.length > 0)
+      || (!toScoped && toCandidates.length > 0);
+    if (ambiguousQualification) cross_source_ambiguity++;
+
+    if (fromScoped?.authority_state === 'archived' && fromScoped.successor_slug) {
+      if (toScoped?.slug === fromScoped.successor_slug && toScoped.source_id === fromScoped.source_id) {
+        authority_lifecycle_compliance++;
+      }
+    } else if (resolved && fromScoped?.authority_state === 'active') {
+      authority_lifecycle_compliance++;
+    }
+  }
+
+  return {
+    valid_outgoing,
+    incoming_backlinks,
+    typed_relations,
+    unresolved_targets,
+    broken_references,
+    duplicate_edges,
+    cross_source_ambiguity,
+    authority_lifecycle_compliance,
+  };
+}
+
+export function compareSnapshots(dryRun: GraphGraphSnapshot, live?: GraphGraphSnapshot | null): GraphIntegrationReport {
+  const dry = metricCounts(dryRun);
+  const hasLive = !!live;
+  const liveCounts = live ? metricCounts(live) : null;
+  const comparisons: GraphComparison[] = hasLive
+    ? (Object.keys(dry) as (keyof GraphMetricCounts)[]).map(metric => ({
+        metric,
+        dry_run: dry[metric],
+        live_read_only: liveCounts![metric],
+        delta: liveCounts![metric] - dry[metric],
+      }))
+    : [];
+
+  const notes: string[] = [];
+  if (!hasLive) {
+    notes.push('fixture-only report: live-read-only comparison omitted by default; pass --live-read-only to compare against the engine');
+  } else {
+    if (liveCounts!.broken_references > dry.broken_references) {
+      notes.push('live-read-only view contains additional broken references that a later repair would reduce');
+    }
+    if (liveCounts!.unresolved_targets > dry.unresolved_targets) {
+      notes.push('live-read-only view contains more unresolved targets than the dry-run expectation');
+    }
+    if (liveCounts!.authority_lifecycle_compliance < dry.authority_lifecycle_compliance) {
+      notes.push('live-read-only authority lifecycle coverage trails the dry-run fixture');
+    }
+  }
+
+  return {
+    schema_version: 1,
+    fixture_name: 'graph-integration',
+    dry_run: dry,
+    live_read_only: liveCounts,
+    comparisons,
+    coverage: {
+      dry_run_edges: dryRun.edges.length,
+      dry_run_nodes: dryRun.nodes.length,
+      ...(live ? { live_read_only_edges: live.edges.length, live_read_only_nodes: live.nodes.length } : {}),
+    },
+    notes,
+  };
+}
+
+export async function runGraphIntegrationHarness(
+  fixtureRows: GraphFixtureRow[],
+  adapter: GraphIntegrationAdapter,
+): Promise<GraphIntegrationReport> {
+  const dry = buildSnapshot(fixtureRows);
+  const live = await adapter.readSnapshot();
+  return compareSnapshots(dry, live);
+}
