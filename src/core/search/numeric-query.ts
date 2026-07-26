@@ -19,10 +19,9 @@ function splitQueryTokens(query: string): string[] {
 /**
  * Generate a very small fallback set for compact numeric separators.
  *
- * We only emit the expanded variant when the query contains both a compact
- * 4-digit token and at least one ordinary 2-digit numeric token. That keeps
- * plain numeric lookups like years/IDs untouched while still recovering
- * compact 80/10-style inputs.
+ * A compact token is eligible only when the immediately following two-digit
+ * token repeats its trailing pair: `8010 10` means `80/10/10`. That repeated
+ * tail is the disambiguator which keeps ordinary year/ID phrases unchanged.
  */
 export function buildNumericQueryFallbacks(query: string): string[] {
   const trimmed = query.trim();
@@ -31,12 +30,17 @@ export function buildNumericQueryFallbacks(query: string): string[] {
   const tokens = splitQueryTokens(trimmed);
   if (tokens.length === 0) return [trimmed];
 
-  const hasCompactFourDigitToken = tokens.some(token => /^\d{4}$/.test(token));
-  const hasTwoDigitToken = tokens.some(token => /^\d{2}$/.test(token));
-  if (!hasCompactFourDigitToken || !hasTwoDigitToken) return [trimmed];
+  const expandedTokens = [...tokens];
+  let expandedAny = false;
+  for (let index = 0; index < tokens.length - 1; index += 1) {
+    const compact = tokens[index];
+    const repeatedTail = tokens[index + 1];
+    const match = /^(\d{2})(\d{2})$/.exec(compact);
+    if (!match || !isNumericToken(repeatedTail) || repeatedTail.length !== 2 || match[2] !== repeatedTail) continue;
+    expandedTokens[index] = `${match[1]} ${match[2]}`;
+    expandedAny = true;
+  }
+  if (!expandedAny) return [trimmed];
 
-  const expanded = trimmed.replace(/\b(\d{2})(\d{2})\b/g, '$1 $2');
-  if (expanded === trimmed) return [trimmed];
-
-  return [trimmed, expanded];
+  return [trimmed, expandedTokens.join(' ')];
 }

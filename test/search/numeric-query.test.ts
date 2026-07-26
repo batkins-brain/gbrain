@@ -9,8 +9,11 @@ describe('buildNumericQueryFallbacks', () => {
     ]);
   });
 
-  test('leaves ordinary numeric queries unchanged', () => {
+  test('leaves ordinary numeric and non-repeated mixed queries unchanged', () => {
     expect(buildNumericQueryFallbacks('2026')).toEqual(['2026']);
     expect(buildNumericQueryFallbacks('project 2026')).toEqual(['project 2026']);
+    expect(buildNumericQueryFallbacks('2026 10')).toEqual(['2026 10']);
+    expect(buildNumericQueryFallbacks('layback 2026 10 allocated')).toEqual(['layback 2026 10 allocated']);
+    expect(buildNumericQueryFallbacks('layback 8010 12 allocated')).toEqual(['layback 8010 12 allocated']);
   });
 });
