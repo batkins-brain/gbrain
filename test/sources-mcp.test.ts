@@ -30,10 +30,12 @@ function writeFakeGit(): void {
   const script = `#!/usr/bin/env bash
 has_clone=0
 has_remote_get_url=0
+repo_path=""
 for ((i=1; i<=$#; i++)); do
   arg="\${!i}"
   next_idx=$((i+1))
   next="\${!next_idx:-}"
+  if [ "$arg" = "-C" ]; then repo_path="$next"; fi
   if [ "$arg" = "clone" ]; then has_clone=1; fi
   if [ "$arg" = "remote" ] && [ "$next" = "get-url" ]; then has_remote_get_url=1; fi
 done
@@ -44,6 +46,7 @@ if [ "$has_clone" = "1" ]; then
   exit 0
 fi
 if [ "$has_remote_get_url" = "1" ]; then
+  if [ -f "$repo_path/.no-origin" ]; then exit 1; fi
   echo "https://github.com/example/repo"
   exit 0
 fi
@@ -176,6 +179,33 @@ describe('sources_* handlers — happy path', () => {
       expect(result.id).toBe('mcp-status-test');
       expect(result.clone_state).toBe('healthy');
       expect(result.remote_url).toBe('https://github.com/example/repo');
+    });
+  });
+
+  test('sources_status returns no-remote for a valid local-only checkout', async () => {
+    await withEnv({ GBRAIN_HOME, PATH: fakePath() }, async () => {
+      // Arrange: seed a path-only source whose checkout is valid but has no
+      // origin. The sentinel makes fake git fail `remote get-url origin`
+      // while allowing the fallback `git remote` probe to succeed.
+      const localPath = join(GBRAIN_HOME, 'mcp-local-only');
+      mkdirSync(join(localPath, '.git'), { recursive: true });
+      writeFileSync(join(localPath, '.no-origin'), '');
+      await engine.executeRaw(
+        `INSERT INTO sources (id, name, local_path, config)
+         VALUES ($1, $2, $3, '{}'::jsonb)`,
+        ['mcp-local-only', 'mcp-local-only', localPath],
+      );
+
+      // Act: invoke the registered MCP operation handler.
+      const statusOp = findOp('sources_status');
+      const result = (await statusOp.handler(ctxRemote(['read']), {
+        id: 'mcp-local-only',
+      })) as any;
+
+      // Assert: local-only is a supported state, not repository corruption.
+      expect(result.id).toBe('mcp-local-only');
+      expect(result.clone_state).toBe('no-remote');
+      expect(result.remote_url).toBeNull();
     });
   });
 

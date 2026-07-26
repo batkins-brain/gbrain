@@ -262,12 +262,14 @@ export type RepoState =
   | 'missing'
   | 'not-a-dir'
   | 'no-git'
+  | 'no-remote'
   | 'url-drift'
   | 'corrupted';
 
 /**
  * Classify the on-disk state of a clone. Used by performSync to decide
  * whether to run pull (healthy), re-clone (missing/no-git/not-a-dir),
+ * report an intentionally local-only checkout (no-remote),
  * refuse with corruption error (corrupted), or refuse with rebase-clone
  * hint (url-drift).
  */
@@ -294,6 +296,19 @@ export function validateRepoState(
     });
     remoteUrl = out.toString().trim();
   } catch {
+    // A valid repository with no origin is a supported local-only source,
+    // not object-level corruption. Probe the remote list to distinguish that
+    // case from a broken/unreadable Git checkout.
+    try {
+      const remotes = execFileSync('git', ['-C', repoPath, 'remote'], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 10_000,
+        env: { ...process.env, ...GIT_ENV },
+      }).toString().trim();
+      if (!remotes.split(/\r?\n/).some((name) => name === 'origin')) return 'no-remote';
+    } catch {
+      // Preserve the corruption classification when Git itself is unreadable.
+    }
     return 'corrupted';
   }
 
