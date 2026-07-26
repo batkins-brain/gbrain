@@ -2242,7 +2242,8 @@ FILES
   files verify                       Verify all uploads
 
 EMBEDDINGS
-  embed [<slug>|--all|--stale]       Generate/refresh embeddings
+  embed [<slug>|--all|--stale] [--source ID]
+                                      Generate/refresh embeddings
 
 LINKS
   link <from> <to>                   Create typed link (alias: link-add)
