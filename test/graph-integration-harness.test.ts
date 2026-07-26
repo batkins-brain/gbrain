@@ -75,18 +75,22 @@ describe('graph-integration harness', () => {
     expect(log.mock.calls.flat().join('\n')).toContain('live-read-only: omitted');
   });
 
-  test('--live-read-only CLI executes live readSnapshot path', async () => {
+  test('--live-read-only requires --source and scopes SQL by source', async () => {
     const fixturePath = Bun.pathToFileURL('/tmp/tan610-fixture-live.jsonl').pathname;
     await Bun.write(fixturePath, FIXTURE);
-    const executeRaw = mock(async (sql: string) => {
+    const executeRaw = mock(async (sql: string, params: unknown[]) => {
+      expect(params).toEqual(['24-105']);
       if (sql.includes('FROM pages')) {
+        expect(sql).toContain('WHERE p.source_id = $1');
+        expect(sql).toContain('SELECT l.to_page_id');
         return [
-          { slug: 'people/alice-example', type: 'person', title: 'Alice Example', source_id: 'default', frontmatter: { source_id: 'default', authority_state: 'active' } },
-          { slug: 'companies/acme-example', type: 'company', title: 'Acme Example', source_id: 'default', frontmatter: { source_id: 'default', authority_state: 'active' } },
+          { slug: 'source/24-105-root', type: 'source', title: '24-105 Root', source_id: '24-105', frontmatter: { source_id: '24-105', authority_state: 'active' } },
+          { slug: 'source/24-105-target', type: 'source', title: '24-105 Target', source_id: 'shared', frontmatter: { source_id: 'shared', authority_state: 'active' } },
         ];
       }
+      expect(sql).toContain('WHERE fp.source_id = $1');
       return [
-        { from_slug: 'people/alice-example', to_slug: 'companies/acme-example', link_type: 'works_at', from_source_id: 'default', to_source_id: 'default', evidence: 'live' },
+        { from_slug: 'source/24-105-root', to_slug: 'source/24-105-target', link_type: 'source', from_source_id: '24-105', to_source_id: 'shared', evidence: 'live' },
       ];
     });
     const engine = { executeRaw } as any;
@@ -94,12 +98,33 @@ describe('graph-integration harness', () => {
     const originalLog = console.log;
     console.log = log as any;
     try {
-      await runEvalGraphIntegration(engine, [fixturePath, '--live-read-only']);
+      await runEvalGraphIntegration(engine, [fixturePath, '--live-read-only', '--source', '24-105']);
     } finally {
       console.log = originalLog;
     }
     expect(executeRaw).toHaveBeenCalledTimes(2);
-    expect(log.mock.calls.flat().join('\n')).toContain('coverage: dry nodes=');
-    expect(log.mock.calls.flat().join('\n')).not.toContain('fixture-only default');
+    expect(log.mock.calls.flat().join('\n')).toContain('source=24-105');
+    expect(log.mock.calls.flat().join('\n')).toContain('live-read-only source scope: 24-105');
+  });
+
+  test('--live-read-only without --source is rejected before SQL', async () => {
+    const fixturePath = Bun.pathToFileURL('/tmp/tan610-fixture-missing-source.jsonl').pathname;
+    await Bun.write(fixturePath, FIXTURE);
+    const executeRaw = mock(async () => {
+      throw new Error('should not run');
+    });
+    const engine = { executeRaw } as any;
+    const error = mock(() => {});
+    const originalError = console.error;
+    const originalExitCode = process.exitCode;
+    console.error = error as any;
+    try {
+      await runEvalGraphIntegration(engine, [fixturePath, '--live-read-only']);
+    } finally {
+      console.error = originalError;
+      process.exitCode = originalExitCode;
+    }
+    expect(executeRaw).toHaveBeenCalledTimes(0);
+    expect(error.mock.calls.flat().join('\n')).toContain('Missing required --source <id> when using --live-read-only.');
   });
 });

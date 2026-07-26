@@ -85,6 +85,7 @@ export interface GraphComparison {
 export interface GraphIntegrationReport {
   schema_version: 1;
   fixture_name: string;
+  live_source_scope?: string | null;
   dry_run: GraphMetricCounts;
   live_read_only?: GraphMetricCounts | null;
   comparisons: GraphComparison[];
@@ -98,7 +99,7 @@ export interface GraphIntegrationReport {
 }
 
 export interface GraphIntegrationAdapter {
-  readSnapshot(): Promise<GraphGraphSnapshot>;
+  readSnapshot(sourceId?: string): Promise<GraphGraphSnapshot>;
 }
 
 export interface LiveGraphNodeRow {
@@ -268,8 +269,12 @@ export function compareSnapshots(dryRun: GraphGraphSnapshot, live?: GraphGraphSn
 export async function runGraphIntegrationHarness(
   fixtureRows: GraphFixtureRow[],
   adapter: GraphIntegrationAdapter,
+  sourceId?: string,
 ): Promise<GraphIntegrationReport> {
   const dry = buildSnapshot(fixtureRows);
-  const live = await adapter.readSnapshot();
-  return compareSnapshots(dry, live);
+  const live = await adapter.readSnapshot(sourceId);
+  const report = compareSnapshots(dry, live);
+  report.live_source_scope = sourceId ?? null;
+  if (sourceId) report.notes.push(`live-read-only source scope: ${sourceId}`);
+  return report;
 }
