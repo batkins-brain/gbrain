@@ -25,6 +25,7 @@ import {
   dispatchGlobalMaintenance,
   isGlobalMaintenanceStale,
   dispatchPerSource,
+  AUTOPILOT_SOURCE_PHASES,
 } from '../src/commands/autopilot-fanout.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 
@@ -95,8 +96,8 @@ describe('dispatchGlobalMaintenance — single-flight gate', () => {
   });
 });
 
-describe('dispatchPerSource — per-source jobs carry NON_GLOBAL phases (no embed)', () => {
-  test('each per-source job sets phases = NON_GLOBAL_PHASES', async () => {
+describe('dispatchPerSource — per-source jobs carry bounded source phases (no embed/takes)', () => {
+  test('each per-source job sets phases = AUTOPILOT_SOURCE_PHASES', async () => {
     const sources = [{ id: 'repo-a', name: 'a', config: {} }, { id: 'repo-b', name: 'b', config: {} }];
     const added: any[] = [];
     const engine = {
@@ -109,8 +110,9 @@ describe('dispatchPerSource — per-source jobs carry NON_GLOBAL phases (no embe
     await dispatchPerSource(engine, queue, { repoPath: '/tmp', slot: 's', timeoutMs: 1, fanoutMax: 4, jsonMode: true, emit: () => {}, log: () => {} });
     expect(added.length).toBe(2);
     for (const j of added) {
-      expect(j.data.phases).toEqual(NON_GLOBAL_PHASES);
+      expect(j.data.phases).toEqual(AUTOPILOT_SOURCE_PHASES);
       expect(j.data.phases).not.toContain('embed');
+      expect(j.data.phases).not.toContain('propose_takes');
     }
   });
 });
