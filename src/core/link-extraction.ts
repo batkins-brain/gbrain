@@ -778,11 +778,15 @@ export const FRONTMATTER_LINK_MAP: FrontmatterFieldMapping[] = [
   // Person pages → companies
   { fields: ['company', 'companies'], pageType: 'person', type: 'works_at', direction: 'outgoing', dirHint: 'companies' },
   { fields: ['founded'], pageType: 'person', type: 'founded', direction: 'outgoing', dirHint: 'companies' },
+  { fields: ['advises'], pageType: 'person', type: 'advises', direction: 'outgoing', dirHint: ['companies', 'projects'] },
   // Company pages (incoming relationships — subject of the verb lives elsewhere)
   { fields: ['key_people'], pageType: 'company', type: 'works_at', direction: 'incoming', dirHint: 'people' },
+  { fields: ['advisors'], pageType: 'company', type: 'advises', direction: 'incoming', dirHint: 'people' },
   { fields: ['partner'], pageType: 'company', type: 'yc_partner', direction: 'incoming', dirHint: 'people' },
   { fields: ['investors'], pageType: 'company', type: 'invested_in', direction: 'incoming',
     dirHint: ['companies', 'funds', 'people'] },
+  // Project pages
+  { fields: ['advisors'], pageType: 'project', type: 'advises', direction: 'incoming', dirHint: 'people' },
   // Deal pages (all incoming — deals are the object)
   { fields: ['investors'], pageType: 'deal', type: 'invested_in', direction: 'incoming',
     dirHint: ['companies', 'funds', 'people'] },
