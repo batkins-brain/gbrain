@@ -419,13 +419,30 @@ export function parsePaceArgs(
 function parseSourceArg(args: string[]): string | undefined {
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
-    if (a === '--source') return args[i + 1];
-    if (a.startsWith('--source=')) return a.slice('--source='.length);
+    if (a === '--source') {
+      const value = args[i + 1];
+      if (!value || value.startsWith('--')) {
+        throw new Error('Missing value for --source');
+      }
+      return value;
+    }
+    if (a.startsWith('--source=')) {
+      const value = a.slice('--source='.length);
+      if (!value) throw new Error('Missing value for --source');
+      return value;
+    }
   }
   return undefined;
 }
 
 export async function runEmbed(engine: BrainEngine, args: string[]): Promise<EmbedResult | undefined> {
+  // Resolve source intent before either inline execution or durable queue
+  // submission so both paths share validation and canonical source identity.
+  const sourceArg = parseSourceArg(args);
+  const sourceId = sourceArg || process.env.GBRAIN_SOURCE
+    ? await resolveSourceId(engine, sourceArg ?? null)
+    : undefined;
+
   // v0.36+ T7: --background submits via Minion queue, returns job_id to
   // stdout, exits. Same semantics in TTY and cron (D9).
   if (args.includes('--background')) {
@@ -436,13 +453,12 @@ export async function runEmbed(engine: BrainEngine, args: string[]): Promise<Emb
       jobName: 'embed',
       paramBuilder: (cleanArgs) => {
         const slugsI = cleanArgs.indexOf('--slugs');
-        const sourceArg = parseSourceArg(cleanArgs);
         return {
           all: cleanArgs.includes('--all'),
           stale: cleanArgs.includes('--stale'),
           dryRun: cleanArgs.includes('--dry-run'),
           slugs: slugsI >= 0 ? cleanArgs.slice(slugsI + 1).filter(a => !a.startsWith('--')) : undefined,
-          sourceId: sourceArg ?? process.env.GBRAIN_SOURCE,
+          sourceId,
           // CX1+CX5: carry explicit pace overrides into the `embed` job payload
           // (the job name CLI --background actually submits). The handler
           // re-resolves env > config > bundle at execution.
@@ -463,10 +479,6 @@ export async function runEmbed(engine: BrainEngine, args: string[]): Promise<Emb
   // GBRAIN_SOURCE scopes embed too. No-source invocations remain
   // brain-wide for backwards compatibility; only explicit/env source intent
   // narrows the target set.
-  const sourceArg = parseSourceArg(args);
-  const sourceId = sourceArg || process.env.GBRAIN_SOURCE
-    ? await resolveSourceId(engine, sourceArg ?? null)
-    : undefined;
   // v0.41.18.0 (A13): --batch-size N, --priority recent, --catch-up flags.
   const batchSizeIdx = args.indexOf('--batch-size');
   const batchSizeRaw = batchSizeIdx >= 0 ? args[batchSizeIdx + 1] : undefined;
@@ -779,7 +791,7 @@ async function embedAll(
 
   // Stdout summary preserved for scripts/tests that grep for counts.
   if (dryRun) {
-    slog(`[dry-run] Would embed ${result.would_embed} chunks across ${pages.length} pages`);
+    slog(`[dry-run] Would embed ${result.would_embed} chunks across ${pages.length} pages${sourceId ? ` in source ${sourceId}` : ''}`);
   } else {
     slog(`Embedded ${result.embedded} chunks across ${pages.length} pages`);
   }

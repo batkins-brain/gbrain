@@ -893,6 +893,21 @@ describe('extractFrontmatterLinks — field-map coverage', () => {
     }
   });
 
+  test('project.advisors → INCOMING advises (person → project)', async () => {
+    const { candidates } = await extractFrontmatterLinks(
+      'projects/gbrain', 'project' as never, { advisors: ['Alice Example'] }, resolver,
+    );
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0]).toMatchObject({
+      fromSlug: 'people/alice-example',
+      targetSlug: 'projects/gbrain',
+      linkType: 'advises',
+      linkSource: 'frontmatter',
+      originSlug: 'projects/gbrain',
+      originField: 'advisors',
+    });
+  });
+
   test('meeting.attendees → INCOMING attended (person → meeting)', async () => {
     const { candidates } = await extractFrontmatterLinks(
       'meetings/2026-04-03', 'meeting' as never, { attendees: ['Pedro', 'Garry'] }, resolver,

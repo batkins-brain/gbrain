@@ -77,4 +77,26 @@ describe('embed source scoping', () => {
     expect(unscoped).toContain('[dry-run] Would embed 5 stale chunks');
     expect(unscoped).not.toContain('in source tf-brain-live-vault');
   });
+
+  test('explicit source scopes all dry-run output', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config)
+       VALUES ('tf-brain-live-vault', 'tf-brain-live-vault', '{"federated":false}'::jsonb)
+       ON CONFLICT (id) DO NOTHING`,
+    );
+    await engine.putPage(
+      'vault-page',
+      { type: 'note', title: 'Vault', compiled_truth: 'vault body' },
+      { sourceId: 'tf-brain-live-vault' },
+    );
+    const scoped = await captureStdout(() =>
+      runEmbed(engine, ['--all', '--dry-run', '--source=tf-brain-live-vault']),
+    );
+    expect(scoped).toContain('across 1 pages in source tf-brain-live-vault');
+  });
+
+  test('missing source values fail closed', async () => {
+    await expect(runEmbed(engine, ['--stale', '--source'])).rejects.toThrow('Missing value for --source');
+    await expect(runEmbed(engine, ['--stale', '--source='])).rejects.toThrow('Missing value for --source');
+  });
 });
