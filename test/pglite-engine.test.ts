@@ -216,6 +216,51 @@ describe('PGLiteEngine: Search', () => {
     expect(results.length).toBe(0);
   });
 
+  test('searchKeyword recalls compact numeric separators on fallback', async () => {
+    await engine.putPage('24-105/rulings/layback-8010-10-allocated', {
+      type: 'ruling',
+      title: 'Layback 8010 10 allocated',
+      compiled_truth: 'Layback 80 10 10 allocated to the project.'
+    });
+    await engine.upsertChunks('24-105/rulings/layback-8010-10-allocated', [
+      { chunk_index: 0, chunk_text: 'Layback 80 10 10 allocated to the project.', chunk_source: 'compiled_truth' },
+    ]);
+
+    const results = await engine.searchKeyword('layback 8010 10 allocated');
+    expect(results.map(r => r.slug)).toContain('24-105/rulings/layback-8010-10-allocated');
+  });
+
+  test('searchKeyword fallback still respects source scope', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config) VALUES ('src-b', 'src-b', '{}'::jsonb) ON CONFLICT DO NOTHING`,
+    );
+    await engine.putPage('24-105/rulings/layback-8010-10-allocated', {
+      type: 'ruling',
+      title: 'Layback 8010 10 allocated',
+      compiled_truth: 'Layback 80 10 10 allocated to the project.'
+    }, { sourceId: 'src-b' });
+    await engine.upsertChunks('24-105/rulings/layback-8010-10-allocated', [
+      { chunk_index: 0, chunk_text: 'Layback 80 10 10 allocated to the project.', chunk_source: 'compiled_truth' },
+    ], { sourceId: 'src-b' });
+
+    const results = await engine.searchKeyword('layback 8010 10 allocated', { sourceId: 'src-b' });
+    expect(results.map(r => r.source_id)).toEqual(['src-b']);
+  });
+
+  test('searchKeywordChunks fallback also works for compact numerics', async () => {
+    await engine.putPage('24-105/rulings/layback-8010-10-allocated-chunk', {
+      type: 'ruling',
+      title: 'Layback 8010 10 allocated chunk',
+      compiled_truth: 'Layback 80 10 10 allocated to the project.'
+    });
+    await engine.upsertChunks('24-105/rulings/layback-8010-10-allocated-chunk', [
+      { chunk_index: 0, chunk_text: 'Layback 80 10 10 allocated to the project.', chunk_source: 'compiled_truth' },
+    ]);
+
+    const results = await engine.searchKeywordChunks('layback 8010 10 allocated');
+    expect(results.map(r => r.slug)).toContain('24-105/rulings/layback-8010-10-allocated-chunk');
+  });
+
   test('tsvector trigger populates search_vector on insert', async () => {
     // Verify the PL/pgSQL trigger fires and content_chunks.search_vector is
     // populated from chunk_text. v0.20.0 Cathedral II Layer 3 moved FTS from
