@@ -818,6 +818,7 @@ describe('extractFrontmatterLinks — field-map coverage', () => {
     'companies/brex': 'companies/brex',
     'companies/sequoia': 'companies/sequoia',
     'companies/benchmark': 'companies/benchmark',
+    'projects/gbrain': 'projects/gbrain',
     'meetings/2026-04-03': 'meetings/2026-04-03',
     'deal/riveter-seed': 'deal/riveter-seed',
   };
@@ -863,6 +864,48 @@ describe('extractFrontmatterLinks — field-map coverage', () => {
       expect(c.originSlug).toBe('companies/stripe');
       expect(c.originField).toBe('key_people');
     }
+  });
+
+  test('company.advisors → INCOMING advises (person → company)', async () => {
+    const { candidates } = await extractFrontmatterLinks(
+      'companies/stripe', 'company' as never, { advisors: ['Alice Example'] }, resolver,
+    );
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0]).toMatchObject({
+      fromSlug: 'people/alice-example',
+      targetSlug: 'companies/stripe',
+      linkType: 'advises',
+      linkSource: 'frontmatter',
+      originSlug: 'companies/stripe',
+      originField: 'advisors',
+    });
+  });
+
+  test('person.advises → outgoing advises to company or project', async () => {
+    const { candidates } = await extractFrontmatterLinks(
+      'people/alice-example', 'person' as never, { advises: ['Stripe', 'Gbrain'] }, resolver,
+    );
+    expect(candidates).toHaveLength(2);
+    expect(candidates.map(c => c.targetSlug).sort()).toEqual(['companies/stripe', 'projects/gbrain']);
+    for (const c of candidates) {
+      expect(c.fromSlug).toBe('people/alice-example');
+      expect(c.linkType).toBe('advises');
+    }
+  });
+
+  test('project.advisors → INCOMING advises (person → project)', async () => {
+    const { candidates } = await extractFrontmatterLinks(
+      'projects/gbrain', 'project' as never, { advisors: ['Alice Example'] }, resolver,
+    );
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0]).toMatchObject({
+      fromSlug: 'people/alice-example',
+      targetSlug: 'projects/gbrain',
+      linkType: 'advises',
+      linkSource: 'frontmatter',
+      originSlug: 'projects/gbrain',
+      originField: 'advisors',
+    });
   });
 
   test('meeting.attendees → INCOMING attended (person → meeting)', async () => {
