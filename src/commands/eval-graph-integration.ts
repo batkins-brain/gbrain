@@ -8,6 +8,7 @@
 
 import type { BrainEngine } from '../core/engine.ts';
 import { readFileSync } from 'fs';
+import { setCliExitVerdict } from '../core/cli-force-exit.ts';
 import {
   buildSnapshot,
   compareSnapshots,
@@ -118,7 +119,7 @@ export async function runEvalGraphIntegration(engine: BrainEngine, args: string[
   }
   if (liveReadOnly && !sourceId) {
     console.error('Missing required --source <id> when using --live-read-only.');
-    process.exitCode = 2;
+    setCliExitVerdict(2);
     return;
   }
 
