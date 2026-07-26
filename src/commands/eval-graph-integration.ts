@@ -50,15 +50,9 @@ function parseArgs(args: string[]): { fixture?: string; json: boolean; fixtureNa
 
 async function readLiveSnapshot(engine: BrainEngine, sourceId: string): Promise<GraphGraphSnapshot> {
   const nodes = await engine.executeRaw<LiveGraphNodeRow>(
-    `SELECT DISTINCT p.slug, p.type, p.title, p.source_id, p.frontmatter
+    `SELECT p.slug, p.type, p.title, p.source_id, p.frontmatter
        FROM pages p
       WHERE p.source_id = $1
-         OR p.id IN (
-              SELECT l.to_page_id
-                FROM links l
-                JOIN pages fp ON fp.id = l.from_page_id
-               WHERE fp.source_id = $1
-           )
       ORDER BY p.slug`,
     [sourceId],
   );
@@ -73,18 +67,32 @@ async function readLiveSnapshot(engine: BrainEngine, sourceId: string): Promise<
       ORDER BY fp.slug, tp.slug, l.link_type`,
     [sourceId],
   );
+  const scopedNodes = nodes.map(n => {
+    const frontmatter = typeof n.frontmatter === 'string' ? JSON.parse(n.frontmatter) : (n.frontmatter ?? {});
+    return {
+      slug: n.slug,
+      type: n.type as any,
+      title: n.title,
+      source_id: String((frontmatter as any).source_id ?? n.source_id ?? 'default'),
+      authority_state: (frontmatter as any).authority_state,
+      successor_slug: (frontmatter as any).successor_slug,
+    };
+  });
+  const scopedKeys = new Set(scopedNodes.map(n => `${n.source_id}\u0000${n.slug}`));
+  const boundaryNodes = edges
+    .filter(e => !scopedKeys.has(`${e.to_source_id}\u0000${e.to_slug}`))
+    .map(e => ({
+      slug: e.to_slug,
+      type: 'external-reference' as any,
+      title: e.to_slug,
+      source_id: e.to_source_id,
+      authority_state: undefined,
+    }));
+  const uniqueBoundaryNodes = [...new Map(boundaryNodes.map(n => [`${n.source_id}\u0000${n.slug}`, n])).values()];
   return {
-    nodes: nodes.map(n => {
-      const frontmatter = typeof n.frontmatter === 'string' ? JSON.parse(n.frontmatter) : (n.frontmatter ?? {});
-      return {
-        slug: n.slug,
-        type: n.type as any,
-        title: n.title,
-        source_id: String((frontmatter as any).source_id ?? n.source_id ?? 'default'),
-        authority_state: (frontmatter as any).authority_state,
-        successor_slug: (frontmatter as any).successor_slug,
-      };
-    }),
+    // External targets are represented only by edge-derived boundary identities;
+    // no out-of-scope page body, title, or frontmatter is loaded.
+    nodes: [...scopedNodes, ...uniqueBoundaryNodes],
     edges: edges.map(e => ({
       from: e.from_slug,
       to: e.to_slug,

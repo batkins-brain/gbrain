@@ -82,10 +82,9 @@ describe('graph-integration harness', () => {
       expect(params).toEqual(['24-105']);
       if (sql.includes('FROM pages')) {
         expect(sql).toContain('WHERE p.source_id = $1');
-        expect(sql).toContain('SELECT l.to_page_id');
+        expect(sql).not.toContain('SELECT l.to_page_id');
         return [
           { slug: 'source/24-105-root', type: 'source', title: '24-105 Root', source_id: '24-105', frontmatter: { source_id: '24-105', authority_state: 'active' } },
-          { slug: 'source/24-105-target', type: 'source', title: '24-105 Target', source_id: 'shared', frontmatter: { source_id: 'shared', authority_state: 'active' } },
         ];
       }
       expect(sql).toContain('WHERE fp.source_id = $1');
