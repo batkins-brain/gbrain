@@ -36,6 +36,15 @@ import { NON_GLOBAL_PHASES, GLOBAL_PHASES, LAST_GLOBAL_AT_KEY } from '../core/cy
 
 const FULL_CYCLE_FLOOR_MIN = 60;
 
+// `propose_takes` is LLM-backed and can exceed the minion worker's
+// lock-renewal/abort window on a large source. Keep it out of the regular
+// per-source maintenance cycle so sync, lint, and backlink reconciliation can
+// complete without taking the whole cycle into cooldown. Takes remain an
+// explicit, separately runnable operation until a bounded scheduler exists.
+export const AUTOPILOT_SOURCE_PHASES = NON_GLOBAL_PHASES.filter(
+  (phase) => phase !== 'propose_takes',
+);
+
 // #2194 fix #2: failure cooldown. A source whose autopilot-cycle keeps
 // failing/timing-out re-dispatches every tick today (only SUCCESS gates
 // dispatch), so the same handful of sources fail and re-fan-out forever — the
@@ -441,7 +450,7 @@ export async function dispatchPerSource(
           // (+ mixed) phases. The brain-wide global phases (embed, orphans,
           // purge, …) run once in autopilot-global-maintenance, not N times
           // concurrently here — the fix for the 4→10GB RSS blowout.
-          phases: NON_GLOBAL_PHASES,
+          phases: AUTOPILOT_SOURCE_PHASES,
         },
         {
           queue: 'default',
