@@ -1,9 +1,9 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { runEmbed } from '../src/commands/embed.ts';
+import { withEnv } from './helpers/with-env.ts';
 
 let engine: PGLiteEngine;
-let originalSource: string | undefined;
 
 async function captureStdout(fn: () => Promise<unknown>): Promise<string> {
   const original = process.stdout.write.bind(process.stdout);
@@ -26,20 +26,16 @@ async function captureStdout(fn: () => Promise<unknown>): Promise<string> {
 }
 
 beforeAll(async () => {
-  originalSource = process.env.GBRAIN_SOURCE;
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
 }, 30000);
 
 afterAll(async () => {
-  if (originalSource === undefined) delete process.env.GBRAIN_SOURCE;
-  else process.env.GBRAIN_SOURCE = originalSource;
   await engine.disconnect();
 });
 
 beforeEach(async () => {
-  delete process.env.GBRAIN_SOURCE;
   await engine.executeRaw('DELETE FROM content_chunks');
   await engine.executeRaw('DELETE FROM pages');
   await engine.executeRaw(`DELETE FROM sources WHERE id != 'default'`);
@@ -68,10 +64,14 @@ describe('embed source scoping', () => {
       { chunk_index: 2, chunk_text: 'vault three', chunk_source: 'compiled_truth' },
     ], { sourceId: 'tf-brain-live-vault' });
 
-    process.env.GBRAIN_SOURCE = 'tf-brain-live-vault';
-    const scoped = await captureStdout(() => runEmbed(engine, ['--stale', '--dry-run']));
-    delete process.env.GBRAIN_SOURCE;
-    const unscoped = await captureStdout(() => runEmbed(engine, ['--stale', '--dry-run']));
+    const scoped = await withEnv(
+      { GBRAIN_SOURCE: 'tf-brain-live-vault' },
+      () => captureStdout(() => runEmbed(engine, ['--stale', '--dry-run'])),
+    );
+    const unscoped = await withEnv(
+      { GBRAIN_SOURCE: undefined },
+      () => captureStdout(() => runEmbed(engine, ['--stale', '--dry-run'])),
+    );
 
     expect(scoped).toContain('[dry-run] Would embed 3 stale chunks in source tf-brain-live-vault');
     expect(unscoped).toContain('[dry-run] Would embed 5 stale chunks');

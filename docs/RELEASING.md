@@ -354,7 +354,7 @@ All GitHub Actions in `.github/workflows/` are pinned to commit SHAs. Before shi
 (`/ship`) or reviewing (`/review`), check for stale pins and update them:
 
 ```bash
-for action in actions/checkout oven-sh/setup-bun actions/upload-artifact actions/download-artifact softprops/action-gh-release gitleaks/gitleaks-action; do
+for action in actions/checkout oven-sh/setup-bun actions/upload-artifact actions/download-artifact softprops/action-gh-release; do
   tag=$(grep -r "$action@" .github/workflows/ | head -1 | grep -o '#.*' | tr -d '# ')
   [ -n "$tag" ] && echo "$action@$tag: $(gh api repos/$action/git/ref/tags/$tag --jq .object.sha 2>/dev/null)"
 done
@@ -432,4 +432,3 @@ Why this over alternatives: adding `garrytan-agents` as a collaborator, or
 flipping the repo-wide "send secrets to fork PRs" toggle, both broaden
 secret distribution to every fork PR from that account or any fork. Moving
 the branch keeps secret scope tight to just the one PR being shipped.
-

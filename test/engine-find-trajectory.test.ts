@@ -24,11 +24,17 @@ import {
 import type { TrajectoryPoint } from '../src/core/engine.ts';
 
 let engine: PGLiteEngine;
+let factEmbeddingDim: number;
 
 beforeAll(async () => {
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
+  const rows = await engine.executeRaw<{ atttypmod: number }>(
+    `SELECT atttypmod FROM pg_attribute
+       WHERE attrelid = 'facts'::regclass AND attname = 'embedding'`,
+  );
+  factEmbeddingDim = rows[0].atttypmod;
 });
 
 afterAll(async () => {
@@ -46,10 +52,10 @@ function vecForMetric(metric: string, offset: number): string {
   // a small perturbation per offset so consecutive same-metric facts
   // are very-similar-but-not-identical (drift score lands between 0 and
   // some small value).
-  const a = new Float32Array(1536);
-  const idx = (metric.charCodeAt(0) + offset) % 1536;
+  const a = new Float32Array(factEmbeddingDim);
+  const idx = (metric.charCodeAt(0) + offset) % factEmbeddingDim;
   a[idx] = 1.0;
-  a[(idx + 1) % 1536] = 0.05 * offset;  // tiny drift between consecutive
+  a[(idx + 1) % factEmbeddingDim] = 0.05 * offset;  // tiny drift between consecutive
   return '[' + Array.from(a).join(',') + ']';
 }
 

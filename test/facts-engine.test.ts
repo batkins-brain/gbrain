@@ -15,11 +15,17 @@ import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 
 let engine: PGLiteEngine;
+let factEmbeddingDim: number;
 
 beforeAll(async () => {
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
+  const rows = await engine.executeRaw<{ atttypmod: number }>(
+    `SELECT atttypmod FROM pg_attribute
+       WHERE attrelid = 'facts'::regclass AND attname = 'embedding'`,
+  );
+  factEmbeddingDim = rows[0].atttypmod;
 });
 
 afterAll(async () => {
@@ -27,7 +33,7 @@ afterAll(async () => {
 });
 
 const vec = (...vals: number[]): Float32Array => {
-  const a = new Float32Array(1536);
+  const a = new Float32Array(factEmbeddingDim);
   for (let i = 0; i < vals.length; i++) a[i] = vals[i];
   return a;
 };
