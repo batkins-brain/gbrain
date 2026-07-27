@@ -11,7 +11,15 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
-import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -296,6 +304,42 @@ describe('phaseBFenceFacts — happy path backfill', () => {
       source_markdown_slug: target.target_markdown_slug,
       row_num: 1,
     });
+  });
+
+  test('does not follow an existing target symlink outside the local source', async () => {
+    const outsideDir = mkdtempSync(join(tmpdir(), 'mig-v0_32_2-outside-'));
+    const outsidePath = join(outsideDir, 'private.md');
+    writeFileSync(outsidePath, 'EXTERNAL PRIVATE CONTENT\n', 'utf-8');
+    mkdirSync(join(brainDir, 'people'), { recursive: true });
+    symlinkSync(outsidePath, join(brainDir, 'people/alice.md'));
+
+    try {
+      await seedLegacyFact({
+        entity_slug: 'people/alice',
+        fact: 'Preserve only this legacy claim',
+      });
+
+      const { manifest } = await __testing.buildTargetPlan(engine);
+      expect(manifest.targets[0]).toMatchObject({
+        original_entity_slug: 'people/alice',
+        disposition: 'quarantine',
+        reason: 'unsafe_target',
+      });
+
+      const r = await __testing.phaseBFenceFacts(engine, OPTS);
+      expect(r.status).toBe('complete');
+      expect(readFileSync(outsidePath, 'utf-8')).toBe('EXTERNAL PRIVATE CONTENT\n');
+
+      const quarantinePath = join(
+        brainDir,
+        `${manifest.targets[0].target_markdown_slug}.md`,
+      );
+      const quarantined = readFileSync(quarantinePath, 'utf-8');
+      expect(quarantined).toContain('Preserve only this legacy claim');
+      expect(quarantined).not.toContain('EXTERNAL PRIVATE CONTENT');
+    } finally {
+      rmSync(outsideDir, { recursive: true, force: true });
+    }
   });
 
   test('dirty guard ignores unrelated changes but blocks an exact target path', () => {

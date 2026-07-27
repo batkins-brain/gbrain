@@ -28,7 +28,18 @@
  * forever; they live in the legacy keyspace permanently.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
+import {
+  closeSync,
+  constants,
+  existsSync,
+  fstatSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from 'node:fs';
 import { join, dirname, resolve, sep } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -193,7 +204,38 @@ function isSafeExistingTarget(localPath: string, entitySlug: string): boolean {
   if (segments.some(segment => segment === '' || segment === '.' || segment === '..')) return false;
   const root = resolve(localPath);
   const candidate = resolve(join(localPath, `${entitySlug}.md`));
-  return candidate.startsWith(`${root}${sep}`) && existsSync(candidate);
+  if (!candidate.startsWith(`${root}${sep}`)) return false;
+  try {
+    const stat = lstatSync(candidate);
+    return stat.isFile() && !stat.isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+function pathEntryExists(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Open an existing migration target without following a symbolic link.
+ * Re-checking at open time closes the plan/read race for symlink swaps.
+ */
+function readRegularFileNoFollow(path: string): string {
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    if (!fstatSync(fd).isFile()) {
+      throw new Error(`migration target is not a regular file: ${path}`);
+    }
+    return readFileSync(fd, 'utf-8');
+  } finally {
+    closeSync(fd);
+  }
 }
 
 function quarantineSlug(sourceId: string, entitySlug: string): string {
@@ -246,7 +288,9 @@ async function buildTargetPlan(
     const localPath = localPathById.get(sourceId)!;
     const safeExisting = isSafeExistingTarget(localPath, originalEntitySlug);
     const originalCandidate = resolve(join(localPath, `${originalEntitySlug}.md`));
-    const unsafeTarget = !originalCandidate.startsWith(`${resolve(localPath)}${sep}`);
+    const unsafeTarget =
+      !originalCandidate.startsWith(`${resolve(localPath)}${sep}`) ||
+      (pathEntryExists(originalCandidate) && !safeExisting);
     const targetMarkdownSlug = safeExisting
       ? originalEntitySlug
       : quarantineSlug(sourceId, originalEntitySlug);
@@ -363,7 +407,7 @@ async function phaseBFenceFacts(
         // Read existing body or stub-create with minimum frontmatter.
         let body: string;
         if (existsSync(filePath)) {
-          body = readFileSync(filePath, 'utf-8');
+          body = readRegularFileNoFollow(filePath);
         } else {
           mkdirSync(dirname(filePath), { recursive: true });
           const prefix = targetMarkdownSlug.split('/')[0];
