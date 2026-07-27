@@ -29,8 +29,9 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join, dirname, resolve, sep } from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 
 import type {
   Migration, OrchestratorOpts, OrchestratorResult, OrchestratorPhaseResult,
@@ -119,6 +120,40 @@ interface SourceLookup {
   local_path: string | null;
 }
 
+export interface MigrationTargetManifestEntry {
+  source_id: string;
+  original_entity_slug: string;
+  target_markdown_slug: string;
+  fact_ids: string[];
+  fact_count: number;
+  target_existed: boolean;
+  disposition: 'existing' | 'quarantine';
+  reason: 'existing_target' | 'missing_target' | 'unsafe_target';
+}
+
+export interface MigrationTargetManifest {
+  version: '0.32.2';
+  legacy_rows: number;
+  unfenceable_rows: number;
+  skipped_no_local_path_rows: number;
+  target_count: number;
+  would_create_count: number;
+  quarantine_count: number;
+  targets: MigrationTargetManifestEntry[];
+}
+
+interface PlannedTarget {
+  sourceId: string;
+  originalEntitySlug: string;
+  targetMarkdownSlug: string;
+  localPath: string;
+  filePath: string;
+  rows: LegacyFactRow[];
+  targetExisted: boolean;
+  disposition: 'existing' | 'quarantine';
+  reason: 'existing_target' | 'missing_target' | 'unsafe_target';
+}
+
 interface PhaseBOutcome {
   scanned: number;
   fenced: number;
@@ -129,14 +164,18 @@ interface PhaseBOutcome {
 }
 
 /**
- * Dirty-tree refusal: mirror src/core/dry-fix.ts behavior. Refuses to
- * write if any source's local_path has uncommitted changes. Dry-run
- * skips this check (no writes happen anyway).
+ * Return true only when one of this migration's exact destination paths is
+ * dirty. Unrelated source-repository changes are deliberately ignored.
  */
-function isLocalPathDirty(localPath: string): boolean {
+function areTargetPathsDirty(localPath: string, targetMarkdownSlugs: string[]): boolean {
+  if (targetMarkdownSlugs.length === 0) return false;
   try {
-    const out = execFileSync('git', ['-C', localPath, 'status', '--porcelain'], {
+    const targetPaths = targetMarkdownSlugs.map(slug => `${slug}.md`);
+    const out = execFileSync('git', [
+      '-C', localPath, 'status', '--porcelain', '--', ...targetPaths,
+    ], {
       encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
       timeout: 10_000,
     });
     return out.trim().length > 0;
@@ -148,6 +187,112 @@ function isLocalPathDirty(localPath: string): boolean {
   }
 }
 
+function isSafeExistingTarget(localPath: string, entitySlug: string): boolean {
+  if (!entitySlug || entitySlug.includes('\\') || entitySlug.includes('\0')) return false;
+  const segments = entitySlug.split('/');
+  if (segments.some(segment => segment === '' || segment === '.' || segment === '..')) return false;
+  const root = resolve(localPath);
+  const candidate = resolve(join(localPath, `${entitySlug}.md`));
+  return candidate.startsWith(`${root}${sep}`) && existsSync(candidate);
+}
+
+function quarantineSlug(sourceId: string, entitySlug: string): string {
+  const digest = createHash('sha256')
+    .update(`${sourceId}\0${entitySlug}`)
+    .digest('hex')
+    .slice(0, 16);
+  return `quarantine/migrations/v0-32-2/${digest}`;
+}
+
+async function buildTargetPlan(
+  engine: BrainEngine,
+): Promise<{ plan: PlannedTarget[]; manifest: MigrationTargetManifest }> {
+  const sources = await engine.executeRaw<SourceLookup>(
+    `SELECT id, local_path FROM sources`,
+  );
+  const localPathById = new Map<string, string | null>();
+  for (const source of sources) localPathById.set(source.id, source.local_path);
+
+  const legacy = await engine.executeRaw<LegacyFactRow>(
+    `SELECT id, source_id, entity_slug, fact, kind, visibility, notability,
+            context, valid_from, valid_until, source, confidence
+       FROM facts
+      WHERE row_num IS NULL
+      ORDER BY source_id, entity_slug, id`,
+  );
+
+  let unfenceableRows = 0;
+  let skippedNoLocalPathRows = 0;
+  const grouped = new Map<string, LegacyFactRow[]>();
+  for (const row of legacy) {
+    if (row.entity_slug === null) {
+      unfenceableRows += 1;
+      continue;
+    }
+    const localPath = localPathById.get(row.source_id);
+    if (!localPath) {
+      skippedNoLocalPathRows += 1;
+      continue;
+    }
+    const key = `${row.source_id}\0${row.entity_slug}`;
+    const rows = grouped.get(key) ?? [];
+    rows.push(row);
+    grouped.set(key, rows);
+  }
+
+  const plan: PlannedTarget[] = [];
+  for (const [key, rows] of grouped) {
+    const [sourceId, originalEntitySlug] = key.split('\0');
+    const localPath = localPathById.get(sourceId)!;
+    const safeExisting = isSafeExistingTarget(localPath, originalEntitySlug);
+    const originalCandidate = resolve(join(localPath, `${originalEntitySlug}.md`));
+    const unsafeTarget = !originalCandidate.startsWith(`${resolve(localPath)}${sep}`);
+    const targetMarkdownSlug = safeExisting
+      ? originalEntitySlug
+      : quarantineSlug(sourceId, originalEntitySlug);
+    const filePath = join(localPath, `${targetMarkdownSlug}.md`);
+    plan.push({
+      sourceId,
+      originalEntitySlug,
+      targetMarkdownSlug,
+      localPath,
+      filePath,
+      rows,
+      targetExisted: existsSync(filePath),
+      disposition: safeExisting ? 'existing' : 'quarantine',
+      reason: safeExisting ? 'existing_target' : unsafeTarget ? 'unsafe_target' : 'missing_target',
+    });
+  }
+  plan.sort((a, b) =>
+    a.sourceId.localeCompare(b.sourceId) ||
+    a.originalEntitySlug.localeCompare(b.originalEntitySlug));
+
+  const targets: MigrationTargetManifestEntry[] = plan.map(target => ({
+    source_id: target.sourceId,
+    original_entity_slug: target.originalEntitySlug,
+    target_markdown_slug: target.targetMarkdownSlug,
+    fact_ids: target.rows.map(row => String(row.id)),
+    fact_count: target.rows.length,
+    target_existed: target.targetExisted,
+    disposition: target.disposition,
+    reason: target.reason,
+  }));
+
+  return {
+    plan,
+    manifest: {
+      version: '0.32.2',
+      legacy_rows: legacy.length,
+      unfenceable_rows: unfenceableRows,
+      skipped_no_local_path_rows: skippedNoLocalPathRows,
+      target_count: targets.length,
+      would_create_count: targets.filter(target => !target.target_existed).length,
+      quarantine_count: targets.filter(target => target.disposition === 'quarantine').length,
+      targets,
+    },
+  };
+}
+
 async function phaseBFenceFacts(
   engine: BrainEngine | null,
   opts: OrchestratorOpts,
@@ -156,18 +301,16 @@ async function phaseBFenceFacts(
     // Dry-run: report what WOULD happen without touching FS or DB.
     if (!engine) return { name: 'fence_facts', status: 'skipped', detail: 'no_brain_configured' };
     try {
-      const counts = await engine.executeRaw<{ n: string }>(
-        `SELECT COUNT(*) AS n FROM facts WHERE row_num IS NULL`,
-      );
-      const total = parseInt(counts[0]?.n ?? '0', 10);
-      const noEntity = await engine.executeRaw<{ n: string }>(
-        `SELECT COUNT(*) AS n FROM facts WHERE row_num IS NULL AND entity_slug IS NULL`,
-      );
-      const noEntityCount = parseInt(noEntity[0]?.n ?? '0', 10);
+      const { manifest } = await buildTargetPlan(engine);
       return {
         name: 'fence_facts',
         status: 'skipped',
-        detail: `dry-run: would fence ${total - noEntityCount} rows; ${noEntityCount} unfenceable (NULL entity_slug)`,
+        detail:
+          `dry-run: legacy_rows=${manifest.legacy_rows} ` +
+          `would_fence=${manifest.legacy_rows - manifest.unfenceable_rows - manifest.skipped_no_local_path_rows} ` +
+          `targets=${manifest.target_count} would_create=${manifest.would_create_count} ` +
+          `quarantine=${manifest.quarantine_count} unfenceable=${manifest.unfenceable_rows} ` +
+          `skipped_no_local_path=${manifest.skipped_no_local_path_rows}`,
       };
     } catch (e) {
       return { name: 'fence_facts', status: 'failed', detail: e instanceof Error ? e.message : String(e) };
@@ -179,66 +322,41 @@ async function phaseBFenceFacts(
   }
 
   try {
-    // Look up all sources + their local_paths.
-    const sources = await engine.executeRaw<SourceLookup>(
-      `SELECT id, local_path FROM sources`,
-    );
-    const localPathById = new Map<string, string | null>();
-    for (const s of sources) localPathById.set(s.id, s.local_path);
+    const { plan, manifest } = await buildTargetPlan(engine);
 
-    // Dirty-tree refusal: check every source's local_path before writing.
-    for (const [id, localPath] of localPathById) {
-      if (localPath && isLocalPathDirty(localPath)) {
+    // Dirty-tree refusal is scoped to this migration's exact destinations.
+    const targetsBySource = new Map<string, { localPath: string; slugs: string[] }>();
+    for (const target of plan) {
+      const entry = targetsBySource.get(target.sourceId) ?? {
+        localPath: target.localPath,
+        slugs: [],
+      };
+      entry.slugs.push(target.targetMarkdownSlug);
+      targetsBySource.set(target.sourceId, entry);
+    }
+    for (const [id, targetSet] of targetsBySource) {
+      if (areTargetPathsDirty(targetSet.localPath, targetSet.slugs)) {
         return {
           name: 'fence_facts',
           status: 'failed',
-          detail: `source "${id}" has uncommitted changes in ${localPath}. Commit or stash, then re-run.`,
+          detail: `source "${id}" has uncommitted changes in a migration destination. Commit or stash the target path, then re-run.`,
         };
       }
     }
 
-    // Walk legacy rows in (source_id, entity_slug) groups for per-page
-    // atomic writes.
-    const legacy = await engine.executeRaw<LegacyFactRow>(
-      `SELECT id, source_id, entity_slug, fact, kind, visibility, notability,
-              context, valid_from, valid_until, source, confidence
-         FROM facts
-        WHERE row_num IS NULL
-        ORDER BY source_id, entity_slug, id`,
-    );
-
     const outcome: PhaseBOutcome = {
-      scanned: legacy.length,
+      scanned: manifest.legacy_rows,
       fenced: 0,
-      skipped_no_entity: 0,
-      skipped_no_local_path: 0,
+      skipped_no_entity: manifest.unfenceable_rows,
+      skipped_no_local_path: manifest.skipped_no_local_path_rows,
       pages_touched: 0,
       failed_pages: [],
     };
 
-    // Group by (source_id, entity_slug) so each page's fence is updated
-    // atomically with all its legacy rows.
-    const groups = new Map<string, LegacyFactRow[]>();
-    for (const row of legacy) {
-      if (row.entity_slug === null) {
-        outcome.skipped_no_entity += 1;
-        continue;
-      }
-      const localPath = localPathById.get(row.source_id);
-      if (!localPath) {
-        outcome.skipped_no_local_path += 1;
-        continue;
-      }
-      const key = `${row.source_id}\0${row.entity_slug}`;
-      const list = groups.get(key) ?? [];
-      list.push(row);
-      groups.set(key, list);
-    }
-
-    for (const [key, group] of groups) {
-      const [sourceId, entitySlug] = key.split('\0');
-      const localPath = localPathById.get(sourceId)!;
-      const filePath = join(localPath, `${entitySlug}.md`);
+    for (const target of plan) {
+      const {
+        targetMarkdownSlug, originalEntitySlug, filePath, rows: group,
+      } = target;
       const tmpPath = `${filePath}.tmp`;
 
       try {
@@ -248,15 +366,18 @@ async function phaseBFenceFacts(
           body = readFileSync(filePath, 'utf-8');
         } else {
           mkdirSync(dirname(filePath), { recursive: true });
-          const prefix = entitySlug.split('/')[0];
+          const prefix = targetMarkdownSlug.split('/')[0];
           const type =
             prefix === 'people'    ? 'person' :
             prefix === 'companies' ? 'company' :
             prefix === 'deals'     ? 'deal' :
             /* fallback */           'concept';
-          const tail = entitySlug.split('/').slice(1).join('/');
-          const title = tail.replace(/[-_/]+/g, ' ').replace(/\b\w/g, c => c.toUpperCase()) || entitySlug;
-          body = `---\ntype: ${type}\ntitle: ${title}\nslug: ${entitySlug}\n---\n\n# ${title}\n`;
+          const title = target.disposition === 'quarantine'
+            ? `Quarantined Legacy Facts ${targetMarkdownSlug.split('/').at(-1)}`
+            : targetMarkdownSlug.split('/').slice(1).join('/')
+                .replace(/[-_/]+/g, ' ').replace(/\b\w/g, c => c.toUpperCase()) ||
+              targetMarkdownSlug;
+          body = `---\ntype: ${type}\ntitle: ${title}\nslug: ${targetMarkdownSlug}\nvisibility: private\n---\n\n# ${title}\n`;
         }
 
         // Append each legacy row, collecting the assigned row_nums.
@@ -311,7 +432,7 @@ async function phaseBFenceFacts(
         const tmpBody = readFileSync(tmpPath, 'utf-8');
         const parsed = parseFactsFence(tmpBody);
         if (parsed.warnings.length > 0) {
-          outcome.failed_pages.push(`${entitySlug} (${parsed.warnings.join('; ')})`);
+          outcome.failed_pages.push(`${targetMarkdownSlug} (${parsed.warnings.join('; ')})`);
           // .tmp stays for inspection; do NOT rename.
           continue;
         }
@@ -321,14 +442,14 @@ async function phaseBFenceFacts(
         for (const a of assignments) {
           await engine.executeRaw(
             `UPDATE facts SET row_num = $1, source_markdown_slug = $2 WHERE id = $3`,
-            [a.row_num, entitySlug, a.id],
+            [a.row_num, targetMarkdownSlug, a.id],
           );
         }
         outcome.fenced += assignments.length;
         outcome.pages_touched += 1;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        outcome.failed_pages.push(`${entitySlug} (${msg})`);
+        outcome.failed_pages.push(`${targetMarkdownSlug} [from ${originalEntitySlug}] (${msg})`);
       }
     }
 
@@ -474,5 +595,7 @@ export const __testing = {
   phaseASchema,
   phaseBFenceFacts,
   phaseCVerify,
-  isLocalPathDirty,
+  buildTargetPlan,
+  areTargetPathsDirty,
+  quarantineSlug,
 };

@@ -10,40 +10,7 @@
 
 import { readFileSync, writeFileSync, renameSync, chmodSync, mkdtempSync, rmSync, existsSync, mkdirSync, appendFileSync } from 'fs';
 import { join } from 'path';
-import { homedir } from 'os';
-
-function home(): string {
-  // `os.homedir()` in Bun caches its initial value and ignores later
-  // `process.env.HOME` mutations, which breaks test isolation and any
-  // workflow that needs to run against a specific $HOME (CI, scripted installs).
-  // Prefer the env var; fall back to the cached OS value. Matches the existing
-  // `src/commands/upgrade.ts` pattern.
-  //
-  // NOTE: prefsDir() and migrationsDir() route through gbrainPath() (which
-  // honors GBRAIN_HOME), so this fallback is only used by code paths that
-  // want $HOME directly (none in this file as of v0.30.3).
-  return process.env.HOME || homedir();
-}
-
-/**
- * GBRAIN_HOME-aware override for the .gbrain directory. When the env var
- * is set, this returns it directly (so the directory is GBRAIN_HOME itself,
- * matching the convention `src/core/config.ts:gbrainPath` enforces).
- * When unset, falls back to `<home>/.gbrain` so legacy callers and the
- * doctor's filesystem-only checks keep working.
- *
- * Without this, `~/.gbrain/migrations/completed.jsonl` is the only path
- * doctor reads on filesystem checks — the test isolation contract that
- * `gbrainPath()` provides for everywhere else doesn't extend here.
- */
-function gbrainDir(): string {
-  const override = process.env.GBRAIN_HOME;
-  if (override) {
-    const trimmed = override.trim();
-    if (trimmed) return trimmed;
-  }
-  return join(home(), '.gbrain');
-}
+import { configDir } from './config.ts';
 
 export type MinionMode = 'always' | 'pain_triggered' | 'off';
 
@@ -79,13 +46,13 @@ export interface CompletedMigrationEntry {
 
 const VALID_MODES: ReadonlyArray<MinionMode> = ['always', 'pain_triggered', 'off'];
 
-// Route preferences + migration ledger paths through gbrainDir() so they
-// honor GBRAIN_HOME for hermetic test isolation. Pre-v0.30.3 these used
-// `$HOME/.gbrain` directly, which leaked the developer's local migration
-// ledger into E2E tests and CI runs even when GBRAIN_HOME was set.
-function prefsDir(): string { return gbrainDir(); }
+// Keep preferences and the migration ledger on the same path contract as
+// engine config: GBRAIN_HOME is a parent directory and configDir() appends
+// `.gbrain`. The former local helper treated GBRAIN_HOME as the .gbrain
+// directory itself, splitting config and ledger state across two locations.
+function prefsDir(): string { return configDir(); }
 function prefsPath(): string { return join(prefsDir(), 'preferences.json'); }
-function migrationsDir(): string { return join(gbrainDir(), 'migrations'); }
+function migrationsDir(): string { return join(configDir(), 'migrations'); }
 function completedJsonlPath(): string { return join(migrationsDir(), 'completed.jsonl'); }
 
 /** Validate that a value is a recognized minion mode. Throws with the allowed list. */

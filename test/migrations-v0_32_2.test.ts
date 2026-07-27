@@ -13,7 +13,8 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { execFileSync } from 'node:child_process';
 
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { v0_32_2, __setTestEngineOverride, __testing } from '../src/commands/migrations/v0_32_2.ts';
@@ -72,6 +73,17 @@ async function seedLegacyFact(input: {
   return r.rows[0].id;
 }
 
+function writeEntityPage(slug: string): void {
+  const path = join(brainDir, `${slug}.md`);
+  mkdirSync(dirname(path), { recursive: true });
+  const title = slug.split('/').at(-1) ?? slug;
+  writeFileSync(
+    path,
+    `---\ntype: concept\ntitle: ${title}\nslug: ${slug}\n---\n\n# ${title}\n`,
+    'utf-8',
+  );
+}
+
 describe('phaseASchema', () => {
   test('passes when schema is at v51', async () => {
     // initSchema ran v51, so the version config + columns are set.
@@ -101,8 +113,11 @@ describe('phaseBFenceFacts — dry-run reporting', () => {
     const r = await __testing.phaseBFenceFacts(engine, DRY_OPTS);
     expect(r.status).toBe('skipped');
     expect(r.detail).toContain('dry-run');
-    expect(r.detail).toContain('would fence 2 rows');  // 3 total - 1 unparented
-    expect(r.detail).toContain('1 unfenceable');
+    expect(r.detail).toContain('would_fence=2');
+    expect(r.detail).toContain('targets=2');
+    expect(r.detail).toContain('would_create=2');
+    expect(r.detail).toContain('quarantine=2');
+    expect(r.detail).toContain('unfenceable=1');
 
     // No files created.
     expect(existsSync(join(brainDir, 'people/alice.md'))).toBe(false);
@@ -117,6 +132,7 @@ describe('phaseBFenceFacts — dry-run reporting', () => {
 
 describe('phaseBFenceFacts — happy path backfill', () => {
   test('fences legacy DB rows into entity pages + updates row_num', async () => {
+    writeEntityPage('people/alice');
     const id1 = await seedLegacyFact({ entity_slug: 'people/alice', fact: 'Founded Acme in 2017' });
     const id2 = await seedLegacyFact({ entity_slug: 'people/alice', fact: 'Prefers async over meetings' });
 
@@ -125,7 +141,7 @@ describe('phaseBFenceFacts — happy path backfill', () => {
     expect(r.detail).toContain('fenced=2');
     expect(r.detail).toContain('pages=1');
 
-    // Stub-page exists with fence content.
+    // Existing page is preserved and receives fence content.
     const filePath = join(brainDir, 'people/alice.md');
     expect(existsSync(filePath)).toBe(true);
     const body = readFileSync(filePath, 'utf-8');
@@ -143,6 +159,9 @@ describe('phaseBFenceFacts — happy path backfill', () => {
   });
 
   test('groups by entity page — multi-entity batch touches multiple files', async () => {
+    writeEntityPage('people/alice');
+    writeEntityPage('companies/acme');
+    writeEntityPage('deals/seed');
     await seedLegacyFact({ entity_slug: 'people/alice', fact: 'A1' });
     await seedLegacyFact({ entity_slug: 'companies/acme', fact: 'C1' });
     await seedLegacyFact({ entity_slug: 'deals/seed', fact: 'D1' });
@@ -175,6 +194,7 @@ describe('phaseBFenceFacts — happy path backfill', () => {
   });
 
   test('idempotent: re-running after partial completion does NOT duplicate rows', async () => {
+    writeEntityPage('people/alice');
     await seedLegacyFact({ entity_slug: 'people/alice', fact: 'First' });
     await seedLegacyFact({ entity_slug: 'people/alice', fact: 'Second' });
 
@@ -205,6 +225,7 @@ describe('phaseBFenceFacts — happy path backfill', () => {
   });
 
   test('skips facts with NULL entity_slug (unfenceable)', async () => {
+    writeEntityPage('people/alice');
     await seedLegacyFact({ entity_slug: 'people/alice', fact: 'Fenceable' });
     await seedLegacyFact({ entity_slug: null, fact: 'Unfenceable' });
 
@@ -236,10 +257,60 @@ describe('phaseBFenceFacts — happy path backfill', () => {
     const rows = await (engine as any).db.query('SELECT row_num FROM facts');
     expect(rows.rows[0].row_num).toBeNull();
   });
+
+  test('routes a missing legacy target into deterministic private quarantine', async () => {
+    const id = await seedLegacyFact({
+      entity_slug: 'flattened-private-identifier',
+      fact: 'Preserve this legacy claim',
+    });
+
+    const { manifest } = await __testing.buildTargetPlan(engine);
+    expect(manifest).toMatchObject({
+      legacy_rows: 1,
+      target_count: 1,
+      would_create_count: 1,
+      quarantine_count: 1,
+    });
+    const target = manifest.targets[0];
+    expect(target.disposition).toBe('quarantine');
+    expect(target.reason).toBe('missing_target');
+    expect(target.target_markdown_slug).toMatch(/^quarantine\/migrations\/v0-32-2\/[0-9a-f]{16}$/);
+    expect(target.target_markdown_slug).not.toContain('private');
+    expect(target.fact_ids).toEqual([String(id)]);
+
+    const r = await __testing.phaseBFenceFacts(engine, OPTS);
+    expect(r.status).toBe('complete');
+    expect(existsSync(join(brainDir, 'flattened-private-identifier.md'))).toBe(false);
+    const quarantinePath = join(brainDir, `${target.target_markdown_slug}.md`);
+    expect(existsSync(quarantinePath)).toBe(true);
+    expect(readFileSync(quarantinePath, 'utf-8')).toContain('visibility: private');
+    expect(readFileSync(quarantinePath, 'utf-8')).toContain('Preserve this legacy claim');
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const rows = await (engine as any).db.query(
+      'SELECT entity_slug, source_markdown_slug, row_num FROM facts WHERE id = $1',
+      [id],
+    );
+    expect(rows.rows[0]).toMatchObject({
+      entity_slug: 'flattened-private-identifier',
+      source_markdown_slug: target.target_markdown_slug,
+      row_num: 1,
+    });
+  });
+
+  test('dirty guard ignores unrelated changes but blocks an exact target path', () => {
+    execFileSync('git', ['init', '-q', brainDir]);
+    writeFileSync(join(brainDir, 'unrelated.md'), 'unrelated\n');
+    expect(__testing.areTargetPathsDirty(brainDir, ['people/alice'])).toBe(false);
+
+    writeEntityPage('people/alice');
+    expect(__testing.areTargetPathsDirty(brainDir, ['people/alice'])).toBe(true);
+  });
 });
 
 describe('phaseCVerify', () => {
   test('returns complete when fence + DB row counts match', async () => {
+    writeEntityPage('people/alice');
     await seedLegacyFact({ entity_slug: 'people/alice', fact: 'F1' });
     await seedLegacyFact({ entity_slug: 'people/alice', fact: 'F2' });
     await __testing.phaseBFenceFacts(engine, OPTS);
@@ -250,6 +321,7 @@ describe('phaseCVerify', () => {
   });
 
   test('returns failed when fence row count drifts from DB', async () => {
+    writeEntityPage('people/alice');
     await seedLegacyFact({ entity_slug: 'people/alice', fact: 'F1' });
     await __testing.phaseBFenceFacts(engine, OPTS);
 
@@ -271,6 +343,7 @@ describe('phaseCVerify', () => {
 
 describe('orchestrator end-to-end', () => {
   test('clean run returns status:complete with 3 phases', async () => {
+    writeEntityPage('people/alice');
     await seedLegacyFact({ entity_slug: 'people/alice', fact: 'Founded Acme' });
 
     const result = await v0_32_2.orchestrator(OPTS);
