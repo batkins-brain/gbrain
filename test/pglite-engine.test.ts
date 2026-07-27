@@ -230,21 +230,37 @@ describe('PGLiteEngine: Search', () => {
     expect(results.map(r => r.slug)).toContain('24-105/rulings/layback-8010-10-allocated');
   });
 
-  test('searchKeyword fallback still respects source scope', async () => {
+  test('searchKeyword fallback preserves source scope when another source has the same compact-numeric match', async () => {
     await engine.executeRaw(
       `INSERT INTO sources (id, name, config) VALUES ('src-b', 'src-b', '{}'::jsonb) ON CONFLICT DO NOTHING`,
     );
+    // Seed the default source with the same fallback-only text. The scoped
+    // retry must retain the original parameterized source predicate rather
+    // than leaking a cross-source answer on its second query.
     await engine.putPage('24-105/rulings/layback-8010-10-allocated', {
       type: 'ruling',
-      title: 'Layback 8010 10 allocated',
-      compiled_truth: 'Layback 80 10 10 allocated to the project.'
+      title: 'Default-source decoy',
+      compiled_truth: 'Layback 80 10 10 allocated to the project.',
+    });
+    await engine.upsertChunks('24-105/rulings/layback-8010-10-allocated', [
+      { chunk_index: 0, chunk_text: 'Layback 80 10 10 allocated to the project.', chunk_source: 'compiled_truth' },
+    ]);
+    await engine.putPage('24-105/rulings/layback-8010-10-allocated', {
+      type: 'ruling',
+      title: 'Scoped source',
+      compiled_truth: 'Layback 80 10 10 allocated to the project.',
     }, { sourceId: 'src-b' });
     await engine.upsertChunks('24-105/rulings/layback-8010-10-allocated', [
       { chunk_index: 0, chunk_text: 'Layback 80 10 10 allocated to the project.', chunk_source: 'compiled_truth' },
     ], { sourceId: 'src-b' });
 
     const results = await engine.searchKeyword('layback 8010 10 allocated', { sourceId: 'src-b' });
-    expect(results.map(r => r.source_id)).toEqual(['src-b']);
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({
+      slug: '24-105/rulings/layback-8010-10-allocated',
+      source_id: 'src-b',
+      title: 'Scoped source',
+    });
   });
 
   test('searchKeywordChunks fallback also works for compact numerics', async () => {
