@@ -850,6 +850,7 @@ describe('extractFrontmatterLinks — field-map coverage', () => {
     'companies/sequoia': 'companies/sequoia',
     'companies/benchmark': 'companies/benchmark',
     'projects/gbrain': 'projects/gbrain',
+    'concepts/entity-resolution': 'concepts/entity-resolution',
     'meetings/2026-04-03': 'meetings/2026-04-03',
     'deal/riveter-seed': 'deal/riveter-seed',
   };
@@ -880,6 +881,21 @@ describe('extractFrontmatterLinks — field-map coverage', () => {
       expect(c.linkType).toBe('works_at');
       expect(c.targetSlug).toMatch(/^companies\/(stripe|brex)$/);
     }
+  });
+
+  test('person.founded → outgoing founded', async () => {
+    const { candidates } = await extractFrontmatterLinks(
+      'people/pedro', 'person' as never, { founded: 'Brex' }, resolver,
+    );
+    expect(candidates).toEqual([
+      expect.objectContaining({
+        fromSlug: 'people/pedro',
+        targetSlug: 'companies/brex',
+        linkType: 'founded',
+        linkSource: 'frontmatter',
+        originField: 'founded',
+      }),
+    ]);
   });
 
   test('company.key_people → INCOMING works_at (person → company)', async () => {
@@ -939,6 +955,21 @@ describe('extractFrontmatterLinks — field-map coverage', () => {
     });
   });
 
+  test('company.investors → INCOMING invested_in (investor → company)', async () => {
+    const { candidates } = await extractFrontmatterLinks(
+      'companies/brex', 'company' as never, { investors: ['Sequoia'] }, resolver,
+    );
+    expect(candidates).toEqual([
+      expect.objectContaining({
+        fromSlug: 'companies/sequoia',
+        targetSlug: 'companies/brex',
+        linkType: 'invested_in',
+        linkSource: 'frontmatter',
+        originField: 'investors',
+      }),
+    ]);
+  });
+
   test('meeting.attendees → INCOMING attended (person → meeting)', async () => {
     const { candidates } = await extractFrontmatterLinks(
       'meetings/2026-04-03', 'meeting' as never, { attendees: ['Pedro', 'Garry'] }, resolver,
@@ -961,6 +992,39 @@ describe('extractFrontmatterLinks — field-map coverage', () => {
       expect(c.targetSlug).toBe('deal/riveter-seed');
       expect(c.linkType).toBe('invested_in');
       expect(c.fromSlug).toMatch(/^companies\/(sequoia|benchmark)$/);
+    }
+  });
+
+  test('deal.lead → INCOMING led_round (lead investor → deal)', async () => {
+    const { candidates } = await extractFrontmatterLinks(
+      'deal/riveter-seed', 'deal' as never, { lead: 'Sequoia' }, resolver,
+    );
+    expect(candidates).toEqual([
+      expect.objectContaining({
+        fromSlug: 'companies/sequoia',
+        targetSlug: 'deal/riveter-seed',
+        linkType: 'led_round',
+        linkSource: 'frontmatter',
+        originField: 'lead',
+      }),
+    ]);
+  });
+
+  test('related and see_also aliases → outgoing related_to', async () => {
+    for (const field of ['related', 'see_also'] as const) {
+      const { candidates } = await extractFrontmatterLinks(
+        'people/pedro', 'person' as never,
+        { [field]: 'concepts/entity-resolution' }, resolver,
+      );
+      expect(candidates).toEqual([
+        expect.objectContaining({
+          fromSlug: 'people/pedro',
+          targetSlug: 'concepts/entity-resolution',
+          linkType: 'related_to',
+          linkSource: 'frontmatter',
+          originField: field,
+        }),
+      ]);
     }
   });
 
@@ -1338,4 +1402,3 @@ describe("v0.18.0 migration v22 — links_resolution_type", () => {
     expect(v22!.sql).toContain("unqualified");
   });
 });
-

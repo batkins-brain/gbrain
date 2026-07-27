@@ -62,7 +62,8 @@ Typed frontmatter is how durable edges enter the graph. The current canonical re
 | --- | --- | --- | --- |
 | `works_at` | person ↔ company employment or affiliation | `company`, `companies`, `key_people` | `company: companies/acme-example` |
 | `founded` | person → company founding relationship | `founded` | `founded: companies/acme-example` |
-| `invested_in` | investor ↔ deal/company investment relation | `investors`, `lead` | `investors: [companies/sequoia-example]` |
+| `invested_in` | investor ↔ deal/company investment relation | `investors` | `investors: [companies/sequoia-example]` |
+| `led_round` | lead investor role on a financing round | `lead` | `lead: companies/sequoia-example` |
 | `attended` | person → meeting attendance | `attendees` | `attendees: [people/alice-example]` |
 | `related_to` | general cross-note adjacency | `related`, `see_also` | `related: [concepts/entity-resolution]` |
 | `mentions` | narrative mention with no stronger typed edge | body wikilinks, loose references | `[[companies/acme-example]]` |

@@ -15,18 +15,20 @@ that map to each relation, and the fallback behavior for body wikilinks.
 | `attended` | person → meeting attendance edge | `meeting` | `attendees` |
 | `related_to` | general cross-note adjacency | any note type | `related`, `see_also` |
 | `mentions` | narrative mention with no stronger typed edge | any note type | body wikilinks, prose mentions |
-| `advises` | advisor ↔ company/project guidance edge | `person`, `company` | — (prose/context inference) |
+| `advises` | advisor ↔ company/project guidance edge | `person`, `company`, `project` | `advises`, `advisors`, or explicit advisor prose |
 
 ## Auto-Linking Order
 
 GBrain resolves entity references in this order:
 
-1. Read frontmatter fields that map to typed relations.
-2. Resolve canonical note slugs in body wikilinks.
-3. Fall back to `mentions` when the prose only signals a loose reference.
+1. Resolve canonical note slugs in markdown links and wikilinks.
+2. Resolve bare canonical slugs in the body.
+3. Read frontmatter fields that map to typed relations.
 
-This keeps durable edges in frontmatter and narrative references in the body
-without losing either signal.
+Every target must resolve to an existing page in the active source. An
+unresolved frontmatter value is reported in the auto-link result and does not
+create a dead edge. Frontmatter and body references have separate provenance,
+so a durable typed edge and a narrative reference can coexist.
 
 ## Recommended Syntax
 
@@ -73,15 +75,20 @@ VP Engineering at Acme Example.
 - **2026-07-16** | First captured as a typed person page.
 ```
 
-When this page is written, the `company` field becomes a `works_at` edge
-automatically. If the body also mentions `[[companies/acme-example]]`, that
-reference is preserved as a narrative mention and can still be upgraded by the
-extractor when the surrounding prose is strong enough.
+When this page is written locally and auto-linking is enabled, the `company`
+field becomes a `works_at` edge if `companies/acme-example` already exists in
+the active source. If the target is missing, GBrain reports the unresolved
+frontmatter value and creates no edge. If the body also mentions
+`[[companies/acme-example]]`, that reference is preserved with body-link
+provenance separately from the frontmatter edge.
 
 ## Verification
 
-1. Create a person page with `company: companies/acme-example`.
-2. Run the auto-link path.
-3. Confirm the graph contains a `works_at` edge to the company page.
-4. Add a body wikilink to the same company and confirm the mention remains
-   linked even if the typed edge is already present.
+1. Create `companies/acme-example`, then create a person page with
+   `company: companies/acme-example`.
+2. Run the trusted local `put_page` auto-link path.
+3. Confirm the graph contains a frontmatter-sourced `works_at` edge.
+4. Add a body wikilink to the same company and confirm both provenance records
+   remain linked.
+5. Repeat with a nonexistent company and confirm the response reports the
+   unresolved field and creates no dead edge.
