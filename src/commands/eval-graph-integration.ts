@@ -40,20 +40,43 @@ Options:
 }
 
 function parseArgs(args: string[]): { fixture?: string; json: boolean; fixtureName: string; liveReadOnly: boolean; sourceId?: string } {
-  const json = args.includes('--json');
-  const liveReadOnly = args.includes('--live-read-only');
-  const fixtureNameIdx = args.indexOf('--fixture-name');
-  const fixtureNameValue = fixtureNameIdx >= 0 ? args[fixtureNameIdx + 1] : undefined;
-  const fixtureName = fixtureNameValue && !fixtureNameValue.startsWith('--')
-    ? fixtureNameValue
-    : 'graph-integration';
-  const sourceIdx = args.indexOf('--source');
-  const sourceValue = sourceIdx >= 0 ? args[sourceIdx + 1] : undefined;
-  const sourceId = sourceValue && !sourceValue.startsWith('--') ? sourceValue : undefined;
-  const consumedValues = new Set<number>();
-  if (fixtureNameIdx >= 0 && fixtureNameValue === fixtureName) consumedValues.add(fixtureNameIdx + 1);
-  if (sourceIdx >= 0 && sourceValue === sourceId) consumedValues.add(sourceIdx + 1);
-  const fixture = args.find((a, index) => !a.startsWith('--') && !consumedValues.has(index));
+  let fixture: string | undefined;
+  let json = false;
+  let fixtureName = 'graph-integration';
+  let liveReadOnly = false;
+  let sourceId: string | undefined;
+  const seen = new Set<string>();
+
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index]!;
+    if (arg === '--json' || arg === '--live-read-only') {
+      if (seen.has(arg)) throw new Error(`Duplicate option: ${arg}`);
+      seen.add(arg);
+      if (arg === '--json') json = true;
+      else liveReadOnly = true;
+      continue;
+    }
+    if (arg === '--fixture-name' || arg === '--source') {
+      if (seen.has(arg)) throw new Error(`Duplicate option: ${arg}`);
+      seen.add(arg);
+      const value = args[index + 1];
+      if (!value || value.startsWith('--')) {
+        throw new Error(`Missing value for ${arg}.`);
+      }
+      index++;
+      if (arg === '--fixture-name') fixtureName = value;
+      else sourceId = value;
+      continue;
+    }
+    if (arg.startsWith('-')) {
+      throw new Error(`Unknown option: ${arg}`);
+    }
+    if (fixture) {
+      throw new Error(`Unexpected extra fixture argument: ${arg}`);
+    }
+    fixture = arg;
+  }
+
   return { fixture, json, fixtureName, liveReadOnly, sourceId };
 }
 
@@ -95,7 +118,7 @@ function prepareGraphIntegrationInput(args: string[]): PreparedGraphIntegrationI
  */
 export function graphIntegrationNeedsEngine(args: string[]): boolean {
   if (args.includes('--help') || args.includes('-h')) return false;
-  if (!parseArgs(args).liveReadOnly) return false;
+  if (!args.includes('--live-read-only')) return false;
   try {
     prepareGraphIntegrationInput(args);
     return true;

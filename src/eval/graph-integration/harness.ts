@@ -313,13 +313,12 @@ function metricCounts(snapshot: GraphGraphSnapshot): GraphMetricCounts {
       broken_references++;
     }
 
-    // Ambiguity means endpoint qualification is absent or points at a source
-    // where the slug does not exist while another source does have it. A
-    // deliberately qualified cross-source edge is valid, not ambiguous.
+    // `source_id` supplies the default scope for both endpoints, so a slug
+    // duplicated in another source is still unambiguous when it resolves in
+    // that default scope. Ambiguity exists only when the selected endpoint
+    // scope has no match while at least one other source does.
     const ambiguousQualification =
-      (!edge.from_source_id && fromCandidates.length > 1)
-      || (!edge.to_source_id && toCandidates.length > 1)
-      || (!fromScoped && fromCandidates.length > 0)
+      (!fromScoped && fromCandidates.length > 0)
       || (!toScoped && toCandidates.length > 0);
     if (ambiguousQualification) cross_source_ambiguity++;
 

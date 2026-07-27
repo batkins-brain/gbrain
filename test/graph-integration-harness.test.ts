@@ -84,6 +84,22 @@ describe('graph-integration harness', () => {
     expect(report.dry_run.typed_relations).toBe(1);
   });
 
+  test('same-source edge remains unambiguous when its target slug exists in another source', () => {
+    const report = compareSnapshots({
+      nodes: [
+        { slug: 'source/from', type: 'source', title: 'From', source_id: 'primary', authority_state: 'active' },
+        { slug: 'source/shared', type: 'source', title: 'Primary Shared', source_id: 'primary', authority_state: 'active' },
+        { slug: 'source/shared', type: 'source', title: 'Secondary Shared', source_id: 'secondary', authority_state: 'active' },
+      ],
+      edges: [
+        { from: 'source/from', to: 'source/shared', type: 'source', source_id: 'primary' },
+      ],
+    });
+    expect(report.dry_run.valid_outgoing).toBe(1);
+    expect(report.dry_run.unresolved_targets).toBe(0);
+    expect(report.dry_run.cross_source_ambiguity).toBe(0);
+  });
+
   test('fixture-only CLI skips live readSnapshot and says so explicitly', async () => {
     const fixturePath = Bun.pathToFileURL('/tmp/tan610-fixture.jsonl').pathname;
     await Bun.write(fixturePath, FIXTURE);
@@ -375,8 +391,17 @@ describe('graph-integration harness', () => {
         '--json',
       ]);
       expect(invalidSource.exitCode).toBe(2);
-      expect(invalidSource.stderr).toContain('Missing required --source <id>');
+      expect(invalidSource.stderr).toContain('Missing value for --source.');
       expect(invalidSource.stderr).not.toContain('No brain configured');
+
+      const missingFixtureName = await run([
+        fixturePath,
+        '--fixture-name',
+        '--json',
+      ]);
+      expect(missingFixtureName.exitCode).toBe(2);
+      expect(missingFixtureName.stderr).toContain('Missing value for --fixture-name.');
+      expect(missingFixtureName.stderr).not.toContain('No brain configured');
 
       for (const sourceId of ['../invalid', 'INVALID']) {
         const rejectedSource = await run([
@@ -390,6 +415,44 @@ describe('graph-integration harness', () => {
         expect(rejectedSource.stderr).toContain('Invalid source_id:');
         expect(rejectedSource.stderr).not.toContain('No brain configured');
       }
+
+      const typoLiveFlag = await run([
+        fixturePath,
+        '--live-readonly',
+        '--source',
+        '24-105',
+        '--json',
+      ]);
+      expect(typoLiveFlag.exitCode).toBe(2);
+      expect(typoLiveFlag.stderr).toContain('Unknown option: --live-readonly');
+      expect(typoLiveFlag.stderr).not.toContain('No brain configured');
+
+      for (const sources of [
+        ['24-105', '../invalid'],
+        ['../invalid', '24-105'],
+      ]) {
+        const duplicateSource = await run([
+          fixturePath,
+          '--live-read-only',
+          '--source',
+          sources[0]!,
+          '--source',
+          sources[1]!,
+          '--json',
+        ]);
+        expect(duplicateSource.exitCode).toBe(2);
+        expect(duplicateSource.stderr).toContain('Duplicate option: --source');
+        expect(duplicateSource.stderr).not.toContain('No brain configured');
+      }
+
+      const duplicateFixture = await run([
+        fixturePath,
+        fixturePath,
+        '--json',
+      ]);
+      expect(duplicateFixture.exitCode).toBe(2);
+      expect(duplicateFixture.stderr).toContain('Unexpected extra fixture argument:');
+      expect(duplicateFixture.stderr).not.toContain('No brain configured');
 
       const missingFixtureArg = await run([
         '--live-read-only',
