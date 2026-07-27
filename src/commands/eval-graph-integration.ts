@@ -74,7 +74,10 @@ async function readLiveSnapshot(engine: BrainEngine, sourceId: string): Promise<
       slug: n.slug,
       type: n.type as any,
       title: n.title,
-      source_id: String((frontmatter as any).source_id ?? n.source_id ?? 'default'),
+      // pages.source_id is the canonical routing identity selected by the
+      // source-scoped SQL predicate. Frontmatter may be stale and must not
+      // move a row into another source in the in-memory graph.
+      source_id: String(n.source_id ?? 'default'),
       authority_state: (frontmatter as any).authority_state,
       successor_slug: (frontmatter as any).successor_slug,
     };
@@ -107,7 +110,7 @@ async function readLiveSnapshot(engine: BrainEngine, sourceId: string): Promise<
 }
 
 
-export async function runEvalGraphIntegration(engine: BrainEngine, args: string[]): Promise<void> {
+export async function runEvalGraphIntegration(engine: BrainEngine | null, args: string[]): Promise<void> {
   if (args.includes('--help') || args.includes('-h')) {
     help();
     return;
@@ -115,7 +118,8 @@ export async function runEvalGraphIntegration(engine: BrainEngine, args: string[
   const { fixture, json, fixtureName, liveReadOnly, sourceId } = parseArgs(args);
   if (!fixture) {
     console.error('Usage: gbrain eval graph-integration <fixture.jsonl> [--json] [--fixture-name <name>] [--live-read-only --source <id>]');
-    process.exit(2);
+    setCliExitVerdict(2);
+    return;
   }
   if (liveReadOnly && !sourceId) {
     console.error('Missing required --source <id> when using --live-read-only.');
@@ -128,11 +132,17 @@ export async function runEvalGraphIntegration(engine: BrainEngine, args: string[
     rows = parseGraphFixtureJsonl(readFileSync(fixture, 'utf8'));
   } catch (e) {
     console.error(`Cannot read fixture: ${e instanceof Error ? e.message : String(e)}`);
-    process.exit(2);
+    setCliExitVerdict(2);
+    return;
   }
 
   const dry = buildSnapshot(rows);
-  const live = liveReadOnly ? await readLiveSnapshot(engine, sourceId!) : null;
+  if (liveReadOnly && !engine) {
+    console.error('Live read-only comparison requires a configured brain connection.');
+    setCliExitVerdict(1);
+    return;
+  }
+  const live = liveReadOnly ? await readLiveSnapshot(engine!, sourceId!) : null;
   const report = compareSnapshots(dry, live);
   report.fixture_name = fixtureName;
   report.live_source_scope = liveReadOnly ? sourceId! : null;

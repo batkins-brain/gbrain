@@ -3,8 +3,13 @@
  */
 
 import { describe, expect, test, mock } from 'bun:test';
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { PGlite } from '@electric-sql/pglite';
 import { compareSnapshots, buildSnapshot, parseGraphFixtureJsonl, runGraphIntegrationHarness, type GraphFixtureRow } from '../src/eval/graph-integration/harness.ts';
 import { runEvalGraphIntegration } from '../src/commands/eval-graph-integration.ts';
+import { _resetCliExitVerdictForTests, currentExitCode } from '../src/core/cli-force-exit.ts';
 
 const FIXTURE = `
 {"kind":"node","node":{"slug":"people/alice-example","type":"person","title":"Alice Example","source_id":"default","authority_state":"active"}}
@@ -75,6 +80,122 @@ describe('graph-integration harness', () => {
     expect(log.mock.calls.flat().join('\n')).toContain('live-read-only: omitted');
   });
 
+  test('fixture-only CLI runs end-to-end without a configured brain', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'gbrain-graph-fixture-'));
+    const fixturePath = join(home, 'fixture.jsonl');
+    await Bun.write(fixturePath, FIXTURE);
+    const env: Record<string, string> = {};
+    for (const [key, value] of Object.entries(process.env)) {
+      if (value !== undefined) env[key] = value;
+    }
+    delete env.GBRAIN_DATABASE_URL;
+    delete env.DATABASE_URL;
+    env.GBRAIN_HOME = home;
+
+    try {
+      const proc = Bun.spawn(
+        ['bun', 'run', 'src/cli.ts', 'eval', 'graph-integration', fixturePath, '--json'],
+        {
+          cwd: new URL('..', import.meta.url).pathname,
+          env,
+          stdout: 'pipe',
+          stderr: 'pipe',
+        },
+      );
+      const stdout = await new Response(proc.stdout).text();
+      const stderr = await new Response(proc.stderr).text();
+      const exitCode = await proc.exited;
+      expect(exitCode).toBe(0);
+      expect(stderr).not.toContain('No brain configured');
+      expect(JSON.parse(stdout).live_read_only).toBeNull();
+      expect(existsSync(join(home, '.gbrain', 'config.json'))).toBe(false);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test('live-read-only CLI uses a probe-only connection without migrations', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'gbrain-graph-live-'));
+    const databasePath = join(home, 'brain-data');
+    const fixturePath = join(home, 'fixture.jsonl');
+    const configDir = join(home, '.gbrain');
+    mkdirSync(configDir, { recursive: true });
+    await Bun.write(fixturePath, FIXTURE);
+
+    const setup = new PGlite(databasePath);
+    await setup.exec(`
+      CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT);
+      INSERT INTO config (key, value) VALUES ('version', '1');
+      CREATE TABLE pages (
+        id SERIAL PRIMARY KEY,
+        slug TEXT NOT NULL,
+        type TEXT NOT NULL,
+        title TEXT NOT NULL,
+        source_id TEXT NOT NULL,
+        frontmatter JSONB NOT NULL DEFAULT '{}'::jsonb
+      );
+      CREATE TABLE links (
+        from_page_id INTEGER NOT NULL,
+        to_page_id INTEGER NOT NULL,
+        link_type TEXT NOT NULL,
+        link_source TEXT
+      );
+      INSERT INTO pages (slug, type, title, source_id, frontmatter)
+      VALUES ('source/fixture', 'source', 'Fixture', '24-105', '{"authority_state":"active"}');
+    `);
+    await setup.close();
+    await Bun.write(
+      join(configDir, 'config.json'),
+      JSON.stringify({ engine: 'pglite', database_path: databasePath }),
+    );
+
+    const env: Record<string, string> = {};
+    for (const [key, value] of Object.entries(process.env)) {
+      if (value !== undefined) env[key] = value;
+    }
+    delete env.GBRAIN_DATABASE_URL;
+    delete env.DATABASE_URL;
+    env.GBRAIN_HOME = home;
+
+    try {
+      const proc = Bun.spawn(
+        [
+          'bun',
+          'run',
+          'src/cli.ts',
+          'eval',
+          'graph-integration',
+          fixturePath,
+          '--json',
+          '--live-read-only',
+          '--source',
+          '24-105',
+        ],
+        {
+          cwd: new URL('..', import.meta.url).pathname,
+          env,
+          stdout: 'pipe',
+          stderr: 'pipe',
+        },
+      );
+      const stdout = await new Response(proc.stdout).text();
+      const stderr = await new Response(proc.stderr).text();
+      const exitCode = await proc.exited;
+      expect(exitCode).toBe(0);
+      expect(stderr).not.toContain('Schema version');
+      expect(JSON.parse(stdout).live_source_scope).toBe('24-105');
+
+      const verify = new PGlite(databasePath);
+      const version = await verify.query<{ value: string }>(
+        `SELECT value FROM config WHERE key = 'version'`,
+      );
+      await verify.close();
+      expect(version.rows[0]?.value).toBe('1');
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, 15_000);
+
   test('--live-read-only requires --source and scopes SQL by source', async () => {
     const fixturePath = Bun.pathToFileURL('/tmp/tan610-fixture-live.jsonl').pathname;
     await Bun.write(fixturePath, FIXTURE);
@@ -84,7 +205,7 @@ describe('graph-integration harness', () => {
         expect(sql).toContain('WHERE p.source_id = $1');
         expect(sql).not.toContain('SELECT l.to_page_id');
         return [
-          { slug: 'source/24-105-root', type: 'source', title: '24-105 Root', source_id: '24-105', frontmatter: { source_id: '24-105', authority_state: 'active' } },
+          { slug: 'source/24-105-root', type: 'source', title: '24-105 Root', source_id: '24-105', frontmatter: { source_id: 'stale-other-source', authority_state: 'active' } },
         ];
       }
       expect(sql).toContain('WHERE fp.source_id = $1');
@@ -97,13 +218,15 @@ describe('graph-integration harness', () => {
     const originalLog = console.log;
     console.log = log as any;
     try {
-      await runEvalGraphIntegration(engine, [fixturePath, '--live-read-only', '--source', '24-105']);
+      await runEvalGraphIntegration(engine, [fixturePath, '--json', '--live-read-only', '--source', '24-105']);
     } finally {
       console.log = originalLog;
     }
     expect(executeRaw).toHaveBeenCalledTimes(2);
-    expect(log.mock.calls.flat().join('\n')).toContain('source=24-105');
-    expect(log.mock.calls.flat().join('\n')).toContain('live-read-only source scope: 24-105');
+    const report = JSON.parse(log.mock.calls.flat().join('\n'));
+    expect(report.live_source_scope).toBe('24-105');
+    expect(report.live_read_only.unresolved_targets).toBe(0);
+    expect(report.live_read_only.broken_references).toBe(0);
   });
 
   test('--live-read-only without --source is rejected before SQL', async () => {
@@ -119,11 +242,38 @@ describe('graph-integration harness', () => {
     console.error = error as any;
     try {
       await runEvalGraphIntegration(engine, [fixturePath, '--live-read-only']);
+      expect(currentExitCode()).toBe(2);
     } finally {
       console.error = originalError;
-      process.exitCode = originalExitCode;
+      _resetCliExitVerdictForTests();
+      process.exitCode = originalExitCode ?? 0;
     }
     expect(executeRaw).toHaveBeenCalledTimes(0);
     expect(error.mock.calls.flat().join('\n')).toContain('Missing required --source <id> when using --live-read-only.');
+  });
+
+  test('fixture input errors use the repository-owned CLI verdict', async () => {
+    const error = mock(() => {});
+    const originalError = console.error;
+    const originalExitCode = process.exitCode;
+    console.error = error as any;
+    try {
+      await runEvalGraphIntegration(null, []);
+      expect(currentExitCode()).toBe(2);
+      expect(error.mock.calls.flat().join('\n')).toContain('Usage: gbrain eval graph-integration');
+
+      _resetCliExitVerdictForTests();
+      process.exitCode = 0;
+      error.mockClear();
+
+      const missingFixture = join(tmpdir(), `tan610-missing-${crypto.randomUUID()}.jsonl`);
+      await runEvalGraphIntegration(null, [missingFixture]);
+      expect(currentExitCode()).toBe(2);
+      expect(error.mock.calls.flat().join('\n')).toContain('Cannot read fixture:');
+    } finally {
+      console.error = originalError;
+      _resetCliExitVerdictForTests();
+      process.exitCode = originalExitCode ?? 0;
+    }
   });
 });

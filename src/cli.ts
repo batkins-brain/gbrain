@@ -1414,6 +1414,34 @@ async function handleCliOnly(command: string, args: string[]) {
     return;
   }
 
+  // TAN-610 graph integration has two intentionally read-only execution
+  // modes. Fixture-only evaluation is hermetic and must not connect to a
+  // configured brain. Live comparison connects in probe-only mode so it can
+  // issue bounded SELECTs without running pending schema migrations.
+  if (command === 'eval' && args[0] === 'graph-integration') {
+    const { runEvalGraphIntegration } = await import('./commands/eval-graph-integration.ts');
+    const graphArgs = args.slice(1);
+    const sourceIndex = graphArgs.indexOf('--source');
+    const sourceValue = sourceIndex >= 0 ? graphArgs[sourceIndex + 1] : undefined;
+    const hasSource = Boolean(sourceValue && !sourceValue.startsWith('--'));
+    if (
+      !graphArgs.includes('--live-read-only') ||
+      graphArgs.includes('--help') ||
+      graphArgs.includes('-h') ||
+      !hasSource
+    ) {
+      await runEvalGraphIntegration(null, graphArgs);
+      return;
+    }
+    const engine = await connectEngine({ probeOnly: true });
+    try {
+      await runEvalGraphIntegration(engine, graphArgs);
+    } finally {
+      await finishCliTeardown({ engine });
+    }
+    return;
+  }
+
   // v0.41.13.0: `gbrain conversation-parser list-builtins | validate
   // | --help` are pure (no DB access). Bypass connectEngine so the
   // operator can run them on machines with no brain configured.
