@@ -165,7 +165,16 @@ export async function runFactsBackstop(
       // increments only). Now they land in ingest_log so doctor +
       // dashboard surface failure modes per source.
       try {
-        await runPipeline(parsedPage, ctx, signal);
+        const result = await runPipeline(parsedPage, ctx, signal);
+        const { writeFactsAbsorbLog } = await import('./absorb-log.ts');
+        await writeFactsAbsorbLog(
+          ctx.engine,
+          parsedPage.slug,
+          'completed',
+          `inserted=${result.inserted} duplicate=${result.duplicate} ` +
+            `superseded=${result.superseded} fact_ids=${result.fact_ids.length}`,
+          ctx.sourceId,
+        );
       } catch (err) {
         const { classifyFactsAbsorbError, writeFactsAbsorbLog } = await import('./absorb-log.ts');
         const reason = classifyFactsAbsorbError(err);

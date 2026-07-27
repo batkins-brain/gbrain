@@ -52,7 +52,11 @@
  * every path directly (cli.ts is a script entrypoint).
  */
 
-import { drainAllBackgroundWorkForCliExit, backgroundWorkSinkCount } from './background-work.ts';
+import {
+  drainAllBackgroundWorkForCliExit,
+  backgroundWorkSinkCount,
+  backgroundWorkTotalDrainBudgetMs,
+} from './background-work.ts';
 import { POOL_END_TIMEOUT_SECONDS } from './db.ts';
 import { parseGlobalFlags } from './cli-options.ts';
 
@@ -80,7 +84,7 @@ export function shouldForceExitAfterMain(
 /** Floor for the computed backstop deadline (the historical hard deadline). */
 export const TEARDOWN_DEADLINE_FLOOR_MS = 10_000;
 /** Allowance for the facts sink's awaited abort() (shutdown of an in-flight job). */
-const FACTS_ABORT_GRACE_MS = 2_000;
+const FACTS_ABORT_GRACE_MS = 5_000;
 /** Headroom over the sum of the guarded bounds so timer jitter can't false-fire. */
 const TEARDOWN_SLACK_MS = 2_000;
 /** Max wait for the stdio flush fence before exiting anyway (blocked pipe). */
@@ -125,6 +129,7 @@ const DEFAULT_DRAIN_TIMEOUT_MS = 2_000;
 export function computeTeardownDeadlineMs(opts: {
   sinkCount: number;
   drainTimeoutMs: number;
+  totalDrainBudgetMs?: number;
 }): number {
   const env = Number(process.env.GBRAIN_TEARDOWN_DEADLINE_MS);
   if (Number.isFinite(env) && env > 0) return env;
@@ -132,7 +137,7 @@ export function computeTeardownDeadlineMs(opts: {
   // ×2 budgets the worst case of two sequential pool ends (direct + read).
   const poolEndBoundMs = POOL_END_TIMEOUT_SECONDS * 1000 + 500;
   const computed =
-    opts.sinkCount * opts.drainTimeoutMs +
+    (opts.totalDrainBudgetMs ?? opts.sinkCount * opts.drainTimeoutMs) +
     FACTS_ABORT_GRACE_MS +
     2 * poolEndBoundMs +
     TEARDOWN_SLACK_MS;
@@ -289,7 +294,11 @@ export async function finishCliTeardown(opts: FinishCliTeardownOpts): Promise<vo
   const drain = opts.drain ?? drainAllBackgroundWorkForCliExit;
   const deadlineMs =
     opts.deadlineMs ??
-    computeTeardownDeadlineMs({ sinkCount: backgroundWorkSinkCount(), drainTimeoutMs });
+    computeTeardownDeadlineMs({
+      sinkCount: backgroundWorkSinkCount(),
+      drainTimeoutMs,
+      totalDrainBudgetMs: backgroundWorkTotalDrainBudgetMs(drainTimeoutMs),
+    });
 
   const backstop = setTimeout(() => {
     warn(

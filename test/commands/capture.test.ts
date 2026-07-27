@@ -242,6 +242,37 @@ describe('capture — local install integration', () => {
     expect(json.slug).toBe('inbox/json-out');
     expect(json.content_hash).toMatch(/^[a-f0-9]{64}$/);
     expect(json.captured_at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(json.facts_extraction).toBeDefined();
+  });
+
+  test('retrying the same capture is idempotent and keeps extraction separate', async () => {
+    const args = [
+      '--json',
+      '--slug', 'meetings/idempotent-retry',
+      '--type', 'meeting',
+      'A substantive synthetic meeting note '.repeat(20),
+    ];
+    const receipts: Array<Record<string, unknown>> = [];
+    const origLog = console.log;
+    try {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const lines: string[] = [];
+        console.log = (...values: unknown[]) => lines.push(values.map(String).join(' '));
+        await runCapture(engine, args);
+        receipts.push(JSON.parse(lines.join('\n')));
+      }
+    } finally {
+      console.log = origLog;
+    }
+
+    const rows = await engine.executeRaw<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM pages WHERE slug = $1`,
+      ['meetings/idempotent-retry'],
+    );
+    expect(Number(rows[0]?.n ?? 0)).toBe(1);
+    expect(receipts[0].content_hash).toBe(receipts[1].content_hash);
+    expect(receipts[0].facts_extraction).toBeDefined();
+    expect(receipts[1].facts_extraction).toBeDefined();
   });
 });
 

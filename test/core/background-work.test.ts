@@ -13,6 +13,7 @@
 import { describe, test, expect } from 'bun:test';
 import {
   drainAllBackgroundWorkForCliExit,
+  backgroundWorkTotalDrainBudgetMs,
   __registerDrainerForTest,
   __listDrainerNamesForTest,
   type BackgroundWorkDrainer,
@@ -78,6 +79,28 @@ describe('background-work registry', () => {
       expect(seq.indexOf('abort-done')).toBeGreaterThan(seq.indexOf('drain'));
     } finally {
       u1(); u2();
+    }
+  });
+
+  test('uses a sink-specific CLI-exit timeout and budgets it explicitly', async () => {
+    let observedTimeout = -1;
+    const d: BackgroundWorkDrainer = {
+      name: 'test-long-model-call',
+      order: 0,
+      cliExitTimeoutMs: 20_000,
+      drain: async (timeoutMs) => {
+        observedTimeout = timeoutMs;
+        return { unfinished: 0 };
+      },
+    };
+    const before = backgroundWorkTotalDrainBudgetMs(50);
+    const unregister = __registerDrainerForTest(d);
+    try {
+      expect(backgroundWorkTotalDrainBudgetMs(50)).toBe(before + 20_000);
+      await drainAllBackgroundWorkForCliExit({ timeoutMs: 50 });
+      expect(observedTimeout).toBe(20_000);
+    } finally {
+      unregister();
     }
   });
 

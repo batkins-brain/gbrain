@@ -45,18 +45,30 @@ function fakeStream(): MinimalWritable & { writes: string[] } {
 }
 
 describe('computeTeardownDeadlineMs', () => {
-  test('formula: sinks × drain + facts grace + 2 × pool bound + slack', () => {
+  test('formula: sinks × drain + facts abort grace + 2 × pool bound + slack', () => {
     const poolEndBoundMs = POOL_END_TIMEOUT_SECONDS * 1000 + 500;
-    // 4 sinks × 2000 + 2000 + 2×poolEnd + 2000 — the Site B worst case that
+    // 4 sinks × 2000 + 5000 + 2×poolEnd + 2000 — the Site B worst case that
     // falsified the old static 10s (eng-review D9).
     const got = computeTeardownDeadlineMs({ sinkCount: 4, drainTimeoutMs: 2000 });
-    expect(got).toBe(4 * 2000 + 2000 + 2 * poolEndBoundMs + 2000);
+    expect(got).toBe(4 * 2000 + 5000 + 2 * poolEndBoundMs + 2000);
     expect(got).toBeGreaterThan(10_000); // the codex-found arithmetic bug, pinned
   });
 
-  test('floors at TEARDOWN_DEADLINE_FLOOR_MS for small budgets', () => {
+  test('sink-specific total drain budget overrides uniform sink arithmetic', () => {
+    const poolEndBoundMs = POOL_END_TIMEOUT_SECONDS * 1000 + 500;
+    const got = computeTeardownDeadlineMs({
+      sinkCount: 4,
+      drainTimeoutMs: 2000,
+      totalDrainBudgetMs: 26_000,
+    });
+    expect(got).toBe(26_000 + 5000 + 2 * poolEndBoundMs + 2000);
+  });
+
+  test('small drain budgets still include fixed abort/pool/slack bounds', () => {
+    const poolEndBoundMs = POOL_END_TIMEOUT_SECONDS * 1000 + 500;
     const got = computeTeardownDeadlineMs({ sinkCount: 1, drainTimeoutMs: 100 });
-    expect(got).toBe(TEARDOWN_DEADLINE_FLOOR_MS);
+    expect(got).toBe(100 + 5000 + 2 * poolEndBoundMs + 2000);
+    expect(got).toBeGreaterThan(TEARDOWN_DEADLINE_FLOOR_MS);
   });
 
   test('GBRAIN_TEARDOWN_DEADLINE_MS env override wins over the formula', async () => {
@@ -67,21 +79,24 @@ describe('computeTeardownDeadlineMs', () => {
 
   test('garbage env values fall back to the formula', async () => {
     await withEnv({ GBRAIN_TEARDOWN_DEADLINE_MS: 'banana' }, async () => {
+      const poolEndBoundMs = POOL_END_TIMEOUT_SECONDS * 1000 + 500;
       expect(
         computeTeardownDeadlineMs({ sinkCount: 1, drainTimeoutMs: 100 }),
-      ).toBe(TEARDOWN_DEADLINE_FLOOR_MS);
+      ).toBe(100 + 5000 + 2 * poolEndBoundMs + 2000);
     });
   });
 
   test('zero and negative env values fall back to the formula (not "fire immediately")', async () => {
+    const poolEndBoundMs = POOL_END_TIMEOUT_SECONDS * 1000 + 500;
+    const expected = 100 + 5000 + 2 * poolEndBoundMs + 2000;
     await withEnv({ GBRAIN_TEARDOWN_DEADLINE_MS: '0' }, async () => {
       expect(computeTeardownDeadlineMs({ sinkCount: 1, drainTimeoutMs: 100 })).toBe(
-        TEARDOWN_DEADLINE_FLOOR_MS,
+        expected,
       );
     });
     await withEnv({ GBRAIN_TEARDOWN_DEADLINE_MS: '-5' }, async () => {
       expect(computeTeardownDeadlineMs({ sinkCount: 1, drainTimeoutMs: 100 })).toBe(
-        TEARDOWN_DEADLINE_FLOOR_MS,
+        expected,
       );
     });
   });

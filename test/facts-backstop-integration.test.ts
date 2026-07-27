@@ -196,7 +196,7 @@ describe('queue-mode → drains successfully on happy path', () => {
       },
       {
         engine,
-        sourceId: 'queue-drain-source',
+        sourceId: 'default',
         sessionId: 'queue-drain-session',
         source: 'sync:import',
         mode: 'queue',
@@ -216,6 +216,15 @@ describe('queue-mode → drains successfully on happy path', () => {
     const counters = queue.getCounters();
     expect(counters.completed).toBeGreaterThanOrEqual(1);
     expect(counters.failed).toBe(0);
+
+    const completedRows = await engine.executeRaw<{ summary: string }>(
+      `SELECT summary FROM ingest_log
+        WHERE source_id = $1 AND source_type = 'facts:absorb' AND source_ref = $2`,
+      ['default', slug],
+    );
+    const completed = completedRows.find(row => row.summary.startsWith('completed:'));
+    expect(completed).toBeDefined();
+    expect(completed!.summary).toContain('inserted=');
   });
 
   test('extract.ts absorbs gateway errors silently — net effect is empty extraction', async () => {
