@@ -1419,17 +1419,12 @@ async function handleCliOnly(command: string, args: string[]) {
   // configured brain. Live comparison connects in probe-only mode so it can
   // issue bounded SELECTs without running pending schema migrations.
   if (command === 'eval' && args[0] === 'graph-integration') {
-    const { runEvalGraphIntegration } = await import('./commands/eval-graph-integration.ts');
+    const {
+      graphIntegrationNeedsEngine,
+      runEvalGraphIntegration,
+    } = await import('./commands/eval-graph-integration.ts');
     const graphArgs = args.slice(1);
-    const sourceIndex = graphArgs.indexOf('--source');
-    const sourceValue = sourceIndex >= 0 ? graphArgs[sourceIndex + 1] : undefined;
-    const hasSource = Boolean(sourceValue && !sourceValue.startsWith('--'));
-    if (
-      !graphArgs.includes('--live-read-only') ||
-      graphArgs.includes('--help') ||
-      graphArgs.includes('-h') ||
-      !hasSource
-    ) {
+    if (!graphIntegrationNeedsEngine(graphArgs)) {
       await runEvalGraphIntegration(null, graphArgs);
       return;
     }

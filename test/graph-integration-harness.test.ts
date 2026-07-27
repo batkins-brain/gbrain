@@ -59,6 +59,23 @@ describe('graph-integration harness', () => {
     expect(report.comparisons.find(c => c.metric === 'broken_references')?.delta).toBe(-2);
   });
 
+  test('typed relations require a non-empty type while permitting custom types', () => {
+    const nodes = [
+      { slug: 'source/from', type: 'source' as const, title: 'From', source_id: 'default', authority_state: 'active' as const },
+      { slug: 'source/to', type: 'source' as const, title: 'To', source_id: 'default', authority_state: 'active' as const },
+    ];
+    const report = compareSnapshots({
+      nodes,
+      edges: [
+        { from: 'source/from', to: 'source/to', type: '' as any, source_id: 'default' },
+        { from: 'source/from', to: 'source/to', type: 'custom_relation' as any, source_id: 'default' },
+      ],
+    });
+    expect(report.dry_run.valid_outgoing).toBe(2);
+    expect(report.dry_run.incoming_backlinks).toBe(2);
+    expect(report.dry_run.typed_relations).toBe(1);
+  });
+
   test('fixture-only CLI skips live readSnapshot and says so explicitly', async () => {
     const fixturePath = Bun.pathToFileURL('/tmp/tan610-fixture.jsonl').pathname;
     await Bun.write(fixturePath, FIXTURE);
@@ -132,7 +149,8 @@ describe('graph-integration harness', () => {
         type TEXT NOT NULL,
         title TEXT NOT NULL,
         source_id TEXT NOT NULL,
-        frontmatter JSONB NOT NULL DEFAULT '{}'::jsonb
+        frontmatter JSONB NOT NULL DEFAULT '{}'::jsonb,
+        deleted_at TIMESTAMPTZ
       );
       CREATE TABLE links (
         from_page_id INTEGER NOT NULL,
@@ -140,8 +158,25 @@ describe('graph-integration harness', () => {
         link_type TEXT NOT NULL,
         link_source TEXT
       );
-      INSERT INTO pages (slug, type, title, source_id, frontmatter)
-      VALUES ('source/fixture', 'source', 'Fixture', '24-105', '{"authority_state":"active"}');
+      INSERT INTO pages (slug, type, title, source_id, frontmatter, deleted_at)
+      VALUES
+        ('source/fixture', 'source', 'Fixture', '24-105', '{"authority_state":"active"}', NULL),
+        ('source/active', 'source', 'Active', '24-105', '{"authority_state":"active"}', NULL),
+        ('source/deleted', 'source', 'Deleted', '24-105', '{"authority_state":"active"}', NOW()),
+        ('source/external', 'source', 'External', 'shared', '{"authority_state":"active"}', NULL),
+        ('source/external-deleted', 'source', 'External Deleted', 'shared', '{"authority_state":"active"}', NOW());
+      INSERT INTO links (from_page_id, to_page_id, link_type, link_source)
+      SELECT fp.id, tp.id, 'source', 'manual'
+        FROM pages fp, pages tp
+       WHERE fp.slug = 'source/active' AND tp.slug = 'source/external';
+      INSERT INTO links (from_page_id, to_page_id, link_type, link_source)
+      SELECT fp.id, tp.id, 'source', 'manual'
+        FROM pages fp, pages tp
+       WHERE fp.slug = 'source/deleted' AND tp.slug = 'source/external';
+      INSERT INTO links (from_page_id, to_page_id, link_type, link_source)
+      SELECT fp.id, tp.id, 'source', 'manual'
+        FROM pages fp, pages tp
+       WHERE fp.slug = 'source/active' AND tp.slug = 'source/external-deleted';
     `);
     await setup.close();
     await Bun.write(
@@ -183,7 +218,17 @@ describe('graph-integration harness', () => {
       const exitCode = await proc.exited;
       expect(exitCode).toBe(0);
       expect(stderr).not.toContain('Schema version');
-      expect(JSON.parse(stdout).live_source_scope).toBe('24-105');
+      const report = JSON.parse(stdout);
+      expect(report.live_source_scope).toBe('24-105');
+      expect(report.coverage.live_read_only_nodes).toBe(3);
+      expect(report.coverage.live_read_only_edges).toBe(1);
+      expect(report.live_read_only.typed_relations).toBe(1);
+      expect(report.live_read_only.unresolved_targets).toBeNull();
+      expect(report.live_metric_coverage.fixture_only).toEqual([
+        'unresolved_targets',
+        'broken_references',
+        'cross_source_ambiguity',
+      ]);
 
       const verify = new PGlite(databasePath);
       const version = await verify.query<{ value: string }>(
@@ -203,12 +248,15 @@ describe('graph-integration harness', () => {
       expect(params).toEqual(['24-105']);
       if (sql.includes('FROM pages')) {
         expect(sql).toContain('WHERE p.source_id = $1');
+        expect(sql).toContain('p.deleted_at IS NULL');
         expect(sql).not.toContain('SELECT l.to_page_id');
         return [
           { slug: 'source/24-105-root', type: 'source', title: '24-105 Root', source_id: '24-105', frontmatter: { source_id: 'stale-other-source', authority_state: 'active' } },
         ];
       }
       expect(sql).toContain('WHERE fp.source_id = $1');
+      expect(sql).toContain('fp.deleted_at IS NULL');
+      expect(sql).toContain('tp.deleted_at IS NULL');
       return [
         { from_slug: 'source/24-105-root', to_slug: 'source/24-105-target', link_type: 'source', from_source_id: '24-105', to_source_id: 'shared', evidence: 'live' },
       ];
@@ -225,8 +273,15 @@ describe('graph-integration harness', () => {
     expect(executeRaw).toHaveBeenCalledTimes(2);
     const report = JSON.parse(log.mock.calls.flat().join('\n'));
     expect(report.live_source_scope).toBe('24-105');
-    expect(report.live_read_only.unresolved_targets).toBe(0);
-    expect(report.live_read_only.broken_references).toBe(0);
+    expect(report.live_read_only.unresolved_targets).toBeNull();
+    expect(report.live_read_only.broken_references).toBeNull();
+    expect(report.live_read_only.cross_source_ambiguity).toBeNull();
+    expect(report.comparisons.some((row: any) => row.metric === 'unresolved_targets')).toBe(false);
+    expect(report.live_metric_coverage.fixture_only).toEqual([
+      'unresolved_targets',
+      'broken_references',
+      'cross_source_ambiguity',
+    ]);
   });
 
   test('--live-read-only without --source is rejected before SQL', async () => {
@@ -276,4 +331,65 @@ describe('graph-integration harness', () => {
       process.exitCode = originalExitCode ?? 0;
     }
   });
+
+  test('live CLI validates source and fixture before connecting', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'gbrain-graph-invalid-'));
+    const fixturePath = join(home, 'fixture.jsonl');
+    const missingFixture = join(home, 'missing.jsonl');
+    await Bun.write(fixturePath, FIXTURE);
+    const env: Record<string, string> = {};
+    for (const [key, value] of Object.entries(process.env)) {
+      if (value !== undefined) env[key] = value;
+    }
+    delete env.GBRAIN_DATABASE_URL;
+    delete env.DATABASE_URL;
+    env.GBRAIN_HOME = home;
+
+    const run = async (args: string[]) => {
+      const proc = Bun.spawn(['bun', 'run', 'src/cli.ts', 'eval', 'graph-integration', ...args], {
+        cwd: new URL('..', import.meta.url).pathname,
+        env,
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      const stdout = await new Response(proc.stdout).text();
+      const stderr = await new Response(proc.stderr).text();
+      return { exitCode: await proc.exited, stdout, stderr };
+    };
+
+    try {
+      const invalidSource = await run([
+        fixturePath,
+        '--live-read-only',
+        '--source',
+        '--json',
+      ]);
+      expect(invalidSource.exitCode).toBe(2);
+      expect(invalidSource.stderr).toContain('Missing required --source <id>');
+      expect(invalidSource.stderr).not.toContain('No brain configured');
+
+      const missingFixtureArg = await run([
+        '--live-read-only',
+        '--source',
+        '24-105',
+        '--json',
+      ]);
+      expect(missingFixtureArg.exitCode).toBe(2);
+      expect(missingFixtureArg.stderr).toContain('Usage: gbrain eval graph-integration');
+      expect(missingFixtureArg.stderr).not.toContain('No brain configured');
+
+      const unreadableFixture = await run([
+        missingFixture,
+        '--live-read-only',
+        '--source',
+        '24-105',
+        '--json',
+      ]);
+      expect(unreadableFixture.exitCode).toBe(2);
+      expect(unreadableFixture.stderr).toContain('Cannot read fixture:');
+      expect(unreadableFixture.stderr).not.toContain('No brain configured');
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, 15_000);
 });

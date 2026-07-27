@@ -26,6 +26,9 @@ function help(): void {
 Run the TAN-610 graph/backlink acceptance harness in read-only mode.
 Measures outgoing links, incoming backlinks, typed relations, unresolved targets,
 broken references, duplicate edges, cross-source ambiguity, and authority-lifecycle compliance.
+Persisted live links can measure only resolved-edge metrics; unresolved targets,
+broken references, and cross-source ambiguity remain fixture-only and are emitted
+as null in the live result with explicit metric-coverage metadata.
 
 Options:
   --json               Emit machine-readable JSON.
@@ -39,14 +42,35 @@ function parseArgs(args: string[]): { fixture?: string; json: boolean; fixtureNa
   const json = args.includes('--json');
   const liveReadOnly = args.includes('--live-read-only');
   const fixtureNameIdx = args.indexOf('--fixture-name');
-  const fixtureName = fixtureNameIdx >= 0 ? args[fixtureNameIdx + 1] ?? 'graph-integration' : 'graph-integration';
+  const fixtureNameValue = fixtureNameIdx >= 0 ? args[fixtureNameIdx + 1] : undefined;
+  const fixtureName = fixtureNameValue && !fixtureNameValue.startsWith('--')
+    ? fixtureNameValue
+    : 'graph-integration';
   const sourceIdx = args.indexOf('--source');
-  const sourceId = sourceIdx >= 0 ? args[sourceIdx + 1] : undefined;
+  const sourceValue = sourceIdx >= 0 ? args[sourceIdx + 1] : undefined;
+  const sourceId = sourceValue && !sourceValue.startsWith('--') ? sourceValue : undefined;
   const consumedValues = new Set<number>();
-  if (fixtureNameIdx >= 0) consumedValues.add(fixtureNameIdx + 1);
-  if (sourceIdx >= 0) consumedValues.add(sourceIdx + 1);
+  if (fixtureNameIdx >= 0 && fixtureNameValue === fixtureName) consumedValues.add(fixtureNameIdx + 1);
+  if (sourceIdx >= 0 && sourceValue === sourceId) consumedValues.add(sourceIdx + 1);
   const fixture = args.find((a, index) => !a.startsWith('--') && !consumedValues.has(index));
   return { fixture, json, fixtureName, liveReadOnly, sourceId };
+}
+
+/**
+ * Fail closed before the generic CLI connects to a brain. A live probe may
+ * open an engine only after all syntax and fixture parsing that can fail
+ * without the engine has succeeded.
+ */
+export function graphIntegrationNeedsEngine(args: string[]): boolean {
+  if (args.includes('--help') || args.includes('-h')) return false;
+  const { fixture, liveReadOnly, sourceId } = parseArgs(args);
+  if (!liveReadOnly || !fixture || !sourceId) return false;
+  try {
+    parseGraphFixtureJsonl(readFileSync(fixture, 'utf8'));
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function readLiveSnapshot(engine: BrainEngine, sourceId: string): Promise<GraphGraphSnapshot> {
@@ -54,6 +78,7 @@ async function readLiveSnapshot(engine: BrainEngine, sourceId: string): Promise<
     `SELECT p.slug, p.type, p.title, p.source_id, p.frontmatter
        FROM pages p
       WHERE p.source_id = $1
+        AND p.deleted_at IS NULL
       ORDER BY p.slug`,
     [sourceId],
   );
@@ -62,8 +87,8 @@ async function readLiveSnapshot(engine: BrainEngine, sourceId: string): Promise<
             fp.source_id AS from_source_id, tp.source_id AS to_source_id,
             COALESCE(l.link_source, '') AS evidence
        FROM links l
-       JOIN pages fp ON fp.id = l.from_page_id
-       JOIN pages tp ON tp.id = l.to_page_id
+       JOIN pages fp ON fp.id = l.from_page_id AND fp.deleted_at IS NULL
+       JOIN pages tp ON tp.id = l.to_page_id AND tp.deleted_at IS NULL
       WHERE fp.source_id = $1
       ORDER BY fp.slug, tp.slug, l.link_type`,
     [sourceId],
@@ -106,6 +131,15 @@ async function readLiveSnapshot(engine: BrainEngine, sourceId: string): Promise<
       to_source_id: e.to_source_id,
       evidence: e.evidence ?? undefined,
     })),
+    // `links` contains only resolved FK-backed endpoints and stores explicit
+    // source identities. It cannot reveal unresolved references or missing /
+    // ambiguous source qualification. Those remain deterministic fixture-only
+    // metrics until GBrain persists a dedicated unresolved-reference substrate.
+    fixtureOnlyMetrics: [
+      'unresolved_targets',
+      'broken_references',
+      'cross_source_ambiguity',
+    ],
   };
 }
 

@@ -62,6 +62,12 @@ export interface GraphGraphEdge extends GraphFixtureEdge {
 export interface GraphGraphSnapshot {
   nodes: GraphFixtureNode[];
   edges: GraphGraphEdge[];
+  /**
+   * Metrics that cannot be observed from this snapshot's backing store.
+   * The persisted links table contains only resolved FK edges, so database
+   * snapshots mark unresolved/broken/ambiguity metrics as fixture-only.
+   */
+  fixtureOnlyMetrics?: Array<keyof GraphMetricCounts>;
 }
 
 export interface GraphMetricCounts {
@@ -82,12 +88,20 @@ export interface GraphComparison {
   delta: number;
 }
 
+export type GraphLiveMetricCounts = {
+  [K in keyof GraphMetricCounts]: number | null;
+};
+
 export interface GraphIntegrationReport {
   schema_version: 1;
   fixture_name: string;
   live_source_scope?: string | null;
   dry_run: GraphMetricCounts;
-  live_read_only?: GraphMetricCounts | null;
+  live_read_only?: GraphLiveMetricCounts | null;
+  live_metric_coverage?: {
+    measured: Array<keyof GraphMetricCounts>;
+    fixture_only: Array<keyof GraphMetricCounts>;
+  } | null;
   comparisons: GraphComparison[];
   coverage: {
     dry_run_edges: number;
@@ -186,7 +200,13 @@ function metricCounts(snapshot: GraphGraphSnapshot): GraphMetricCounts {
     if (resolved) {
       valid_outgoing++;
       incoming_backlinks++;
-      typed_relations++;
+      // GBrain permits custom relation names, so "typed" means a
+      // non-empty normalized link_type rather than membership in a closed
+      // enum. Blank/default link_type rows are resolved links, not typed
+      // relations.
+      if (typeof edge.type === 'string' && edge.type.trim().length > 0) {
+        typed_relations++;
+      }
     } else {
       unresolved_targets++;
       broken_references++;
@@ -227,8 +247,16 @@ export function compareSnapshots(dryRun: GraphGraphSnapshot, live?: GraphGraphSn
   const dry = metricCounts(dryRun);
   const hasLive = !!live;
   const liveCounts = live ? metricCounts(live) : null;
+  const metrics = Object.keys(dry) as (keyof GraphMetricCounts)[];
+  const fixtureOnly = new Set(live?.fixtureOnlyMetrics ?? []);
+  const measured = hasLive ? metrics.filter(metric => !fixtureOnly.has(metric)) : [];
+  const liveValues: GraphLiveMetricCounts | null = liveCounts
+    ? Object.fromEntries(
+        metrics.map(metric => [metric, fixtureOnly.has(metric) ? null : liveCounts[metric]]),
+      ) as GraphLiveMetricCounts
+    : null;
   const comparisons: GraphComparison[] = hasLive
-    ? (Object.keys(dry) as (keyof GraphMetricCounts)[]).map(metric => ({
+    ? measured.map(metric => ({
         metric,
         dry_run: dry[metric],
         live_read_only: liveCounts![metric],
@@ -240,10 +268,16 @@ export function compareSnapshots(dryRun: GraphGraphSnapshot, live?: GraphGraphSn
   if (!hasLive) {
     notes.push('fixture-only report: live-read-only comparison omitted by default; pass --live-read-only to compare against the engine');
   } else {
-    if (liveCounts!.broken_references > dry.broken_references) {
+    if (fixtureOnly.size > 0) {
+      notes.push(
+        `fixture-only metrics omitted from live comparison: ${[...fixtureOnly].join(', ')}; `
+        + 'the persisted links table contains only resolved, source-qualified foreign-key edges',
+      );
+    }
+    if (!fixtureOnly.has('broken_references') && liveCounts!.broken_references > dry.broken_references) {
       notes.push('live-read-only view contains additional broken references that a later repair would reduce');
     }
-    if (liveCounts!.unresolved_targets > dry.unresolved_targets) {
+    if (!fixtureOnly.has('unresolved_targets') && liveCounts!.unresolved_targets > dry.unresolved_targets) {
       notes.push('live-read-only view contains more unresolved targets than the dry-run expectation');
     }
     if (liveCounts!.authority_lifecycle_compliance < dry.authority_lifecycle_compliance) {
@@ -255,7 +289,10 @@ export function compareSnapshots(dryRun: GraphGraphSnapshot, live?: GraphGraphSn
     schema_version: 1,
     fixture_name: 'graph-integration',
     dry_run: dry,
-    live_read_only: liveCounts,
+    live_read_only: liveValues,
+    live_metric_coverage: hasLive
+      ? { measured, fixture_only: [...fixtureOnly] }
+      : null,
     comparisons,
     coverage: {
       dry_run_edges: dryRun.edges.length,
