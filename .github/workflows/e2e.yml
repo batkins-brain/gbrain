@@ -91,6 +91,10 @@ jobs:
         run: bun test test/e2e/mechanical.test.ts test/e2e/mcp.test.ts
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/gbrain_test
+      - name: Run Postgres/PGLite engine parity
+        run: bun test test/e2e/engine-parity.test.ts
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/gbrain_test
 
   tier2:
     name: Tier 2 (LLM Skills)

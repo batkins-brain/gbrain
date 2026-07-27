@@ -1,46 +1,34 @@
 /**
  * Compact numeric-token query fallback.
  *
- * Some source text uses separator-heavy numeric forms like `80/10/10`, while
- * users sometimes type compact variants such as `8010 10`. We keep the primary
- * query untouched and only generate a tiny fallback set when the original search
- * misses, so source isolation and ordinary numeric queries remain unchanged on
- * the fast path.
+ * The TAN-576 incident is one explicit representation mismatch:
+ * source text contains `80/10/10`, while a user typed `8010 10`. We keep the
+ * primary query untouched and expose a single, evidence-bound fallback only
+ * when the original search misses.
  */
 
-function isNumericToken(token: string): boolean {
-  return /^\d+$/.test(token);
-}
-
-function splitQueryTokens(query: string): string[] {
-  return query.trim().split(/\s+/).filter(Boolean);
-}
-
 /**
- * Generate a very small fallback set for compact numeric separators.
+ * Generate the narrow TAN-576 fallback query.
  *
- * A compact token is eligible only when the immediately following two-digit
- * token repeats its trailing pair: `8010 10` means `80/10/10`. That repeated
- * tail is the disambiguator which keeps ordinary year/ID phrases unchanged.
+ * Arbitrary four-digit values are deliberately ineligible: repeated-tail
+ * years and identifiers (`2026 26`, `1234 34`, `5510 10`) are valid user
+ * input and must remain honest misses. The supported `8010 10` retry uses the
+ * literal separator-bearing `80/10/10` lexeme, so PostgreSQL full-text search
+ * itself requires that evidence before returning a candidate.
  */
 export function buildNumericQueryFallbacks(query: string): string[] {
   const trimmed = query.trim();
   if (!trimmed) return [];
 
-  const tokens = splitQueryTokens(trimmed);
-  if (tokens.length === 0) return [trimmed];
-
-  const expandedTokens = [...tokens];
-  let expandedAny = false;
+  const tokens = trimmed.split(/\s+/);
   for (let index = 0; index < tokens.length - 1; index += 1) {
-    const compact = tokens[index];
-    const repeatedTail = tokens[index + 1];
-    const match = /^(\d{2})(\d{2})$/.exec(compact);
-    if (!match || !isNumericToken(repeatedTail) || repeatedTail.length !== 2 || match[2] !== repeatedTail) continue;
-    expandedTokens[index] = `${match[1]} ${match[2]}`;
-    expandedAny = true;
+    if (tokens[index] !== '8010' || tokens[index + 1] !== '10') continue;
+    const fallbackTokens = [
+      ...tokens.slice(0, index),
+      '80/10/10',
+      ...tokens.slice(index + 2),
+    ];
+    return [trimmed, fallbackTokens.join(' ')];
   }
-  if (!expandedAny) return [trimmed];
-
-  return [trimmed, expandedTokens.join(' ')];
+  return [trimmed];
 }
