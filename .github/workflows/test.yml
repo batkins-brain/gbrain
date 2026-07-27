@@ -29,7 +29,9 @@ jobs:
   # file EXCEPT the deny-list (CHANGELOG.md, README.md, docs/**/*.md, etc.
   # — see scripts/ci-cache-hash.sh for the full list). Looks up
   # `ci-pass-<hash>` in actions/cache; if hit, the test matrix + verify
-  # + serial jobs all skip and test-status reports green immediately.
+  # + serial jobs all skip. Secret scanning always runs against the exact
+  # current tree and commit range; test-status reports green only after it
+  # succeeds.
   # If miss, the full suite runs and cache-write seals it on success.
   #
   # Hit rate covers re-pushes (same SHA twice), branch rebases that
@@ -79,17 +81,41 @@ jobs:
           fi
 
   gitleaks:
-    needs: cache-check
-    if: needs.cache-check.outputs.hit != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           fetch-depth: 0
-      - uses: gitleaks/gitleaks-action@dcedce43c6f43de0b836d1fe38946645c9c638dc  # v2
+      - name: Install Gitleaks 8.30.1
+        run: |
+          archive=gitleaks_8.30.1_linux_x64.tar.gz
+          curl --fail --silent --show-error --location \
+            --output "/tmp/$archive" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/$archive"
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  /tmp/$archive" \
+            | sha256sum --check
+          tar -xzf "/tmp/$archive" -C /tmp gitleaks
+          /tmp/gitleaks version
+      - name: Scan current tree and changed commits
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          /tmp/gitleaks dir . --redact --no-banner
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            range="$PR_BASE_SHA..$PR_HEAD_SHA"
+          elif [ "$EVENT_NAME" = "push" ] \
+            && [ -n "$PUSH_BEFORE_SHA" ] \
+            && [ "$PUSH_BEFORE_SHA" != "0000000000000000000000000000000000000000" ]; then
+            range="$PUSH_BEFORE_SHA..$CURRENT_SHA"
+          else
+            range="$(git merge-base origin/master HEAD)..HEAD"
+          fi
+          /tmp/gitleaks git . --redact --no-banner --log-opts="$range"
 
   verify:
     # Pre-test gates: privacy/jsonb/source-id/etc + typecheck + admin-build.
@@ -251,8 +277,9 @@ jobs:
 
   # ──────────────────────────────────────────────────────────────────────
   # test-status: the single user-visible "did CI pass?" check.
-  # Runs always (if: always()), succeeds when EITHER cache-check.hit==true
-  # OR all gated jobs (gitleaks, verify, serial-tests, test) succeeded.
+  # Runs always (if: always()). Gitleaks must succeed on every exact head.
+  # After that, either cache-check.hit==true OR all remaining gated test jobs
+  # must have succeeded.
   # Branch protection (when configured) gates on this single job name.
   # ──────────────────────────────────────────────────────────────────────
   test-status:
@@ -272,12 +299,16 @@ jobs:
           TEST="${{ needs.test.result }}"
           echo "cache-check.hit=$HIT"
           echo "gitleaks=$GITLEAKS  verify=$VERIFY  serial-tests=$SERIAL  slow-eval-longmemeval=$SLOW_EVAL  slow-entity-resolve-perf=$SLOW_PERF  test=$TEST"
+          if [ "$GITLEAKS" != "success" ]; then
+            echo "✗ gitleaks did not succeed (got $GITLEAKS) — CI fail"
+            exit 1
+          fi
           if [ "$HIT" = "true" ]; then
-            echo "✓ cache HIT for hash ${{ needs.cache-check.outputs.hash }} — CI green"
+            echo "✓ gitleaks succeeded and cache HIT for hash ${{ needs.cache-check.outputs.hash }} — CI green"
             exit 0
           fi
-          # Cache miss: every gated job must have succeeded.
-          for r in "$GITLEAKS" "$VERIFY" "$SERIAL" "$SLOW_EVAL" "$SLOW_PERF" "$TEST"; do
+          # Cache miss: every remaining gated test job must have succeeded.
+          for r in "$VERIFY" "$SERIAL" "$SLOW_EVAL" "$SLOW_PERF" "$TEST"; do
             if [ "$r" != "success" ]; then
               echo "✗ gated job did not succeed (got $r) — CI fail"
               exit 1

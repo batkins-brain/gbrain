@@ -54,6 +54,7 @@ import { GBrainError, PAGE_SORT_SQL, ENRICH_ORDER_SQL } from './types.ts';
 import { finalizeLastSeen } from './chronicle/last-seen.ts';
 import { computeAnomaliesFromBuckets } from './cycle/anomaly.ts';
 import { resolveBoostMap, resolveHardExcludes } from './search/source-boost.ts';
+import { buildNumericQueryFallbacks } from './search/numeric-query.ts';
 import { buildSourceFactorCase, buildHardExcludeClause, buildVisibilityClause, buildRecencyComponentSql, buildBestPerPagePoolCte } from './search/sql-ranking.ts';
 import {
   normalizeEngineColumn,
@@ -1578,8 +1579,7 @@ export class PGLiteEngine implements BrainEngine {
       extraFilter += ` AND p.source_id = $${params.length}`;
     }
 
-    const { rows } = await this.db.query(
-      `WITH ranked AS (
+    const rawQuery = `WITH ranked AS (
          SELECT
            p.slug, p.id as page_id, p.title, p.type, p.source_id,
            p.effective_date, p.effective_date_source,
@@ -1602,11 +1602,17 @@ export class PGLiteEngine implements BrainEngine {
        ${buildBestPerPagePoolCte('ranked')}
        SELECT * FROM best_per_page
        ORDER BY score DESC, page_id ASC, chunk_id ASC
-       LIMIT $3 OFFSET $4`,
-      params
-    );
+       LIMIT $3 OFFSET $4`;
 
-    return (rows as Record<string, unknown>[]).map(rowToSearchResult);
+    const queryVariants = buildNumericQueryFallbacks(query);
+    let rows = await this.db.query(rawQuery, params);
+    if ((rows.rows as Record<string, unknown>[]).length === 0 && queryVariants.length > 1) {
+      const nextParams = [...params];
+      nextParams[0] = queryVariants[1];
+      rows = await this.db.query(rawQuery, nextParams);
+    }
+
+    return (rows.rows as Record<string, unknown>[]).map(rowToSearchResult);
   }
 
   /**
@@ -1811,8 +1817,7 @@ export class PGLiteEngine implements BrainEngine {
 
     // visibilityClause already declared above (v0.32.7: hoisted so CJK branch can reuse).
 
-    const { rows } = await this.db.query(
-      `SELECT
+    const rawQuery = `SELECT
          p.slug, p.id as page_id, p.title, p.type, p.source_id,
          p.effective_date, p.effective_date_source,
          cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
@@ -1825,11 +1830,17 @@ export class PGLiteEngine implements BrainEngine {
        JOIN sources s ON s.id = p.source_id
        WHERE cc.search_vector @@ websearch_to_tsquery('english', $1) ${detailFilter}${extraFilter} ${hardExcludeClause} ${visibilityClause}
        ORDER BY score DESC
-       LIMIT $2 OFFSET $3`,
-      params
-    );
+       LIMIT $2 OFFSET $3`;
 
-    return (rows as Record<string, unknown>[]).map(rowToSearchResult);
+    const queryVariants = buildNumericQueryFallbacks(query);
+    let rows = await this.db.query(rawQuery, params);
+    if ((rows.rows as Record<string, unknown>[]).length === 0 && queryVariants.length > 1) {
+      const nextParams = [...params];
+      nextParams[0] = queryVariants[1];
+      rows = await this.db.query(rawQuery, nextParams);
+    }
+
+    return (rows.rows as Record<string, unknown>[]).map(rowToSearchResult);
   }
 
   async searchVector(embedding: Float32Array, opts?: SearchOpts): Promise<SearchResult[]> {

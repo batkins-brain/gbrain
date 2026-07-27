@@ -78,6 +78,7 @@ if [ "$has_clone" = "1" ]; then
   exit 0
 fi
 if [ "$has_remote_get_url" = "1" ]; then
+  if [ "$mode" = "no-remote" ]; then exit 1; fi
   echo "https://github.com/example/repo"
   exit 0
 fi
@@ -88,7 +89,7 @@ exit 0
   chmodSync(path, 0o755);
 }
 
-function setMode(mode: 'ok' | 'clone-fail'): void {
+function setMode(mode: 'ok' | 'clone-fail' | 'no-remote'): void {
   writeFileSync(join(FAKE_GIT_DIR, 'mode'), mode);
 }
 
@@ -440,6 +441,19 @@ describe('getSourceStatus', () => {
       rmSync(row.local_path!, { recursive: true, force: true });
       const s = await getSourceStatus(engine, 'status-missing');
       expect(s.clone_state).toBe('missing');
+    });
+  });
+
+  test('clone_state = "no-remote" for a valid local-only checkout', async () => {
+    await withEnv2(async () => {
+      const userPath = join(GBRAIN_HOME, 'no-remote-fixture');
+      mkdirSync(join(userPath, '.git'), { recursive: true });
+      setMode('no-remote');
+      await addSource(engine, { id: 'status-no-remote', localPath: userPath });
+      const s = await getSourceStatus(engine, 'status-no-remote');
+      expect(s.clone_state).toBe('no-remote');
+      expect(s.remote_url).toBeNull();
+      rmSync(userPath, { recursive: true, force: true });
     });
   });
 

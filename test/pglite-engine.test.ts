@@ -216,6 +216,91 @@ describe('PGLiteEngine: Search', () => {
     expect(results.length).toBe(0);
   });
 
+  test('searchKeyword recalls compact numeric separators on fallback', async () => {
+    await engine.putPage('24-105/rulings/layback-8010-10-allocated', {
+      type: 'ruling',
+      title: 'Layback 80/10/10 allocated',
+      compiled_truth: 'Layback 80/10/10 allocated to the project.'
+    });
+    await engine.upsertChunks('24-105/rulings/layback-8010-10-allocated', [
+      { chunk_index: 0, chunk_text: 'Layback 80/10/10 allocated to the project.', chunk_source: 'compiled_truth' },
+    ]);
+
+    const results = await engine.searchKeyword('layback 8010 10 allocated');
+    expect(results.map(r => r.slug)).toContain('24-105/rulings/layback-8010-10-allocated');
+  });
+
+  test('searchKeyword fallback preserves source scope when another source has the same compact-numeric match', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config) VALUES ('src-b', 'src-b', '{}'::jsonb) ON CONFLICT DO NOTHING`,
+    );
+    // Seed the default source with the same fallback-only text. The scoped
+    // retry must retain the original parameterized source predicate rather
+    // than leaking a cross-source answer on its second query.
+    await engine.putPage('24-105/rulings/layback-8010-10-allocated', {
+      type: 'ruling',
+      title: 'Default-source decoy',
+      compiled_truth: 'Layback 80/10/10 allocated to the project.',
+    });
+    await engine.upsertChunks('24-105/rulings/layback-8010-10-allocated', [
+      { chunk_index: 0, chunk_text: 'Layback 80/10/10 allocated to the project.', chunk_source: 'compiled_truth' },
+    ]);
+    await engine.putPage('24-105/rulings/layback-8010-10-allocated', {
+      type: 'ruling',
+      title: 'Scoped source',
+      compiled_truth: 'Layback 80/10/10 allocated to the project.',
+    }, { sourceId: 'src-b' });
+    await engine.upsertChunks('24-105/rulings/layback-8010-10-allocated', [
+      { chunk_index: 0, chunk_text: 'Layback 80/10/10 allocated to the project.', chunk_source: 'compiled_truth' },
+    ], { sourceId: 'src-b' });
+
+    const results = await engine.searchKeyword('layback 8010 10 allocated', { sourceId: 'src-b' });
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({
+      slug: '24-105/rulings/layback-8010-10-allocated',
+      source_id: 'src-b',
+      title: 'Scoped source',
+    });
+  });
+
+  test('searchKeywordChunks fallback also works for compact numerics', async () => {
+    await engine.putPage('24-105/rulings/layback-8010-10-allocated-chunk', {
+      type: 'ruling',
+      title: 'Layback 80/10/10 allocated chunk',
+      compiled_truth: 'Layback 80/10/10 allocated to the project.'
+    });
+    await engine.upsertChunks('24-105/rulings/layback-8010-10-allocated-chunk', [
+      { chunk_index: 0, chunk_text: 'Layback 80/10/10 allocated to the project.', chunk_source: 'compiled_truth' },
+    ]);
+
+    const results = await engine.searchKeywordChunks('layback 8010 10 allocated');
+    expect(results.map(r => r.slug)).toContain('24-105/rulings/layback-8010-10-allocated-chunk');
+  });
+
+  test('searchKeyword fallback rejects repeated-tail year and identifier decoys', async () => {
+    await engine.putPage('notes/decoy-year', {
+      type: 'note',
+      title: 'Report decoy year',
+      compiled_truth: 'Report 20 completed item 26.',
+    });
+    await engine.upsertChunks('notes/decoy-year', [
+      { chunk_index: 0, chunk_text: 'Report 20 completed item 26.', chunk_source: 'compiled_truth' },
+    ]);
+    await engine.putPage('notes/decoy-id', {
+      type: 'note',
+      title: 'Ticket decoy identifier',
+      compiled_truth: 'Ticket 80 assigned group 10.',
+    });
+    await engine.upsertChunks('notes/decoy-id', [
+      { chunk_index: 0, chunk_text: 'Ticket 80 assigned group 10.', chunk_source: 'compiled_truth' },
+    ]);
+
+    expect(await engine.searchKeyword('report 2026 26')).toEqual([]);
+    expect(await engine.searchKeyword('ticket 8010 10')).toEqual([]);
+    expect(await engine.searchKeywordChunks('report 2026 26')).toEqual([]);
+    expect(await engine.searchKeywordChunks('ticket 8010 10')).toEqual([]);
+  });
+
   test('tsvector trigger populates search_vector on insert', async () => {
     // Verify the PL/pgSQL trigger fires and content_chunks.search_vector is
     // populated from chunk_text. v0.20.0 Cathedral II Layer 3 moved FTS from

@@ -1556,6 +1556,13 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
               `gbrain sources remove ${opts.sourceId} --confirm-destructive && ` +
               `gbrain sources add ${opts.sourceId} --url ${remoteUrl}`,
           );
+        case 'no-remote':
+          throw new Error(
+            `Source "${opts.sourceId}" at ${repoPath} has no origin remote ` +
+              `although config.remote_url is set. Re-add it with: ` +
+              `gbrain sources remove ${opts.sourceId} --confirm-destructive && ` +
+              `gbrain sources add ${opts.sourceId} --url ${remoteUrl}`,
+          );
         case 'url-drift':
           throw new Error(
             `Source "${opts.sourceId}" clone at ${repoPath} has a remote ` +
@@ -1786,6 +1793,21 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       detachedWorkingTreeManifest.renamed.length > 0);
 
   if (lastCommit === headCommit && !versionMismatch && !versionNeverSet && !hasDetachedWorkingTreeChanges) {
+    // TAN-607 / false-fresh: a verified no-op sync must still bookmark
+    // last_sync_at. Doctor lag and operator freshness read last_sync_at;
+    // fanout "fresh" previously used last_full_cycle_at only. Without this
+    // stamp, "Already up to date" left multi-day last_sync ages while cycles
+    // looked healthy. Mirror the totalChanges===0 path below (and skip dry-run).
+    if (!opts.dryRun) {
+      await writeSyncAnchor(
+        engine,
+        opts.sourceId,
+        'last_commit',
+        headCommit,
+        commitTimeMs(repoPath, headCommit),
+      );
+      await engine.setConfig('sync.last_run', new Date().toISOString());
+    }
     return {
       status: 'up_to_date',
       fromCommit: lastCommit,

@@ -19,6 +19,7 @@ import {
 } from '../core/pace-mode.ts';
 import { tryAcquireDbLock, type DbLockHandle } from '../core/db-lock.ts';
 import { embedBackfillLockId } from '../core/embed-backfill-lock.ts';
+import { resolveSourceId } from '../core/source-resolver.ts';
 
 export interface EmbedOpts {
   /** Embed ALL pages (every chunk). */
@@ -415,7 +416,33 @@ export function parsePaceArgs(
   return { ...(perCallMode !== undefined && { perCallMode }), ...(perCall && { perCall }) };
 }
 
+function parseSourceArg(args: string[]): string | undefined {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--source') {
+      const value = args[i + 1];
+      if (!value || value.startsWith('--')) {
+        throw new Error('Missing value for --source');
+      }
+      return value;
+    }
+    if (a.startsWith('--source=')) {
+      const value = a.slice('--source='.length);
+      if (!value) throw new Error('Missing value for --source');
+      return value;
+    }
+  }
+  return undefined;
+}
+
 export async function runEmbed(engine: BrainEngine, args: string[]): Promise<EmbedResult | undefined> {
+  // Resolve source intent before either inline execution or durable queue
+  // submission so both paths share validation and canonical source identity.
+  const sourceArg = parseSourceArg(args);
+  const sourceId = sourceArg || process.env.GBRAIN_SOURCE
+    ? await resolveSourceId(engine, sourceArg ?? null)
+    : undefined;
+
   // v0.36+ T7: --background submits via Minion queue, returns job_id to
   // stdout, exits. Same semantics in TTY and cron (D9).
   if (args.includes('--background')) {
@@ -426,13 +453,12 @@ export async function runEmbed(engine: BrainEngine, args: string[]): Promise<Emb
       jobName: 'embed',
       paramBuilder: (cleanArgs) => {
         const slugsI = cleanArgs.indexOf('--slugs');
-        const srcI = cleanArgs.indexOf('--source');
         return {
           all: cleanArgs.includes('--all'),
           stale: cleanArgs.includes('--stale'),
           dryRun: cleanArgs.includes('--dry-run'),
           slugs: slugsI >= 0 ? cleanArgs.slice(slugsI + 1).filter(a => !a.startsWith('--')) : undefined,
-          sourceId: srcI >= 0 ? cleanArgs[srcI + 1] : undefined,
+          sourceId,
           // CX1+CX5: carry explicit pace overrides into the `embed` job payload
           // (the job name CLI --background actually submits). The handler
           // re-resolves env > config > bundle at execution.
@@ -450,8 +476,9 @@ export async function runEmbed(engine: BrainEngine, args: string[]): Promise<Emb
   const stale = args.includes('--stale');
   const dryRun = args.includes('--dry-run');
   // v0.31.12: --source <id> scopes to a single source.
-  const sourceIdx = args.indexOf('--source');
-  const sourceId = sourceIdx >= 0 ? args[sourceIdx + 1] : undefined;
+  // GBRAIN_SOURCE scopes embed too. No-source invocations remain
+  // brain-wide for backwards compatibility; only explicit/env source intent
+  // narrows the target set.
   // v0.41.18.0 (A13): --batch-size N, --priority recent, --catch-up flags.
   const batchSizeIdx = args.indexOf('--batch-size');
   const batchSizeRaw = batchSizeIdx >= 0 ? args[batchSizeIdx + 1] : undefined;
@@ -471,7 +498,7 @@ export async function runEmbed(engine: BrainEngine, args: string[]): Promise<Emb
   } else {
     const slug = args.find(a => !a.startsWith('--'));
     if (!slug) {
-      serr('Usage: gbrain embed [<slug>|--all|--stale|--slugs s1 s2 ...] [--dry-run] [--batch-size N] [--priority recent] [--catch-up]');
+      serr('Usage: gbrain embed [<slug>|--all|--stale|--slugs s1 s2 ...] [--source ID] [--dry-run] [--batch-size N] [--priority recent] [--catch-up]');
       process.exit(1);
     }
     opts = { slug, dryRun, sourceId, batchSize, priority, catchUp };
@@ -764,7 +791,7 @@ async function embedAll(
 
   // Stdout summary preserved for scripts/tests that grep for counts.
   if (dryRun) {
-    slog(`[dry-run] Would embed ${result.would_embed} chunks across ${pages.length} pages`);
+    slog(`[dry-run] Would embed ${result.would_embed} chunks across ${pages.length} pages${sourceId ? ` in source ${sourceId}` : ''}`);
   } else {
     slog(`Embedded ${result.embedded} chunks across ${pages.length} pages`);
   }
@@ -831,7 +858,7 @@ async function embedAllStale(
   );
   if (staleCount === 0) {
     if (dryRun) {
-      slog('[dry-run] Would embed 0 chunks (0 stale found)');
+      slog(`[dry-run] Would embed 0 chunks${sourceId ? ` in source ${sourceId}` : ''} (0 stale found)`);
     } else {
       slog('Embedded 0 chunks (0 stale found)');
     }
@@ -842,7 +869,7 @@ async function embedAllStale(
     result.would_embed += staleCount;
     result.total_chunks += staleCount;
     if (onProgress) onProgress(1, 1, 0);
-    slog(`[dry-run] Would embed ${staleCount} stale chunks`);
+    slog(`[dry-run] Would embed ${staleCount} stale chunks${sourceId ? ` in source ${sourceId}` : ''}`);
     return;
   }
 
