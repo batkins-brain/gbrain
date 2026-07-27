@@ -40,6 +40,7 @@
 import type { BrainEngine, FactInsertStatus, NewFact } from '../engine.ts';
 import { isFactsBackstopEligible } from './eligibility.ts';
 import type { PageType } from '../types.ts';
+import type { ExtractAbsorbedFailure } from './extract.ts';
 
 export interface FactsBackstopCtx {
   engine: BrainEngine;
@@ -165,7 +166,28 @@ export async function runFactsBackstop(
       // increments only). Now they land in ingest_log so doctor +
       // dashboard surface failure modes per source.
       try {
-        const result = await runPipeline(parsedPage, ctx, signal);
+        let absorbedFailure = false;
+        const onAbsorbedFailure = async (failure: ExtractAbsorbedFailure) => {
+          absorbedFailure = true;
+          const { writeFactsAbsorbLog } = await import('./absorb-log.ts');
+          const detail = failure.error instanceof Error
+            ? failure.error.message
+            : String(failure.error);
+          await writeFactsAbsorbLog(
+            ctx.engine,
+            parsedPage.slug,
+            failure.reason,
+            detail,
+            ctx.sourceId,
+          );
+        };
+        const result = await runPipeline(
+          parsedPage,
+          ctx,
+          signal,
+          onAbsorbedFailure,
+        );
+        if (absorbedFailure) return;
         const { writeFactsAbsorbLog } = await import('./absorb-log.ts');
         await writeFactsAbsorbLog(
           ctx.engine,
@@ -249,6 +271,7 @@ async function runPipeline(
   parsedPage: ParsedPageInput,
   ctx: FactsBackstopCtx,
   abortSignal?: AbortSignal,
+  onAbsorbedFailure?: (failure: ExtractAbsorbedFailure) => void | Promise<void>,
 ): Promise<{ inserted: number; duplicate: number; superseded: number; fact_ids: number[] }> {
   return runPipelineWithBody(
     {
@@ -257,6 +280,7 @@ async function runPipeline(
     },
     ctx,
     abortSignal,
+    onAbsorbedFailure,
   );
 }
 
@@ -290,6 +314,7 @@ async function runPipelineWithBody(
   input: { turnText: string; isDreamGenerated: boolean },
   ctx: FactsBackstopCtx,
   abortSignal?: AbortSignal,
+  onAbsorbedFailure?: (failure: ExtractAbsorbedFailure) => void | Promise<void>,
 ): Promise<{ inserted: number; duplicate: number; superseded: number; fact_ids: number[] }> {
   const { extractFactsFromTurn } = await import('./extract.ts');
   const { resolveEntitySlug } = await import('../entities/resolve.ts');
@@ -309,6 +334,7 @@ async function runPipelineWithBody(
     engine: ctx.engine,
     abortSignal,
     model: ctx.model,
+    onAbsorbedFailure,
   });
 
   const filter = ctx.notabilityFilter ?? 'all';

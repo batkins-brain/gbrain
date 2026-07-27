@@ -93,6 +93,17 @@ export interface ExtractInput {
   abortSignal?: AbortSignal;
   /** Cap on number of facts returned per turn. Defaults to 10. */
   maxFactsPerTurn?: number;
+  /**
+   * Optional observability hook for failures this best-effort extractor
+   * intentionally converts into an empty result. The hook must not change
+   * extraction semantics; callback errors are absorbed too.
+   */
+  onAbsorbedFailure?: (failure: ExtractAbsorbedFailure) => void | Promise<void>;
+}
+
+export interface ExtractAbsorbedFailure {
+  reason: 'gateway_error' | 'parse_failure';
+  error: unknown;
 }
 
 /** A pre-INSERT fact ready for the engine.insertFact path. */
@@ -159,6 +170,10 @@ export async function extractFactsFromTurn(input: ExtractInput): Promise<Extract
   if (!isAvailable('chat')) {
     // No chat gateway → no extraction. Caller still inserts facts via direct
     // `gbrain take add` paths.
+    await notifyAbsorbedFailure(input, {
+      reason: 'gateway_error',
+      error: new Error('facts extraction chat gateway is unavailable'),
+    });
     return [];
   }
 
@@ -186,13 +201,20 @@ export async function extractFactsFromTurn(input: ExtractInput): Promise<Extract
     // Re-throw aborts; absorb other errors as "no extraction" — caller's
     // `put_page` backstop will still record the page itself.
     if (isAbort(err)) throw err;
+    await notifyAbsorbedFailure(input, { reason: 'gateway_error', error: err });
     return [];
   }
 
   if (result.stopReason === 'refusal' || result.stopReason === 'content_filter') return [];
 
   const parsedRaw = parseExtractorJson(result.text);
-  if (!parsedRaw) return [];
+  if (!parsedRaw) {
+    await notifyAbsorbedFailure(input, {
+      reason: 'parse_failure',
+      error: new Error('facts extractor returned malformed JSON'),
+    });
+    return [];
+  }
 
   const facts: ExtractedFact[] = [];
   for (const candidate of parsedRaw.slice(0, cap)) {
@@ -251,6 +273,17 @@ export async function extractFactsFromTurn(input: ExtractInput): Promise<Extract
   }
 
   return facts;
+}
+
+async function notifyAbsorbedFailure(
+  input: ExtractInput,
+  failure: ExtractAbsorbedFailure,
+): Promise<void> {
+  try {
+    await input.onAbsorbedFailure?.(failure);
+  } catch {
+    // Observability must not turn a best-effort extractor into a hard failure.
+  }
 }
 
 interface RawExtracted {
