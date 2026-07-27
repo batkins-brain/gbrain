@@ -677,6 +677,7 @@ describe('runEmbed CLI flag wiring (--stale --source)', () => {
   test('--source <id> on CLI threads sourceId into countStaleChunks', async () => {
     let receivedOpts: unknown;
     const engine = mockEngine({
+      executeRaw: async () => [{ id: 'media-corpus' }],
       countStaleChunks: async (opts: unknown) => {
         receivedOpts = opts;
         return 0; // short-circuit so we don't hit listStaleChunks

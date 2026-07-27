@@ -71,4 +71,18 @@ describe('check-privacy.sh CI wiring', () => {
     const yml = readFileSync(TEST_WORKFLOW, 'utf-8');
     expect(yml).toContain('bun run verify');
   });
+
+  it('CI secret scanning cannot be bypassed by a test-cache hit', () => {
+    const yml = readFileSync(TEST_WORKFLOW, 'utf-8');
+    const gitleaks = yml.match(/\n  gitleaks:\n([\s\S]*?)\n  verify:/)?.[1];
+    expect(gitleaks).toBeDefined();
+    expect(gitleaks).not.toContain('needs: cache-check');
+    expect(gitleaks).not.toContain("needs.cache-check.outputs.hit != 'true'");
+
+    const aggregate = yml.match(/\n  test-status:\n([\s\S]*?)$/)?.[1];
+    expect(aggregate).toBeDefined();
+    expect(aggregate).toContain('if [ "$GITLEAKS" != "success" ]');
+    expect(aggregate!.indexOf('if [ "$GITLEAKS" != "success" ]'))
+      .toBeLessThan(aggregate!.indexOf('if [ "$HIT" = "true" ]'));
+  });
 });
