@@ -66,6 +66,12 @@ export async function runEvalCommand(engine: BrainEngine, args: string[]): Promi
     const { runEvalRetrievalQuality } = await import('./eval-retrieval-quality.ts');
     return runEvalRetrievalQuality(engine, args.slice(1));
   }
+  if (sub === 'graph-integration') {
+    // TAN-610 — pure graph/backlink acceptance harness. Read-only dry-run vs
+    // live snapshot comparison with no mutation/backfill.
+    const { runEvalGraphIntegration } = await import('./eval-graph-integration.ts');
+    return runEvalGraphIntegration(engine, args.slice(1));
+  }
   if (sub === 'brainstorm') {
     // v0.37.0 (D3 + codex r2 #11) — three-axis evaluation gate for the
     // brainstorm + LSD wave. Engine connected (calls hybridSearch +

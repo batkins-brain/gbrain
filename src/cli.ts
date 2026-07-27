@@ -272,7 +272,9 @@ async function main() {
   }
 
   // Per-command --help
-  if (hasHelpFlag(subArgs)) {
+  // graph-integration owns strict option parsing. Do not let a value-shaped
+  // `-h` later in its argv bypass that parser as generic `eval` help.
+  if (hasHelpFlag(subArgs) && !(command === 'eval' && subArgs[0] === 'graph-integration')) {
     const op = cliOps.get(command) ?? cliAliases.get(command);
     if (op) {
       printOpHelp(op, command);
@@ -1411,6 +1413,29 @@ async function handleCliOnly(command: string, args: string[]) {
   if (command === 'eval' && args[0] === 'conversation-parser') {
     const { runEvalConversationParser } = await import('./commands/eval-conversation-parser.ts');
     setCliExitVerdict(await runEvalConversationParser(args.slice(1)));
+    return;
+  }
+
+  // TAN-610 graph integration has two intentionally read-only execution
+  // modes. Fixture-only evaluation is hermetic and must not connect to a
+  // configured brain. Live comparison connects in probe-only mode so it can
+  // issue bounded SELECTs without running pending schema migrations.
+  if (command === 'eval' && args[0] === 'graph-integration') {
+    const {
+      graphIntegrationNeedsEngine,
+      runEvalGraphIntegration,
+    } = await import('./commands/eval-graph-integration.ts');
+    const graphArgs = args.slice(1);
+    if (!graphIntegrationNeedsEngine(graphArgs)) {
+      await runEvalGraphIntegration(null, graphArgs);
+      return;
+    }
+    const engine = await connectEngine({ probeOnly: true });
+    try {
+      await runEvalGraphIntegration(engine, graphArgs);
+    } finally {
+      await finishCliTeardown({ engine });
+    }
     return;
   }
 

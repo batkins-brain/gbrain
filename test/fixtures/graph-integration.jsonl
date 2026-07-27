@@ -1,0 +1,11 @@
+{"kind":"node","node":{"slug":"people/alice-example","type":"person","title":"Alice Example","source_id":"default","authority_state":"active"}}
+{"kind":"node","node":{"slug":"people/bob-example","type":"person","title":"Bob Example","source_id":"default","authority_state":"archived","successor_slug":"projects/alice-successor"}}
+{"kind":"node","node":{"slug":"companies/acme-example","type":"company","title":"Acme Example","source_id":"default","authority_state":"active"}}
+{"kind":"node","node":{"slug":"projects/alice-successor","type":"project","title":"Alice Successor","source_id":"default","authority_state":"active"}}
+{"kind":"node","node":{"slug":"source/primary","type":"source","title":"Primary Source","source_id":"primary","authority_state":"active"}}
+{"kind":"node","node":{"slug":"source/secondary","type":"source","title":"Secondary Source","source_id":"secondary","authority_state":"active"}}
+{"kind":"edge","edge":{"from":"people/alice-example","to":"companies/acme-example","type":"works_at","source_id":"default","evidence":"profile mention"}}
+{"kind":"edge","edge":{"from":"people/alice-example","to":"companies/acme-example","type":"works_at","source_id":"default","evidence":"duplicate row to test dedupe"}}
+{"kind":"edge","edge":{"from":"people/bob-example","to":"projects/alice-successor","type":"successor_of","source_id":"default","evidence":"archive handoff"}}
+{"kind":"edge","edge":{"from":"people/bob-example","to":"people/missing-example","type":"mentions","source_id":"default","evidence":"broken ref"}}
+{"kind":"edge","edge":{"from":"source/primary","to":"source/secondary","type":"source","source_id":"primary","from_source_id":"primary","to_source_id":"secondary","evidence":"cross-source retrieval"}}
