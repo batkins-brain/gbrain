@@ -37,6 +37,18 @@ describe('graph-integration harness', () => {
     expect(() => parseGraphFixtureJsonl('{"kind":"node","node":{"slug":"../invalid","type":"source","title":"A","source_id":"default"}}')).toThrow('invalid node.slug');
   });
 
+  test('accepts schema-pack-extensible page and relation types', () => {
+    const rows = parseGraphFixtureJsonl(`
+{"kind":"node","node":{"slug":"meetings/review","type":"meeting","title":"Review","source_id":"default"}}
+{"kind":"node","node":{"slug":"decisions/custom","type":"decision","title":"Custom Decision","source_id":"default"}}
+{"kind":"edge","edge":{"from":"meetings/review","to":"decisions/custom","type":"custom_relation","source_id":"default"}}
+    `);
+    expect(rows[0]?.node?.type).toBe('meeting');
+    expect(rows[1]?.node?.type).toBe('decision');
+    expect(rows[2]?.edge?.type).toBe('custom_relation');
+    expect(compareSnapshots(buildSnapshot(rows)).dry_run.typed_relations).toBe(1);
+  });
+
   test('parses and scores fixture metrics deterministically', () => {
     const rows = parseGraphFixtureJsonl(FIXTURE);
     expect(rows).toHaveLength(13);

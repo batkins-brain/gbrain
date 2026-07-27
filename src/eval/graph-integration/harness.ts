@@ -21,18 +21,13 @@
 import { assertValidSourceId } from '../../core/source-id.ts';
 import { validatePageSlug } from '../../core/operations.ts';
 
-export type GraphRelationType =
-  | 'works_at'
-  | 'advises'
-  | 'invested_in'
-  | 'attended'
-  | 'mentions'
-  | 'source'
-  | 'successor_of';
+/** Relation names are schema-pack extensible, matching persisted link_type. */
+export type GraphRelationType = string;
 
 export interface GraphFixtureNode {
   slug: string;
-  type: 'person' | 'company' | 'project' | 'advisor' | 'archive' | 'source';
+  /** Page types are schema-pack extensible, matching canonical PageType. */
+  type: string;
   title: string;
   source_id: string;
   authority_state?: 'active' | 'archived' | 'retired';
@@ -136,14 +131,6 @@ export interface LiveGraphEdgeRow {
   evidence?: string | null;
 }
 
-const GRAPH_NODE_TYPES = new Set<GraphFixtureNode['type']>([
-  'person',
-  'company',
-  'project',
-  'advisor',
-  'archive',
-  'source',
-]);
 const AUTHORITY_STATES = new Set<NonNullable<GraphFixtureNode['authority_state']>>([
   'active',
   'archived',
@@ -198,9 +185,6 @@ function validateFixtureRow(value: unknown, lineNumber: number): GraphFixtureRow
     validateFixtureSlug(node.slug, 'node.slug', lineNumber);
     requireNonEmptyString(node.title, 'node.title', lineNumber);
     requireNonEmptyString(node.type, 'node.type', lineNumber);
-    if (!GRAPH_NODE_TYPES.has(node.type as GraphFixtureNode['type'])) {
-      throw new Error(`graph fixture line ${lineNumber}: unsupported node.type ${JSON.stringify(node.type)}`);
-    }
     validateFixtureSourceId(node.source_id, 'node.source_id', lineNumber);
     if (node.authority_state !== undefined && !AUTHORITY_STATES.has(node.authority_state as NonNullable<GraphFixtureNode['authority_state']>)) {
       throw new Error(`graph fixture line ${lineNumber}: unsupported node.authority_state ${JSON.stringify(node.authority_state)}`);

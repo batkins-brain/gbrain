@@ -158,7 +158,7 @@ async function readLiveSnapshot(engine: BrainEngine, sourceId: string): Promise<
     const frontmatter = typeof n.frontmatter === 'string' ? JSON.parse(n.frontmatter) : (n.frontmatter ?? {});
     return {
       slug: n.slug,
-      type: n.type as any,
+      type: n.type,
       title: n.title,
       // pages.source_id is the canonical routing identity selected by the
       // source-scoped SQL predicate. Frontmatter may be stale and must not
@@ -173,7 +173,7 @@ async function readLiveSnapshot(engine: BrainEngine, sourceId: string): Promise<
     .filter(e => !scopedKeys.has(`${e.to_source_id}\u0000${e.to_slug}`))
     .map(e => ({
       slug: e.to_slug,
-      type: 'external-reference' as any,
+      type: 'external-reference',
       title: e.to_slug,
       source_id: e.to_source_id,
       authority_state: undefined,
@@ -186,7 +186,7 @@ async function readLiveSnapshot(engine: BrainEngine, sourceId: string): Promise<
     edges: edges.map(e => ({
       from: e.from_slug,
       to: e.to_slug,
-      type: e.link_type as any,
+      type: e.link_type,
       source_id: e.from_source_id,
       from_source_id: e.from_source_id,
       to_source_id: e.to_source_id,
