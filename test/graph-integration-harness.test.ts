@@ -28,6 +28,14 @@ const FIXTURE = `
 `.trim();
 
 describe('graph-integration harness', () => {
+  test('rejects empty and structurally invalid fixture rows', () => {
+    expect(() => parseGraphFixtureJsonl('')).toThrow('at least one node or edge row');
+    expect(() => parseGraphFixtureJsonl('{}')).toThrow('line 1: kind must be "node" or "edge"');
+    expect(() => parseGraphFixtureJsonl('{"kind":"node","node":{}}')).toThrow('line 1: node.slug');
+    expect(() => parseGraphFixtureJsonl('{"kind":"edge","edge":{"from":"a","to":"b","type":"","source_id":"default"}}')).toThrow('line 1: edge.type');
+    expect(() => parseGraphFixtureJsonl('{"kind":"node","node":{"slug":"source/a","type":"source","title":"A","source_id":"INVALID"}}')).toThrow('invalid node.source_id');
+  });
+
   test('parses and scores fixture metrics deterministically', () => {
     const rows = parseGraphFixtureJsonl(FIXTURE);
     expect(rows).toHaveLength(13);
@@ -335,8 +343,10 @@ describe('graph-integration harness', () => {
   test('live CLI validates source and fixture before connecting', async () => {
     const home = mkdtempSync(join(tmpdir(), 'gbrain-graph-invalid-'));
     const fixturePath = join(home, 'fixture.jsonl');
+    const malformedFixture = join(home, 'malformed.jsonl');
     const missingFixture = join(home, 'missing.jsonl');
     await Bun.write(fixturePath, FIXTURE);
+    await Bun.write(malformedFixture, '{}\n');
     const env: Record<string, string> = {};
     for (const [key, value] of Object.entries(process.env)) {
       if (value !== undefined) env[key] = value;
@@ -368,6 +378,19 @@ describe('graph-integration harness', () => {
       expect(invalidSource.stderr).toContain('Missing required --source <id>');
       expect(invalidSource.stderr).not.toContain('No brain configured');
 
+      for (const sourceId of ['../invalid', 'INVALID']) {
+        const rejectedSource = await run([
+          fixturePath,
+          '--live-read-only',
+          '--source',
+          sourceId,
+          '--json',
+        ]);
+        expect(rejectedSource.exitCode).toBe(2);
+        expect(rejectedSource.stderr).toContain('Invalid source_id:');
+        expect(rejectedSource.stderr).not.toContain('No brain configured');
+      }
+
       const missingFixtureArg = await run([
         '--live-read-only',
         '--source',
@@ -388,6 +411,17 @@ describe('graph-integration harness', () => {
       expect(unreadableFixture.exitCode).toBe(2);
       expect(unreadableFixture.stderr).toContain('Cannot read fixture:');
       expect(unreadableFixture.stderr).not.toContain('No brain configured');
+
+      const invalidStructure = await run([
+        malformedFixture,
+        '--live-read-only',
+        '--source',
+        '24-105',
+        '--json',
+      ]);
+      expect(invalidStructure.exitCode).toBe(2);
+      expect(invalidStructure.stderr).toContain('Cannot read fixture: graph fixture line 1: kind');
+      expect(invalidStructure.stderr).not.toContain('No brain configured');
     } finally {
       rmSync(home, { recursive: true, force: true });
     }

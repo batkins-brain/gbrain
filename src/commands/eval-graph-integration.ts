@@ -9,6 +9,7 @@
 import type { BrainEngine } from '../core/engine.ts';
 import { readFileSync } from 'fs';
 import { setCliExitVerdict } from '../core/cli-force-exit.ts';
+import { assertValidSourceId } from '../core/source-id.ts';
 import {
   buildSnapshot,
   compareSnapshots,
@@ -56,6 +57,37 @@ function parseArgs(args: string[]): { fixture?: string; json: boolean; fixtureNa
   return { fixture, json, fixtureName, liveReadOnly, sourceId };
 }
 
+type PreparedGraphIntegrationInput = ReturnType<typeof parseArgs> & {
+  fixture: string;
+  rows: GraphFixtureRow[];
+};
+
+function prepareGraphIntegrationInput(args: string[]): PreparedGraphIntegrationInput {
+  const parsed = parseArgs(args);
+  if (!parsed.fixture) {
+    throw new Error('Usage: gbrain eval graph-integration <fixture.jsonl> [--json] [--fixture-name <name>] [--live-read-only --source <id>]');
+  }
+  if (parsed.liveReadOnly && !parsed.sourceId) {
+    throw new Error('Missing required --source <id> when using --live-read-only.');
+  }
+  if (parsed.liveReadOnly) {
+    assertValidSourceId(parsed.sourceId);
+  }
+
+  try {
+    return {
+      ...parsed,
+      fixture: parsed.fixture,
+      rows: parseGraphFixtureJsonl(readFileSync(parsed.fixture, 'utf8')),
+    };
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('Invalid source_id:')) {
+      throw error;
+    }
+    throw new Error(`Cannot read fixture: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 /**
  * Fail closed before the generic CLI connects to a brain. A live probe may
  * open an engine only after all syntax and fixture parsing that can fail
@@ -63,10 +95,9 @@ function parseArgs(args: string[]): { fixture?: string; json: boolean; fixtureNa
  */
 export function graphIntegrationNeedsEngine(args: string[]): boolean {
   if (args.includes('--help') || args.includes('-h')) return false;
-  const { fixture, liveReadOnly, sourceId } = parseArgs(args);
-  if (!liveReadOnly || !fixture || !sourceId) return false;
+  if (!parseArgs(args).liveReadOnly) return false;
   try {
-    parseGraphFixtureJsonl(readFileSync(fixture, 'utf8'));
+    prepareGraphIntegrationInput(args);
     return true;
   } catch {
     return false;
@@ -149,26 +180,15 @@ export async function runEvalGraphIntegration(engine: BrainEngine | null, args: 
     help();
     return;
   }
-  const { fixture, json, fixtureName, liveReadOnly, sourceId } = parseArgs(args);
-  if (!fixture) {
-    console.error('Usage: gbrain eval graph-integration <fixture.jsonl> [--json] [--fixture-name <name>] [--live-read-only --source <id>]');
-    setCliExitVerdict(2);
-    return;
-  }
-  if (liveReadOnly && !sourceId) {
-    console.error('Missing required --source <id> when using --live-read-only.');
-    setCliExitVerdict(2);
-    return;
-  }
-
-  let rows: GraphFixtureRow[];
+  let prepared: PreparedGraphIntegrationInput;
   try {
-    rows = parseGraphFixtureJsonl(readFileSync(fixture, 'utf8'));
+    prepared = prepareGraphIntegrationInput(args);
   } catch (e) {
-    console.error(`Cannot read fixture: ${e instanceof Error ? e.message : String(e)}`);
+    console.error(e instanceof Error ? e.message : String(e));
     setCliExitVerdict(2);
     return;
   }
+  const { json, fixtureName, liveReadOnly, sourceId, rows } = prepared;
 
   const dry = buildSnapshot(rows);
   if (liveReadOnly && !engine) {

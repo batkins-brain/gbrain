@@ -18,6 +18,8 @@
  * It never mutates the DB and it does not run extraction/backfill.
  */
 
+import { assertValidSourceId } from '../../core/source-id.ts';
+
 export type GraphRelationType =
   | 'works_at'
   | 'advises'
@@ -133,12 +135,111 @@ export interface LiveGraphEdgeRow {
   evidence?: string | null;
 }
 
+const GRAPH_NODE_TYPES = new Set<GraphFixtureNode['type']>([
+  'person',
+  'company',
+  'project',
+  'advisor',
+  'archive',
+  'source',
+]);
+const AUTHORITY_STATES = new Set<NonNullable<GraphFixtureNode['authority_state']>>([
+  'active',
+  'archived',
+  'retired',
+]);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function requireNonEmptyString(
+  value: unknown,
+  field: string,
+  lineNumber: number,
+): asserts value is string {
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw new Error(`graph fixture line ${lineNumber}: ${field} must be a non-empty string`);
+  }
+}
+
+function validateFixtureSourceId(value: unknown, field: string, lineNumber: number): asserts value is string {
+  try {
+    assertValidSourceId(value);
+  } catch (error) {
+    throw new Error(
+      `graph fixture line ${lineNumber}: invalid ${field}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+function validateFixtureRow(value: unknown, lineNumber: number): GraphFixtureRow {
+  if (!isRecord(value)) {
+    throw new Error(`graph fixture line ${lineNumber}: expected a JSON object`);
+  }
+
+  if (value.kind === 'node') {
+    if (!isRecord(value.node)) {
+      throw new Error(`graph fixture line ${lineNumber}: node row requires a node object`);
+    }
+    const node = value.node;
+    requireNonEmptyString(node.slug, 'node.slug', lineNumber);
+    requireNonEmptyString(node.title, 'node.title', lineNumber);
+    requireNonEmptyString(node.type, 'node.type', lineNumber);
+    if (!GRAPH_NODE_TYPES.has(node.type as GraphFixtureNode['type'])) {
+      throw new Error(`graph fixture line ${lineNumber}: unsupported node.type ${JSON.stringify(node.type)}`);
+    }
+    validateFixtureSourceId(node.source_id, 'node.source_id', lineNumber);
+    if (node.authority_state !== undefined && !AUTHORITY_STATES.has(node.authority_state as NonNullable<GraphFixtureNode['authority_state']>)) {
+      throw new Error(`graph fixture line ${lineNumber}: unsupported node.authority_state ${JSON.stringify(node.authority_state)}`);
+    }
+    if (node.successor_slug !== undefined) {
+      requireNonEmptyString(node.successor_slug, 'node.successor_slug', lineNumber);
+    }
+    return value as unknown as GraphFixtureRow;
+  }
+
+  if (value.kind === 'edge') {
+    if (!isRecord(value.edge)) {
+      throw new Error(`graph fixture line ${lineNumber}: edge row requires an edge object`);
+    }
+    const edge = value.edge;
+    requireNonEmptyString(edge.from, 'edge.from', lineNumber);
+    requireNonEmptyString(edge.to, 'edge.to', lineNumber);
+    requireNonEmptyString(edge.type, 'edge.type', lineNumber);
+    validateFixtureSourceId(edge.source_id, 'edge.source_id', lineNumber);
+    if (edge.from_source_id !== undefined) {
+      validateFixtureSourceId(edge.from_source_id, 'edge.from_source_id', lineNumber);
+    }
+    if (edge.to_source_id !== undefined) {
+      validateFixtureSourceId(edge.to_source_id, 'edge.to_source_id', lineNumber);
+    }
+    if (edge.evidence !== undefined && typeof edge.evidence !== 'string') {
+      throw new Error(`graph fixture line ${lineNumber}: edge.evidence must be a string when provided`);
+    }
+    return value as unknown as GraphFixtureRow;
+  }
+
+  throw new Error(`graph fixture line ${lineNumber}: kind must be "node" or "edge"`);
+}
+
 export function parseGraphFixtureJsonl(text: string): GraphFixtureRow[] {
   const rows: GraphFixtureRow[] = [];
-  for (const raw of text.split('\n')) {
+  for (const [index, raw] of text.split('\n').entries()) {
     const line = raw.trim();
     if (!line || line.startsWith('#') || line.startsWith('//')) continue;
-    rows.push(JSON.parse(line) as GraphFixtureRow);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line);
+    } catch (error) {
+      throw new Error(
+        `graph fixture line ${index + 1}: invalid JSON: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    rows.push(validateFixtureRow(parsed, index + 1));
+  }
+  if (rows.length === 0) {
+    throw new Error('graph fixture must contain at least one node or edge row');
   }
   return rows;
 }
