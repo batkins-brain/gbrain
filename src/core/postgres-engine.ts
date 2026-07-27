@@ -62,6 +62,7 @@ import { ConnectionManager } from './connection-manager.ts';
 import { logConnectionEvent } from './connection-audit.ts';
 import { validateSlug, contentHash, rowToPage, rowToStalePage, rowToChunk, rowToSearchResult, parseEmbedding, tryParseEmbedding, takeRowToTake, isUndefinedTableError, warnOncePerProcess } from './utils.ts';
 import { resolveBoostMap, resolveHardExcludes } from './search/source-boost.ts';
+import { buildNumericQueryFallbacks } from './search/numeric-query.ts';
 import { buildSourceFactorCase, buildHardExcludeClause, buildVisibilityClause, buildRecencyComponentSql, buildBestPerPagePoolCte } from './search/sql-ranking.ts';
 import { DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_DIMENSIONS } from './ai/defaults.ts';
 import { DELETE_BATCH_SIZE } from './engine-constants.ts';
@@ -1682,6 +1683,16 @@ export class PostgresEngine implements BrainEngine {
       await sql`SET LOCAL statement_timeout = '8s'`;
       return await sql.unsafe(rawQuery, params as Parameters<typeof sql.unsafe>[1]);
     });
+    const queryVariants = buildNumericQueryFallbacks(query);
+    if (rows.length === 0 && queryVariants.length > 1) {
+      const nextParams = [...params];
+      nextParams[0] = queryVariants[1];
+      const fallbackRows = await sql.begin(async sql => {
+        await sql`SET LOCAL statement_timeout = '8s'`;
+        return await sql.unsafe(rawQuery, nextParams as Parameters<typeof sql.unsafe>[1]);
+      });
+      return fallbackRows.map(rowToSearchResult);
+    }
     return rows.map(rowToSearchResult);
   }
 
@@ -1806,6 +1817,16 @@ export class PostgresEngine implements BrainEngine {
       await sql`SET LOCAL statement_timeout = '8s'`;
       return await sql.unsafe(rawQuery, params as Parameters<typeof sql.unsafe>[1]);
     });
+    const queryVariants = buildNumericQueryFallbacks(query);
+    if (rows.length === 0 && queryVariants.length > 1) {
+      const nextParams = [...params];
+      nextParams[0] = queryVariants[1];
+      const fallbackRows = await sql.begin(async sql => {
+        await sql`SET LOCAL statement_timeout = '8s'`;
+        return await sql.unsafe(rawQuery, nextParams as Parameters<typeof sql.unsafe>[1]);
+      });
+      return fallbackRows.map(rowToSearchResult);
+    }
     return rows.map(rowToSearchResult);
   }
 

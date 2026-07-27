@@ -52,6 +52,13 @@ const SEED_PAGES: SeedPage[] = [
     embeddingDim: 14,
   },
   {
+    slug: 'rulings/layback-80-10-10-allocated',
+    type: 'note',
+    title: 'Layback 80/10/10 Allocated',
+    body: 'layback 80/10/10 allocated ruling',
+    embeddingDim: 21,
+  },
+  {
     slug: 'openclaw/chat/2026-04-15',
     type: 'note',
     title: '2026-04-15 chat',
@@ -103,6 +110,7 @@ const QUERIES = [
   'fat code thin harness',
   'fat code thin harness part 3',
   'fat code production',
+  'layback 8010 10 allocated',
 ];
 
 describeBoth('Engine parity — Postgres vs PGLite', () => {
