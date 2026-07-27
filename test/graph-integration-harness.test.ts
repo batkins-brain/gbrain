@@ -34,6 +34,7 @@ describe('graph-integration harness', () => {
     expect(() => parseGraphFixtureJsonl('{"kind":"node","node":{}}')).toThrow('line 1: node.slug');
     expect(() => parseGraphFixtureJsonl('{"kind":"edge","edge":{"from":"a","to":"b","type":"","source_id":"default"}}')).toThrow('line 1: edge.type');
     expect(() => parseGraphFixtureJsonl('{"kind":"node","node":{"slug":"source/a","type":"source","title":"A","source_id":"INVALID"}}')).toThrow('invalid node.source_id');
+    expect(() => parseGraphFixtureJsonl('{"kind":"node","node":{"slug":"../invalid","type":"source","title":"A","source_id":"default"}}')).toThrow('invalid node.slug');
   });
 
   test('parses and scores fixture metrics deterministically', () => {
@@ -98,6 +99,46 @@ describe('graph-integration harness', () => {
     expect(report.dry_run.valid_outgoing).toBe(1);
     expect(report.dry_run.unresolved_targets).toBe(0);
     expect(report.dry_run.cross_source_ambiguity).toBe(0);
+  });
+
+  test('duplicate-edge identity cannot collide through relation delimiters', () => {
+    const report = compareSnapshots({
+      nodes: [
+        { slug: 'a', type: 'source', title: 'A', source_id: 'default', authority_state: 'active' },
+        { slug: 'b', type: 'source', title: 'B', source_id: 'default', authority_state: 'active' },
+        { slug: 'b|c', type: 'source', title: 'B Pipe C', source_id: 'default', authority_state: 'active' },
+      ],
+      edges: [
+        { from: 'a', to: 'b', type: 'c|d' as any, source_id: 'default' },
+        { from: 'a', to: 'b|c', type: 'd' as any, source_id: 'default' },
+      ],
+    });
+    expect(report.dry_run.duplicate_edges).toBe(0);
+  });
+
+  test('missing origin is broken without being an unresolved target', () => {
+    const report = compareSnapshots({
+      nodes: [
+        { slug: 'target', type: 'source', title: 'Target', source_id: 'default', authority_state: 'active' },
+      ],
+      edges: [
+        { from: 'missing-origin', to: 'target', type: 'mentions', source_id: 'default' },
+      ],
+    });
+    expect(report.dry_run.valid_outgoing).toBe(0);
+    expect(report.dry_run.broken_references).toBe(1);
+    expect(report.dry_run.unresolved_targets).toBe(0);
+
+    const missingTarget = compareSnapshots({
+      nodes: [
+        { slug: 'origin', type: 'source', title: 'Origin', source_id: 'default', authority_state: 'active' },
+      ],
+      edges: [
+        { from: 'origin', to: 'missing-target', type: 'mentions', source_id: 'default' },
+      ],
+    });
+    expect(missingTarget.dry_run.broken_references).toBe(1);
+    expect(missingTarget.dry_run.unresolved_targets).toBe(1);
   });
 
   test('fixture-only CLI skips live readSnapshot and says so explicitly', async () => {
@@ -402,6 +443,36 @@ describe('graph-integration harness', () => {
       expect(missingFixtureName.exitCode).toBe(2);
       expect(missingFixtureName.stderr).toContain('Missing value for --fixture-name.');
       expect(missingFixtureName.stderr).not.toContain('No brain configured');
+
+      const shortFixtureName = await run([
+        fixturePath,
+        '--fixture-name',
+        '-x',
+        '--json',
+      ]);
+      expect(shortFixtureName.exitCode).toBe(2);
+      expect(shortFixtureName.stderr).toContain('Missing value for --fixture-name.');
+      expect(shortFixtureName.stderr).not.toContain('No brain configured');
+
+      const helpShapedSource = await run([
+        fixturePath,
+        '--live-read-only',
+        '--source',
+        '-h',
+      ]);
+      expect(helpShapedSource.exitCode).toBe(2);
+      expect(helpShapedSource.stderr).toContain('Missing value for --source.');
+      expect(helpShapedSource.stderr).not.toContain('No brain configured');
+
+      const sourceWithoutLive = await run([
+        fixturePath,
+        '--source',
+        'default',
+        '--json',
+      ]);
+      expect(sourceWithoutLive.exitCode).toBe(2);
+      expect(sourceWithoutLive.stderr).toContain('--source requires --live-read-only.');
+      expect(sourceWithoutLive.stderr).not.toContain('No brain configured');
 
       for (const sourceId of ['../invalid', 'INVALID']) {
         const rejectedSource = await run([

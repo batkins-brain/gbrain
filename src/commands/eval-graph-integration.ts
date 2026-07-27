@@ -39,6 +39,10 @@ Options:
 `);
 }
 
+function isHelpRequest(args: string[]): boolean {
+  return args.length === 1 && (args[0] === '--help' || args[0] === '-h');
+}
+
 function parseArgs(args: string[]): { fixture?: string; json: boolean; fixtureName: string; liveReadOnly: boolean; sourceId?: string } {
   let fixture: string | undefined;
   let json = false;
@@ -60,7 +64,7 @@ function parseArgs(args: string[]): { fixture?: string; json: boolean; fixtureNa
       if (seen.has(arg)) throw new Error(`Duplicate option: ${arg}`);
       seen.add(arg);
       const value = args[index + 1];
-      if (!value || value.startsWith('--')) {
+      if (!value || value.startsWith('-')) {
         throw new Error(`Missing value for ${arg}.`);
       }
       index++;
@@ -93,8 +97,11 @@ function prepareGraphIntegrationInput(args: string[]): PreparedGraphIntegrationI
   if (parsed.liveReadOnly && !parsed.sourceId) {
     throw new Error('Missing required --source <id> when using --live-read-only.');
   }
-  if (parsed.liveReadOnly) {
+  if (parsed.sourceId) {
     assertValidSourceId(parsed.sourceId);
+  }
+  if (parsed.sourceId && !parsed.liveReadOnly) {
+    throw new Error('--source requires --live-read-only.');
   }
 
   try {
@@ -117,7 +124,7 @@ function prepareGraphIntegrationInput(args: string[]): PreparedGraphIntegrationI
  * without the engine has succeeded.
  */
 export function graphIntegrationNeedsEngine(args: string[]): boolean {
-  if (args.includes('--help') || args.includes('-h')) return false;
+  if (isHelpRequest(args)) return false;
   if (!args.includes('--live-read-only')) return false;
   try {
     prepareGraphIntegrationInput(args);
@@ -199,7 +206,7 @@ async function readLiveSnapshot(engine: BrainEngine, sourceId: string): Promise<
 
 
 export async function runEvalGraphIntegration(engine: BrainEngine | null, args: string[]): Promise<void> {
-  if (args.includes('--help') || args.includes('-h')) {
+  if (isHelpRequest(args)) {
     help();
     return;
   }

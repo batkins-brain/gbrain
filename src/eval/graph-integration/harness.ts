@@ -19,6 +19,7 @@
  */
 
 import { assertValidSourceId } from '../../core/source-id.ts';
+import { validatePageSlug } from '../../core/operations.ts';
 
 export type GraphRelationType =
   | 'works_at'
@@ -173,6 +174,17 @@ function validateFixtureSourceId(value: unknown, field: string, lineNumber: numb
   }
 }
 
+function validateFixtureSlug(value: unknown, field: string, lineNumber: number): asserts value is string {
+  requireNonEmptyString(value, field, lineNumber);
+  try {
+    validatePageSlug(value);
+  } catch (error) {
+    throw new Error(
+      `graph fixture line ${lineNumber}: invalid ${field}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
 function validateFixtureRow(value: unknown, lineNumber: number): GraphFixtureRow {
   if (!isRecord(value)) {
     throw new Error(`graph fixture line ${lineNumber}: expected a JSON object`);
@@ -183,7 +195,7 @@ function validateFixtureRow(value: unknown, lineNumber: number): GraphFixtureRow
       throw new Error(`graph fixture line ${lineNumber}: node row requires a node object`);
     }
     const node = value.node;
-    requireNonEmptyString(node.slug, 'node.slug', lineNumber);
+    validateFixtureSlug(node.slug, 'node.slug', lineNumber);
     requireNonEmptyString(node.title, 'node.title', lineNumber);
     requireNonEmptyString(node.type, 'node.type', lineNumber);
     if (!GRAPH_NODE_TYPES.has(node.type as GraphFixtureNode['type'])) {
@@ -194,7 +206,7 @@ function validateFixtureRow(value: unknown, lineNumber: number): GraphFixtureRow
       throw new Error(`graph fixture line ${lineNumber}: unsupported node.authority_state ${JSON.stringify(node.authority_state)}`);
     }
     if (node.successor_slug !== undefined) {
-      requireNonEmptyString(node.successor_slug, 'node.successor_slug', lineNumber);
+      validateFixtureSlug(node.successor_slug, 'node.successor_slug', lineNumber);
     }
     return value as unknown as GraphFixtureRow;
   }
@@ -204,8 +216,8 @@ function validateFixtureRow(value: unknown, lineNumber: number): GraphFixtureRow
       throw new Error(`graph fixture line ${lineNumber}: edge row requires an edge object`);
     }
     const edge = value.edge;
-    requireNonEmptyString(edge.from, 'edge.from', lineNumber);
-    requireNonEmptyString(edge.to, 'edge.to', lineNumber);
+    validateFixtureSlug(edge.from, 'edge.from', lineNumber);
+    validateFixtureSlug(edge.to, 'edge.to', lineNumber);
     requireNonEmptyString(edge.type, 'edge.type', lineNumber);
     validateFixtureSourceId(edge.source_id, 'edge.source_id', lineNumber);
     if (edge.from_source_id !== undefined) {
@@ -277,7 +289,13 @@ function metricCounts(snapshot: GraphGraphSnapshot): GraphMetricCounts {
 
   const edgeCounts = countBy(
     snapshot.edges,
-    e => `${e.from_source_id ?? e.source_id}|${e.from}|${e.to_source_id ?? e.source_id}|${e.to}|${e.type}`,
+    e => JSON.stringify([
+      e.from_source_id ?? e.source_id,
+      e.from,
+      e.to_source_id ?? e.source_id,
+      e.to,
+      e.type,
+    ]),
   );
   const duplicate_edges = [...edgeCounts.values()].filter(c => c > 1).reduce((sum, c) => sum + (c - 1), 0);
 
@@ -309,8 +327,8 @@ function metricCounts(snapshot: GraphGraphSnapshot): GraphMetricCounts {
         typed_relations++;
       }
     } else {
-      unresolved_targets++;
       broken_references++;
+      if (!toScoped) unresolved_targets++;
     }
 
     // `source_id` supplies the default scope for both endpoints, so a slug

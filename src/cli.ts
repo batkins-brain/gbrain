@@ -272,7 +272,9 @@ async function main() {
   }
 
   // Per-command --help
-  if (hasHelpFlag(subArgs)) {
+  // graph-integration owns strict option parsing. Do not let a value-shaped
+  // `-h` later in its argv bypass that parser as generic `eval` help.
+  if (hasHelpFlag(subArgs) && !(command === 'eval' && subArgs[0] === 'graph-integration')) {
     const op = cliOps.get(command) ?? cliAliases.get(command);
     if (op) {
       printOpHelp(op, command);
