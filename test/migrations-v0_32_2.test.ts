@@ -342,6 +342,41 @@ describe('phaseBFenceFacts — happy path backfill', () => {
     }
   });
 
+  test('does not follow an intermediate directory symlink outside the local source', async () => {
+    const outsideDir = mkdtempSync(join(tmpdir(), 'mig-v0_32_2-outside-dir-'));
+    const outsidePath = join(outsideDir, 'alice.md');
+    writeFileSync(outsidePath, 'EXTERNAL PRIVATE CONTENT\n', 'utf-8');
+    symlinkSync(outsideDir, join(brainDir, 'people'));
+
+    try {
+      await seedLegacyFact({
+        entity_slug: 'people/alice',
+        fact: 'Preserve only this legacy claim',
+      });
+
+      const { manifest } = await __testing.buildTargetPlan(engine);
+      expect(manifest.targets[0]).toMatchObject({
+        original_entity_slug: 'people/alice',
+        disposition: 'quarantine',
+        reason: 'unsafe_target',
+      });
+
+      const r = await __testing.phaseBFenceFacts(engine, OPTS);
+      expect(r.status).toBe('complete');
+      expect(readFileSync(outsidePath, 'utf-8')).toBe('EXTERNAL PRIVATE CONTENT\n');
+
+      const quarantinePath = join(
+        brainDir,
+        `${manifest.targets[0].target_markdown_slug}.md`,
+      );
+      const quarantined = readFileSync(quarantinePath, 'utf-8');
+      expect(quarantined).toContain('Preserve only this legacy claim');
+      expect(quarantined).not.toContain('EXTERNAL PRIVATE CONTENT');
+    } finally {
+      rmSync(outsideDir, { recursive: true, force: true });
+    }
+  });
+
   test('dirty guard ignores unrelated changes but blocks an exact target path', () => {
     execFileSync('git', ['init', '-q', brainDir]);
     writeFileSync(join(brainDir, 'unrelated.md'), 'unrelated\n');

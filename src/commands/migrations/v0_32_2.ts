@@ -40,7 +40,7 @@ import {
   renameSync,
   writeFileSync,
 } from 'node:fs';
-import { join, dirname, resolve, sep } from 'node:path';
+import { join, dirname, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 
@@ -51,6 +51,7 @@ import type { BrainEngine } from '../../core/engine.ts';
 import { loadConfig, toEngineConfig } from '../../core/config.ts';
 import { createEngine } from '../../core/engine-factory.ts';
 import { upsertFactRow, parseFactsFence } from '../../core/facts-fence.ts';
+import { isWriteTargetContained } from '../../core/path-confine.ts';
 
 let testEngineOverride: BrainEngine | null = null;
 export function __setTestEngineOverride(engine: BrainEngine | null): void {
@@ -202,9 +203,8 @@ function isSafeExistingTarget(localPath: string, entitySlug: string): boolean {
   if (!entitySlug || entitySlug.includes('\\') || entitySlug.includes('\0')) return false;
   const segments = entitySlug.split('/');
   if (segments.some(segment => segment === '' || segment === '.' || segment === '..')) return false;
-  const root = resolve(localPath);
   const candidate = resolve(join(localPath, `${entitySlug}.md`));
-  if (!candidate.startsWith(`${root}${sep}`)) return false;
+  if (!isWriteTargetContained(candidate, localPath)) return false;
   try {
     const stat = lstatSync(candidate);
     return stat.isFile() && !stat.isSymbolicLink();
@@ -289,12 +289,17 @@ async function buildTargetPlan(
     const safeExisting = isSafeExistingTarget(localPath, originalEntitySlug);
     const originalCandidate = resolve(join(localPath, `${originalEntitySlug}.md`));
     const unsafeTarget =
-      !originalCandidate.startsWith(`${resolve(localPath)}${sep}`) ||
+      !isWriteTargetContained(originalCandidate, localPath) ||
       (pathEntryExists(originalCandidate) && !safeExisting);
     const targetMarkdownSlug = safeExisting
       ? originalEntitySlug
       : quarantineSlug(sourceId, originalEntitySlug);
     const filePath = join(localPath, `${targetMarkdownSlug}.md`);
+    if (!isWriteTargetContained(filePath, localPath)) {
+      throw new Error(
+        `migration quarantine target escapes source root: ${targetMarkdownSlug}`,
+      );
+    }
     plan.push({
       sourceId,
       originalEntitySlug,
@@ -404,6 +409,15 @@ async function phaseBFenceFacts(
       const tmpPath = `${filePath}.tmp`;
 
       try {
+        // Re-check immediately before access so a pre-existing intermediate
+        // symlink cannot redirect either the canonical or quarantine write.
+        if (
+          !isWriteTargetContained(filePath, target.localPath) ||
+          !isWriteTargetContained(tmpPath, target.localPath)
+        ) {
+          throw new Error('migration target escapes source root');
+        }
+
         // Read existing body or stub-create with minimum frontmatter.
         let body: string;
         if (existsSync(filePath)) {
@@ -547,11 +561,11 @@ async function phaseCVerify(
       const localPath = localPathById.get(g.source_id);
       if (!localPath) continue;
       const filePath = join(localPath, `${g.source_markdown_slug}.md`);
-      if (!existsSync(filePath)) {
+      if (!isWriteTargetContained(filePath, localPath) || !existsSync(filePath)) {
         mismatches.push(`${g.source_markdown_slug} (file missing)`);
         continue;
       }
-      const body = readFileSync(filePath, 'utf-8');
+      const body = readRegularFileNoFollow(filePath);
       const parsed = parseFactsFence(body);
       const fenceCount = parsed.facts.length;
       const dbCount = parseInt(g.n, 10);
