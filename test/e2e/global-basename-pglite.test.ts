@@ -342,4 +342,44 @@ describe('TAN-18 — put_page typed frontmatter persistence', () => {
     ]);
     expect(await engine.getLinks('people/alice-example')).toEqual([]);
   });
+
+  test('target in another source stays unresolved in the active source', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config)
+       VALUES ('alpha', 'Alpha', '{}'::jsonb), ('beta', 'Beta', '{}'::jsonb)
+       ON CONFLICT (id) DO NOTHING`,
+    );
+    await engine.putPage(
+      'companies/acme-example',
+      {
+        type: 'company', title: 'Acme Example',
+        compiled_truth: 'Only present in alpha.', timeline: '',
+      },
+      { sourceId: 'alpha' },
+    );
+
+    const { operations } = await import('../../src/core/operations.ts');
+    const putPage = operations.find(op => op.name === 'put_page')!;
+    const result = await putPage.handler(
+      { engine, remote: false, sourceId: 'beta' } as never,
+      {
+        slug: 'people/alice-example',
+        content: `---
+title: Alice Example
+type: person
+company: Acme Example
+---
+
+Alice works at Acme Example.
+`,
+      },
+    ) as { auto_links?: { unresolved?: Array<{ field: string; name: string }> } };
+
+    expect(result.auto_links?.unresolved).toEqual([
+      { field: 'company', name: 'Acme Example' },
+    ]);
+    expect(
+      await engine.getLinks('people/alice-example', { sourceId: 'beta' }),
+    ).toEqual([]);
+  });
 });
