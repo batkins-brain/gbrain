@@ -40,9 +40,9 @@ import {
   renameSync,
   writeFileSync,
 } from 'node:fs';
-import { join, dirname, resolve } from 'node:path';
+import { join, dirname, resolve, relative, isAbsolute, sep } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 import type {
   Migration, OrchestratorOpts, OrchestratorResult, OrchestratorPhaseResult,
@@ -160,6 +160,7 @@ interface PlannedTarget {
   targetMarkdownSlug: string;
   localPath: string;
   filePath: string;
+  tmpPath: string;
   rows: LegacyFactRow[];
   targetExisted: boolean;
   disposition: 'existing' | 'quarantine';
@@ -175,16 +176,46 @@ interface PhaseBOutcome {
   failed_pages: string[];
 }
 
+interface MigrationTargetPhaseResult extends OrchestratorPhaseResult {
+  /** Operator-visible, deterministic mapping; never written to the ledger. */
+  manifest?: MigrationTargetManifest;
+}
+
+export interface MigrationTargetOrchestratorResult extends OrchestratorResult {
+  /** Available from the public dry-run/orchestrator result contract. */
+  target_manifest?: MigrationTargetManifest;
+}
+
 /**
  * Return true only when one of this migration's exact destination paths is
  * dirty. Unrelated source-repository changes are deliberately ignored.
  */
-function areTargetPathsDirty(localPath: string, targetMarkdownSlugs: string[]): boolean {
-  if (targetMarkdownSlugs.length === 0) return false;
+function areTargetPathsDirty(
+  localPath: string,
+  targetMarkdownSlugs: string[],
+  additionalRelativePaths: string[] = [],
+): boolean {
+  if (targetMarkdownSlugs.length === 0 && additionalRelativePaths.length === 0) return false;
+  const targetPaths = [
+    ...targetMarkdownSlugs.map(slug => `${slug}.md`),
+    ...additionalRelativePaths,
+  ];
   try {
-    const targetPaths = targetMarkdownSlugs.map(slug => `${slug}.md`);
+    // A missing Git repository is supported. Once Git recognizes the worktree,
+    // however, status errors must fail closed rather than silently authorizing
+    // a migration write.
+    execFileSync('git', ['-C', localPath, 'rev-parse', '--is-inside-work-tree'], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 10_000,
+    });
+  } catch {
+    return false;
+  }
+  try {
     const out = execFileSync('git', [
-      '-C', localPath, 'status', '--porcelain', '--', ...targetPaths,
+      '--literal-pathspecs', '-C', localPath,
+      'status', '--porcelain', '--', ...targetPaths,
     ], {
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'ignore'],
@@ -192,11 +223,32 @@ function areTargetPathsDirty(localPath: string, targetMarkdownSlugs: string[]): 
     });
     return out.trim().length > 0;
   } catch {
-    // Not a git repo OR git not on PATH → treat as "not dirty" (the
-    // user opted out of git tracking, which is allowed). The fence
-    // writes are still atomic via .tmp + rename.
-    return false;
+    return true;
   }
+}
+
+/**
+ * Reject every symbolic link below the registered source root, even when it
+ * resolves to another location inside that root. Missing tail components are
+ * allowed for new quarantine pages; only existing components are inspected.
+ */
+function hasNoSymlinkComponents(target: string, localPath: string): boolean {
+  const root = resolve(localPath);
+  const absoluteTarget = resolve(target);
+  const rel = relative(root, absoluteTarget);
+  if (rel === '') return true;
+  if (rel.startsWith('..') || isAbsolute(rel)) return false;
+
+  let current = root;
+  for (const segment of rel.split(sep)) {
+    current = join(current, segment);
+    try {
+      if (lstatSync(current).isSymbolicLink()) return false;
+    } catch {
+      break;
+    }
+  }
+  return true;
 }
 
 function isSafeExistingTarget(localPath: string, entitySlug: string): boolean {
@@ -204,7 +256,10 @@ function isSafeExistingTarget(localPath: string, entitySlug: string): boolean {
   const segments = entitySlug.split('/');
   if (segments.some(segment => segment === '' || segment === '.' || segment === '..')) return false;
   const candidate = resolve(join(localPath, `${entitySlug}.md`));
-  if (!isWriteTargetContained(candidate, localPath)) return false;
+  if (
+    !isWriteTargetContained(candidate, localPath) ||
+    !hasNoSymlinkComponents(candidate, localPath)
+  ) return false;
   try {
     const stat = lstatSync(candidate);
     return stat.isFile() && !stat.isSymbolicLink();
@@ -233,6 +288,27 @@ function readRegularFileNoFollow(path: string): string {
       throw new Error(`migration target is not a regular file: ${path}`);
     }
     return readFileSync(fd, 'utf-8');
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * Create a migration-owned temporary file exclusively and write through the
+ * verified descriptor. O_EXCL prevents clobbering user files; O_NOFOLLOW
+ * rejects a final-component symlink.
+ */
+function writeOwnedTempFileNoFollow(path: string, body: string): void {
+  const fd = openSync(
+    path,
+    constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+    0o600,
+  );
+  try {
+    if (!fstatSync(fd).isFile()) {
+      throw new Error(`migration temporary target is not a regular file: ${path}`);
+    }
+    writeFileSync(fd, body, 'utf-8');
   } finally {
     closeSync(fd);
   }
@@ -290,12 +366,22 @@ async function buildTargetPlan(
     const originalCandidate = resolve(join(localPath, `${originalEntitySlug}.md`));
     const unsafeTarget =
       !isWriteTargetContained(originalCandidate, localPath) ||
+      !hasNoSymlinkComponents(originalCandidate, localPath) ||
       (pathEntryExists(originalCandidate) && !safeExisting);
     const targetMarkdownSlug = safeExisting
       ? originalEntitySlug
       : quarantineSlug(sourceId, originalEntitySlug);
     const filePath = join(localPath, `${targetMarkdownSlug}.md`);
-    if (!isWriteTargetContained(filePath, localPath)) {
+    const tmpPath = join(
+      dirname(filePath),
+      `.${targetMarkdownSlug.split('/').at(-1)}.migration-${process.pid}-${randomUUID()}.tmp`,
+    );
+    if (
+      !isWriteTargetContained(filePath, localPath) ||
+      !hasNoSymlinkComponents(filePath, localPath) ||
+      !isWriteTargetContained(tmpPath, localPath) ||
+      !hasNoSymlinkComponents(tmpPath, localPath)
+    ) {
       throw new Error(
         `migration quarantine target escapes source root: ${targetMarkdownSlug}`,
       );
@@ -306,6 +392,7 @@ async function buildTargetPlan(
       targetMarkdownSlug,
       localPath,
       filePath,
+      tmpPath,
       rows,
       targetExisted: existsSync(filePath),
       disposition: safeExisting ? 'existing' : 'quarantine',
@@ -345,7 +432,7 @@ async function buildTargetPlan(
 async function phaseBFenceFacts(
   engine: BrainEngine | null,
   opts: OrchestratorOpts,
-): Promise<OrchestratorPhaseResult> {
+): Promise<MigrationTargetPhaseResult> {
   if (opts.dryRun) {
     // Dry-run: report what WOULD happen without touching FS or DB.
     if (!engine) return { name: 'fence_facts', status: 'skipped', detail: 'no_brain_configured' };
@@ -354,6 +441,7 @@ async function phaseBFenceFacts(
       return {
         name: 'fence_facts',
         status: 'skipped',
+        manifest,
         detail:
           `dry-run: legacy_rows=${manifest.legacy_rows} ` +
           `would_fence=${manifest.legacy_rows - manifest.unfenceable_rows - manifest.skipped_no_local_path_rows} ` +
@@ -374,17 +462,27 @@ async function phaseBFenceFacts(
     const { plan, manifest } = await buildTargetPlan(engine);
 
     // Dirty-tree refusal is scoped to this migration's exact destinations.
-    const targetsBySource = new Map<string, { localPath: string; slugs: string[] }>();
+    const targetsBySource = new Map<string, {
+      localPath: string;
+      slugs: string[];
+      additionalRelativePaths: string[];
+    }>();
     for (const target of plan) {
       const entry = targetsBySource.get(target.sourceId) ?? {
         localPath: target.localPath,
         slugs: [],
+        additionalRelativePaths: [],
       };
       entry.slugs.push(target.targetMarkdownSlug);
+      entry.additionalRelativePaths.push(relative(target.localPath, target.tmpPath));
       targetsBySource.set(target.sourceId, entry);
     }
     for (const [id, targetSet] of targetsBySource) {
-      if (areTargetPathsDirty(targetSet.localPath, targetSet.slugs)) {
+      if (areTargetPathsDirty(
+        targetSet.localPath,
+        targetSet.slugs,
+        targetSet.additionalRelativePaths,
+      )) {
         return {
           name: 'fence_facts',
           status: 'failed',
@@ -404,16 +502,17 @@ async function phaseBFenceFacts(
 
     for (const target of plan) {
       const {
-        targetMarkdownSlug, originalEntitySlug, filePath, rows: group,
+        targetMarkdownSlug, originalEntitySlug, filePath, tmpPath, rows: group,
       } = target;
-      const tmpPath = `${filePath}.tmp`;
 
       try {
         // Re-check immediately before access so a pre-existing intermediate
         // symlink cannot redirect either the canonical or quarantine write.
         if (
           !isWriteTargetContained(filePath, target.localPath) ||
-          !isWriteTargetContained(tmpPath, target.localPath)
+          !hasNoSymlinkComponents(filePath, target.localPath) ||
+          !isWriteTargetContained(tmpPath, target.localPath) ||
+          !hasNoSymlinkComponents(tmpPath, target.localPath)
         ) {
           throw new Error('migration target escapes source root');
         }
@@ -486,13 +585,19 @@ async function phaseBFenceFacts(
         }
 
         // Atomic write: .tmp + parse + rename.
-        writeFileSync(tmpPath, body, 'utf-8');
-        const tmpBody = readFileSync(tmpPath, 'utf-8');
+        writeOwnedTempFileNoFollow(tmpPath, body);
+        const tmpBody = readRegularFileNoFollow(tmpPath);
         const parsed = parseFactsFence(tmpBody);
         if (parsed.warnings.length > 0) {
           outcome.failed_pages.push(`${targetMarkdownSlug} (${parsed.warnings.join('; ')})`);
           // .tmp stays for inspection; do NOT rename.
           continue;
+        }
+        if (
+          !hasNoSymlinkComponents(dirname(filePath), target.localPath) ||
+          !hasNoSymlinkComponents(tmpPath, target.localPath)
+        ) {
+          throw new Error('migration target path changed before rename');
         }
         renameSync(tmpPath, filePath);
 
@@ -523,7 +628,7 @@ async function phaseBFenceFacts(
         detail: `${detail} :: ${outcome.failed_pages.slice(0, 3).join(' | ')}${outcome.failed_pages.length > 3 ? '...' : ''}`,
       };
     }
-    return { name: 'fence_facts', status: 'complete', detail };
+    return { name: 'fence_facts', status: 'complete', detail, manifest };
   } catch (e) {
     return { name: 'fence_facts', status: 'failed', detail: e instanceof Error ? e.message : String(e) };
   }
@@ -561,7 +666,11 @@ async function phaseCVerify(
       const localPath = localPathById.get(g.source_id);
       if (!localPath) continue;
       const filePath = join(localPath, `${g.source_markdown_slug}.md`);
-      if (!isWriteTargetContained(filePath, localPath) || !existsSync(filePath)) {
+      if (
+        !isWriteTargetContained(filePath, localPath) ||
+        !hasNoSymlinkComponents(filePath, localPath) ||
+        !existsSync(filePath)
+      ) {
         mismatches.push(`${g.source_markdown_slug} (file missing)`);
         continue;
       }
@@ -590,7 +699,7 @@ async function phaseCVerify(
 
 // ── Orchestrator ────────────────────────────────────────────
 
-async function orchestrator(opts: OrchestratorOpts): Promise<OrchestratorResult> {
+async function orchestrator(opts: OrchestratorOpts): Promise<MigrationTargetOrchestratorResult> {
   console.log('');
   console.log('=== v0.32.2 — facts join the system-of-record invariant ===');
   if (opts.dryRun) console.log('  (dry-run; no side effects)');
@@ -605,7 +714,9 @@ async function orchestrator(opts: OrchestratorOpts): Promise<OrchestratorResult>
 
   const b = await phaseBFenceFacts(engine, opts);
   phases.push(b);
-  if (b.status === 'failed') return finalizeResult(phases, 'failed', engine);
+  if (b.status === 'failed') {
+    return { ...finalizeResult(phases, 'failed', engine), target_manifest: b.manifest };
+  }
 
   const c = await phaseCVerify(engine, opts);
   phases.push(c);
@@ -613,7 +724,7 @@ async function orchestrator(opts: OrchestratorOpts): Promise<OrchestratorResult>
   const overallStatus: 'complete' | 'partial' | 'failed' =
     c.status === 'failed' ? 'partial' : 'complete';
 
-  return finalizeResult(phases, overallStatus, engine);
+  return { ...finalizeResult(phases, overallStatus, engine), target_manifest: b.manifest };
 }
 
 function finalizeResult(
@@ -633,7 +744,9 @@ function finalizeResult(
   };
 }
 
-export const v0_32_2: Migration = {
+export const v0_32_2: Omit<Migration, 'orchestrator'> & {
+  orchestrator: (opts: OrchestratorOpts) => Promise<MigrationTargetOrchestratorResult>;
+} = {
   version: '0.32.2',
   featurePitch: {
     headline: 'Facts join the system-of-record — your hot memory now lives in markdown, indexed by the DB',
@@ -656,4 +769,5 @@ export const __testing = {
   buildTargetPlan,
   areTargetPathsDirty,
   quarantineSlug,
+  writeOwnedTempFileNoFollow,
 };

@@ -54,6 +54,24 @@ function prefsDir(): string { return configDir(); }
 function prefsPath(): string { return join(prefsDir(), 'preferences.json'); }
 function migrationsDir(): string { return join(configDir(), 'migrations'); }
 function completedJsonlPath(): string { return join(migrationsDir(), 'completed.jsonl'); }
+function legacyOverrideDir(): string | null {
+  // Releases that predate the configDir() alignment treated GBRAIN_HOME as
+  // the .gbrain directory itself. When the override is set, keep a read-only
+  // compatibility lane so preferences and terminal migration history are not
+  // silently abandoned. Calling configDir() first validates the override.
+  const canonical = configDir();
+  const raw = process.env.GBRAIN_HOME?.trim();
+  if (!raw || raw === canonical) return null;
+  return raw;
+}
+function legacyPrefsPath(): string | null {
+  const dir = legacyOverrideDir();
+  return dir ? join(dir, 'preferences.json') : null;
+}
+function legacyCompletedJsonlPath(): string | null {
+  const dir = legacyOverrideDir();
+  return dir ? join(dir, 'migrations', 'completed.jsonl') : null;
+}
 
 /** Validate that a value is a recognized minion mode. Throws with the allowed list. */
 export function validateMinionMode(value: unknown): asserts value is MinionMode {
@@ -69,7 +87,15 @@ export function validateMinionMode(value: unknown): asserts value is MinionMode 
  * Malformed JSON throws; caller can catch if they want graceful fallback.
  */
 export function loadPreferences(): Preferences {
-  const path = prefsPath();
+  const canonical = prefsPath();
+  const legacy = legacyPrefsPath();
+  // Canonical state always wins. The legacy path is a read-only fallback;
+  // the next explicit save writes canonically with restrictive permissions.
+  const path = existsSync(canonical)
+    ? canonical
+    : legacy && existsSync(legacy)
+      ? legacy
+      : canonical;
   if (!existsSync(path)) return {};
   const raw = readFileSync(path, 'utf-8');
   const parsed = JSON.parse(raw) as Preferences;
@@ -130,12 +156,11 @@ export function appendCompletedMigration(entry: CompletedMigrationEntry): void {
   };
   const dir = migrationsDir();
   mkdirSync(dir, { recursive: true });
-  appendFileSync(completedJsonlPath(), JSON.stringify(full) + '\n');
+  appendFileSync(completedJsonlPath(), JSON.stringify(full) + '\n', { mode: 0o600 });
+  try { chmodSync(completedJsonlPath(), 0o600); } catch { /* best-effort */ }
 }
 
-/** Read the completed.jsonl file, skipping malformed lines with a warning to stderr. */
-export function loadCompletedMigrations(): CompletedMigrationEntry[] {
-  const path = completedJsonlPath();
+function readCompletedMigrations(path: string): CompletedMigrationEntry[] {
   if (!existsSync(path)) return [];
   const raw = readFileSync(path, 'utf-8');
   const out: CompletedMigrationEntry[] = [];
@@ -151,10 +176,37 @@ export function loadCompletedMigrations(): CompletedMigrationEntry[] {
   return out;
 }
 
+/**
+ * Read canonical and legacy migration ledgers. Canonical entries are appended
+ * after legacy entries so their newer ordering wins, while any legacy
+ * terminal completion remains visible to the runner. Exact duplicate records
+ * are removed without rewriting or deleting the legacy file.
+ */
+export function loadCompletedMigrations(): CompletedMigrationEntry[] {
+  const legacy = legacyCompletedJsonlPath();
+  const paths = [
+    ...(legacy ? [legacy] : []),
+    completedJsonlPath(),
+  ];
+  const seen = new Set<string>();
+  const merged: CompletedMigrationEntry[] = [];
+  for (const path of paths) {
+    for (const entry of readCompletedMigrations(path)) {
+      const key = JSON.stringify(entry);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      merged.push(entry);
+    }
+  }
+  return merged;
+}
+
 /** Paths — exported for tests and rare consumers. */
 export const preferencesPaths = {
   dir: prefsDir,
   file: prefsPath,
   migrationsDir,
   completedJsonl: completedJsonlPath,
+  legacyFile: legacyPrefsPath,
+  legacyCompletedJsonl: legacyCompletedJsonlPath,
 };

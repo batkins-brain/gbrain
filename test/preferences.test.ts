@@ -66,6 +66,27 @@ describe('loadPreferences', () => {
     expect(loadPreferences()).toEqual({ minion_mode: 'always', set_in_version: '0.11.0' });
   });
 
+  test('falls back to the legacy direct-GBRAIN_HOME preferences path', () => {
+    writeFileSync(
+      join(tmp, 'preferences.json'),
+      JSON.stringify({ minion_mode: 'always', set_in_version: 'legacy' }),
+    );
+    expect(loadPreferences()).toEqual({ minion_mode: 'always', set_in_version: 'legacy' });
+  });
+
+  test('canonical preferences take precedence over the legacy fallback', () => {
+    writeFileSync(
+      join(tmp, 'preferences.json'),
+      JSON.stringify({ minion_mode: 'always', set_in_version: 'legacy' }),
+    );
+    mkdirSync(join(tmp, '.gbrain'), { recursive: true });
+    writeFileSync(
+      join(tmp, '.gbrain', 'preferences.json'),
+      JSON.stringify({ minion_mode: 'off', set_in_version: 'canonical' }),
+    );
+    expect(loadPreferences()).toEqual({ minion_mode: 'off', set_in_version: 'canonical' });
+  });
+
   test('throws on malformed JSON so callers can surface it', () => {
     mkdirSync(join(tmp, '.gbrain'), { recursive: true });
     writeFileSync(join(tmp, '.gbrain', 'preferences.json'), '{not json');
@@ -143,6 +164,7 @@ describe('appendCompletedMigration', () => {
     expect(parsed.status).toBe('complete');
     expect(parsed.mode).toBe('always');
     expect(parsed.ts).toBeTruthy();
+    expect(statSync(path).mode & 0o777).toBe(0o600);
   });
 
   test('appends instead of overwriting', () => {
@@ -187,6 +209,38 @@ describe('loadCompletedMigrations', () => {
     expect(entries.length).toBe(2);
     expect(entries[0].version).toBe('0.10.0');
     expect(entries[1].status).toBe('partial');
+  });
+
+  test('merges legacy direct-GBRAIN_HOME completion history with canonical history', () => {
+    mkdirSync(join(tmp, 'migrations'), { recursive: true });
+    writeFileSync(
+      join(tmp, 'migrations', 'completed.jsonl'),
+      JSON.stringify({ version: '0.10.0', status: 'complete', ts: '2026-01-01T00:00:00Z' }) + '\n',
+    );
+    appendCompletedMigration({
+      version: '0.11.0',
+      status: 'partial',
+      ts: '2026-02-01T00:00:00Z',
+    });
+
+    expect(loadCompletedMigrations()).toEqual([
+      { version: '0.10.0', status: 'complete', ts: '2026-01-01T00:00:00Z' },
+      { version: '0.11.0', status: 'partial', ts: '2026-02-01T00:00:00Z' },
+    ]);
+  });
+
+  test('deduplicates an exact record present in both legacy and canonical ledgers', () => {
+    const entry = {
+      version: '0.10.0',
+      status: 'complete' as const,
+      ts: '2026-01-01T00:00:00Z',
+    };
+    mkdirSync(join(tmp, 'migrations'), { recursive: true });
+    mkdirSync(join(tmp, '.gbrain', 'migrations'), { recursive: true });
+    writeFileSync(join(tmp, 'migrations', 'completed.jsonl'), JSON.stringify(entry) + '\n');
+    writeFileSync(join(tmp, '.gbrain', 'migrations', 'completed.jsonl'), JSON.stringify(entry) + '\n');
+
+    expect(loadCompletedMigrations()).toEqual([entry]);
   });
 
   test('tolerates malformed lines with a warning, continuing past them', () => {
