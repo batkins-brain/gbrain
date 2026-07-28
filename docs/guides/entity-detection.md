@@ -64,6 +64,9 @@ For each entity:
      Format: - YYYY-MM-DD | {what happened} [Source: {who}, {context}, {date}]
   c. If no page AND entity is notable: create page with web enrichment
   d. If page is thin (< 5 lines compiled truth): spawn background enrichment
+  e. When the page has typed frontmatter like `company` on a person page,
+     follow the canonical typed-linking contract in
+     `docs/ENTITY_TYPES_AND_AUTO_LINKING.md` rather than inventing a new edge.
 
 STEP 3 — BACK-LINKING (mandatory):
 For every entity mentioned, add a back-link FROM their page TO this source.
@@ -125,7 +128,9 @@ is_notable(entity):
 ### The Iron Law of Back-Linking
 
 Every entity mention MUST create a back-link FROM the entity page TO the
-source. This is not optional.
+source. This is not optional. If the mention also maps to typed frontmatter,
+prefer the typed edge for compiled truth and keep the body mention as narrative
+context.
 
 ```
 // When message mentions "Pedro" and creates a meeting page:
