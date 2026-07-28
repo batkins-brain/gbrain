@@ -42,6 +42,14 @@ describe('classifyFactsAbsorbError — reason routing', () => {
     expect(classifyFactsAbsorbError(new Error('500 internal server error'))).toBe('gateway_error');
   });
 
+  test('cooperative teardown aborts → timeout', () => {
+    const abort = new Error('The operation was aborted.');
+    abort.name = 'AbortError';
+    expect(classifyFactsAbsorbError(abort)).toBe('timeout');
+    expect(classifyFactsAbsorbError(new Error('aborted'))).toBe('timeout');
+    expect(classifyFactsAbsorbError(new Error('Delay was aborted'))).toBe('timeout');
+  });
+
   test('network errors → gateway_error', () => {
     expect(classifyFactsAbsorbError(new Error('connect ECONNREFUSED 127.0.0.1:443'))).toBe('gateway_error');
     expect(classifyFactsAbsorbError(new Error('ECONNRESET'))).toBe('gateway_error');
@@ -112,13 +120,15 @@ describe('writeFactsAbsorbLog — ingest_log row shape', () => {
   });
 
   test('FACTS_ABSORB_REASONS contains every documented reason', () => {
+    expect(FACTS_ABSORB_REASONS).toContain('completed');
+    expect(FACTS_ABSORB_REASONS).toContain('timeout');
     expect(FACTS_ABSORB_REASONS).toContain('gateway_error');
     expect(FACTS_ABSORB_REASONS).toContain('parse_failure');
     expect(FACTS_ABSORB_REASONS).toContain('queue_overflow');
     expect(FACTS_ABSORB_REASONS).toContain('queue_shutdown');
     expect(FACTS_ABSORB_REASONS).toContain('embed_failure');
     expect(FACTS_ABSORB_REASONS).toContain('pipeline_error');
-    expect(FACTS_ABSORB_REASONS.length).toBe(6);
+    expect(FACTS_ABSORB_REASONS.length).toBe(8);
   });
 });
 

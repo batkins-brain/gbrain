@@ -47,6 +47,13 @@ export interface BackgroundWorkDrainer {
    * last-retrieved / search-cache drains. Ties break by name for determinism.
    */
   order: number;
+  /**
+   * Optional sink-specific CLI-exit budget. Facts extraction needs enough
+   * wallclock for a normal model response; cache/telemetry sinks should keep
+   * the caller-provided short default. The registry remains sequential and
+   * bounded.
+   */
+  cliExitTimeoutMs?: number;
   /** Resolve when in-flight work settles OR the bound elapses; report leftovers. */
   drain(timeoutMs: number): Promise<{ unfinished: number }>;
   /**
@@ -72,6 +79,14 @@ export function registerBackgroundWorkDrainer(d: BackgroundWorkDrainer): void {
  */
 export function backgroundWorkSinkCount(): number {
   return drainers.size;
+}
+
+/** Sum of the actual per-sink drain bounds used by the registry. */
+export function backgroundWorkTotalDrainBudgetMs(defaultTimeoutMs: number): number {
+  return [...drainers.values()].reduce(
+    (total, drainer) => total + (drainer.cliExitTimeoutMs ?? defaultTimeoutMs),
+    0,
+  );
 }
 
 /**
@@ -107,7 +122,7 @@ export async function drainAllBackgroundWorkForCliExit(opts?: { timeoutMs?: numb
   );
   for (const d of ordered) {
     try {
-      const { unfinished } = await d.drain(timeoutMs);
+      const { unfinished } = await d.drain(d.cliExitTimeoutMs ?? timeoutMs);
       if (unfinished > 0 && d.abort) {
         // codex #9: AWAIT — the facts:absorb job writes its absorb-log to the
         // DB on settle; the abort must finish against a live engine before the

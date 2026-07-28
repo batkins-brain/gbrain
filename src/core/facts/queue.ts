@@ -266,6 +266,10 @@ export function __resetFactsQueueForTests(): void {
 registerBackgroundWorkDrainer({
   name: 'facts',
   order: 0,
+  // TAN-591: a healthy hosted model call routinely exceeds the former 2s
+  // generic teardown budget. Keep extraction bounded, but give it 20s before
+  // the existing abort + log path takes over.
+  cliExitTimeoutMs: 20_000,
   drain: (ms) => getFactsQueue().drainPending({ timeout: ms }).then((r) => ({ unfinished: r.unfinished })),
   abort: () => getFactsQueue().shutdown(),
 });
