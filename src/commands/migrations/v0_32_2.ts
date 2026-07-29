@@ -31,6 +31,7 @@
 import {
   closeSync,
   constants,
+  fchmodSync,
   fstatSync,
   linkSync,
   lstatSync,
@@ -427,6 +428,19 @@ function nativeMkdirAt(fd: number, name: string, mode: number): void {
   if (getNativeAtSymbols().mkdirat(fd, cString(name), mode) < 0) {
     throw new Error(`descriptor-relative mkdir failed: ${name}`);
   }
+  // Darwin openat/mkdirat FFI paths can ignore the mode argument (variadic
+  // libc signatures). Re-apply the intended mode through the newly created
+  // directory descriptor before trusting it for private migration writes.
+  const childFd = nativeOpenAt(
+    fd,
+    name,
+    constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+  );
+  try {
+    fchmodSync(childFd, mode);
+  } finally {
+    closeSync(childFd);
+  }
 }
 
 function assertDirectoryFd(fd: number): void {
@@ -557,6 +571,8 @@ function openAnchoredParent(
             child,
             constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
           );
+          // mkdir mode is still subject to umask; pin owner-only on the fd.
+          fchmodSync(childFd, 0o700);
         } else {
           nativeMkdirAt(fd, segment, 0o700);
           childFd = nativeOpenAt(
@@ -671,6 +687,10 @@ function writeOwnedTempFileAt(parent: AnchoredParent, name: string, body: string
     if (!fstatSync(fd).isFile()) {
       throw new Error(`migration temporary target is not a regular file: ${name}`);
     }
+    // Force owner-only mode after create. Darwin's openat(2) is variadic; the
+    // bun:ffi binding can silently drop the mode argument and leave mode 0
+    // files that later fail with EACCES for the same effective user.
+    fchmodSync(fd, 0o600);
     writeFileSync(fd, body, 'utf-8');
   } finally {
     closeSync(fd);

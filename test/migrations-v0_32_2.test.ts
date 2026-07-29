@@ -55,6 +55,9 @@ afterAll(async () => {
 
 beforeEach(async () => {
   brainDir = mkdtempSync(join(tmpdir(), 'mig-v0_32_2-test-'));
+  // Migration refuses group/world-writable source dirs. mkdtemp is usually
+  // 0700, but pin it so umask drift cannot turn the fixture into a false fail.
+  chmodSync(brainDir, 0o700);
   __setTestPageLockRoot(join(brainDir, '.migration-page-locks'));
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   await (engine as any).db.query('DELETE FROM facts');
@@ -104,14 +107,39 @@ async function seedLegacyFact(input: {
   return r.rows[0].id;
 }
 
+function ensureOwnerOnlyDirs(filePath: string): void {
+  // Walk parents under brainDir and clear group/world write bits. Default
+  // mkdirSync honors umask (often 0002 → 0775), which the migration correctly
+  // rejects as an untrusted source directory.
+  let current = dirname(filePath);
+  const root = brainDir.endsWith('/') ? brainDir.slice(0, -1) : brainDir;
+  while (current.startsWith(root)) {
+    try {
+      chmodSync(current, 0o700);
+    } catch {
+      // Directory may not exist yet; mkdir below creates it.
+    }
+    if (current === root) break;
+    const parent = dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+}
+
+function mkdirOwnerOnly(dirPath: string): void {
+  mkdirSync(dirPath, { recursive: true, mode: 0o700 });
+  // recursive mkdir still applies umask to each created component.
+  ensureOwnerOnlyDirs(join(dirPath, '.keep'));
+}
+
 function writeEntityPage(slug: string): void {
   const path = join(brainDir, `${slug}.md`);
-  mkdirSync(dirname(path), { recursive: true });
+  mkdirOwnerOnly(dirname(path));
   const title = slug.split('/').at(-1) ?? slug;
   writeFileSync(
     path,
     `---\ntype: concept\ntitle: ${title}\nslug: ${slug}\n---\n\n# ${title}\n`,
-    'utf-8',
+    { encoding: 'utf-8', mode: 0o600 },
   );
 }
 
@@ -208,7 +236,7 @@ describe('phaseBFenceFacts — happy path backfill', () => {
   });
 
   test('appends to existing entity page without overwriting body', async () => {
-    mkdirSync(join(brainDir, 'people'), { recursive: true });
+    mkdirOwnerOnly(join(brainDir, 'people'));
     writeFileSync(
       join(brainDir, 'people/alice.md'),
       '---\ntype: person\ntitle: Alice\nslug: people/alice\n---\n\n# Alice\n\nNotes about Alice.\n',
@@ -411,6 +439,7 @@ describe('phaseBFenceFacts — happy path backfill', () => {
     const outsidePath = join(outsideDir, 'private.md');
     writeFileSync(outsidePath, 'EXTERNAL PRIVATE CONTENT\n', 'utf-8');
     mkdirSync(join(brainDir, 'people'), { recursive: true });
+    chmodSync(join(brainDir, 'people'), 0o700);
     symlinkSync(outsidePath, join(brainDir, 'people/alice.md'));
 
     try {
@@ -480,7 +509,7 @@ describe('phaseBFenceFacts — happy path backfill', () => {
   test('rejects an intermediate directory symlink even when it stays inside the source', async () => {
     const redirectedDir = join(brainDir, 'redirected-people');
     const redirectedPath = join(redirectedDir, 'alice.md');
-    mkdirSync(redirectedDir, { recursive: true });
+    mkdirOwnerOnly(redirectedDir);
     writeFileSync(redirectedPath, 'IN-ROOT UNRELATED CONTENT\n', 'utf-8');
     symlinkSync(redirectedDir, join(brainDir, 'people'));
 
@@ -502,7 +531,7 @@ describe('phaseBFenceFacts — happy path backfill', () => {
   });
 
   test('fails closed when an in-root quarantine directory component is a symlink', async () => {
-    mkdirSync(join(brainDir, 'redirected-quarantine'), { recursive: true });
+    mkdirOwnerOnly(join(brainDir, 'redirected-quarantine'));
     symlinkSync(join(brainDir, 'redirected-quarantine'), join(brainDir, 'quarantine'));
     await seedLegacyFact({
       entity_slug: 'missing-private-identifier',
@@ -540,7 +569,7 @@ describe('phaseBFenceFacts — happy path backfill', () => {
     });
     const slug = __testing.quarantineSlug('default', 'missing-private-identifier');
     const collisionPath = join(brainDir, `${slug}.md`);
-    mkdirSync(dirname(collisionPath), { recursive: true });
+    mkdirOwnerOnly(dirname(collisionPath));
     writeFileSync(collisionPath, 'UNRELATED CLEAN CONTENT\n');
     execFileSync('git', ['init', '-q', brainDir]);
     execFileSync('git', ['-C', brainDir, 'config', 'user.email', 'test@example.com']);
@@ -632,7 +661,7 @@ describe('phaseBFenceFacts — happy path backfill', () => {
     const outsideDir = mkdtempSync(join(tmpdir(), 'mig-v0_32_2-race-outside-'));
     const peopleDir = join(brainDir, 'people');
     const movedPeopleDir = join(brainDir, 'people-before-swap');
-    mkdirSync(peopleDir, { recursive: true });
+    mkdirOwnerOnly(peopleDir);
     writeFileSync(join(peopleDir, 'alice.md'), 'ORIGINAL\n');
     writeFileSync(join(outsideDir, 'alice.md'), 'OUTSIDE\n');
 
@@ -660,7 +689,7 @@ describe('phaseBFenceFacts — happy path backfill', () => {
     const aliasRoot = `${brainDir}-alias`;
     const replacementRoot = mkdtempSync(join(tmpdir(), 'mig-v0_32_2-root-swap-'));
     const peopleDir = join(brainDir, 'people');
-    mkdirSync(peopleDir, { recursive: true });
+    mkdirOwnerOnly(peopleDir);
     writeFileSync(join(peopleDir, 'alice.md'), 'ORIGINAL\n');
     symlinkSync(brainDir, aliasRoot);
 
