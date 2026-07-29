@@ -167,7 +167,7 @@ describe('phaseBFenceFacts — happy path backfill', () => {
     const id2 = await seedLegacyFact({ entity_slug: 'people/alice', fact: 'Prefers async over meetings' });
 
     const r = await __testing.phaseBFenceFacts(engine, OPTS);
-    expect(r.status).toBe('complete');
+    expect(r).toMatchObject({ status: 'complete' });
     expect(r.detail).toContain('fenced=2');
     expect(r.detail).toContain('pages=1');
 
