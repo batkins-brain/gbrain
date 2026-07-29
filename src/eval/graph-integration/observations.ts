@@ -370,7 +370,7 @@ export async function insertGraphReferenceObservations(
          scanner_version, content_hash, observed_at
        ) VALUES (
          $1, $2, $3, $4, $5,
-         $6, $7, $8::jsonb, $9,
+         $6, $7, $8::text::jsonb, $9,
          $10, $11, $12::timestamptz
        )
        ON CONFLICT (observation_id) DO UPDATE SET
