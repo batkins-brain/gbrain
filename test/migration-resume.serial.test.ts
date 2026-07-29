@@ -108,8 +108,11 @@ describe('Bug 3 — appendCompletedMigration idempotency', () => {
 
   test('partial always appends (needed for attempt-cap counter)', async () => {
     const { appendCompletedMigration, loadCompletedMigrations } = await import('../src/core/preferences.ts');
-    appendCompletedMigration({ version: '9.9.9', status: 'partial' });
-    appendCompletedMigration({ version: '9.9.9', status: 'partial' });
+    // Identical timestamps make this deterministic: ledger loading must not
+    // collapse two attempts merely because they landed in the same millisecond.
+    const ts = '2026-07-29T00:00:00.000Z';
+    appendCompletedMigration({ version: '9.9.9', status: 'partial', ts });
+    appendCompletedMigration({ version: '9.9.9', status: 'partial', ts });
     const entries = loadCompletedMigrations().filter(e => e.version === '9.9.9');
     expect(entries.length).toBe(2);
   });

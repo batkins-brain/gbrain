@@ -179,24 +179,30 @@ function readCompletedMigrations(path: string): CompletedMigrationEntry[] {
 /**
  * Read canonical and legacy migration ledgers. Canonical entries are appended
  * after legacy entries so their newer ordering wins, while any legacy
- * terminal completion remains visible to the runner. Exact duplicate records
- * are removed without rewriting or deleting the legacy file.
+ * terminal completion remains visible to the runner. Exact overlap between
+ * the two files is removed one-for-one without collapsing repeated entries
+ * within either ledger: repeated partials are distinct migration attempts,
+ * even when their timestamps happen to be identical.
  */
 export function loadCompletedMigrations(): CompletedMigrationEntry[] {
   const legacy = legacyCompletedJsonlPath();
-  const paths = [
-    ...(legacy ? [legacy] : []),
-    completedJsonlPath(),
-  ];
-  const seen = new Set<string>();
-  const merged: CompletedMigrationEntry[] = [];
-  for (const path of paths) {
-    for (const entry of readCompletedMigrations(path)) {
-      const key = JSON.stringify(entry);
-      if (seen.has(key)) continue;
-      seen.add(key);
-      merged.push(entry);
+  const legacyEntries = legacy ? readCompletedMigrations(legacy) : [];
+  const canonicalEntries = readCompletedMigrations(completedJsonlPath());
+  const overlappingLegacyCounts = new Map<string, number>();
+  for (const entry of legacyEntries) {
+    const key = JSON.stringify(entry);
+    overlappingLegacyCounts.set(key, (overlappingLegacyCounts.get(key) ?? 0) + 1);
+  }
+
+  const merged = [...legacyEntries];
+  for (const entry of canonicalEntries) {
+    const key = JSON.stringify(entry);
+    const remainingOverlap = overlappingLegacyCounts.get(key) ?? 0;
+    if (remainingOverlap > 0) {
+      overlappingLegacyCounts.set(key, remainingOverlap - 1);
+      continue;
     }
+    merged.push(entry);
   }
   return merged;
 }

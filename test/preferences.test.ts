@@ -243,6 +243,21 @@ describe('loadCompletedMigrations', () => {
     expect(loadCompletedMigrations()).toEqual([entry]);
   });
 
+  test('preserves exact repeated records within the canonical ledger', () => {
+    const entry = {
+      version: '0.10.0',
+      status: 'partial' as const,
+      ts: '2026-01-01T00:00:00.000Z',
+    };
+    mkdirSync(join(tmp, '.gbrain', 'migrations'), { recursive: true });
+    writeFileSync(
+      join(tmp, '.gbrain', 'migrations', 'completed.jsonl'),
+      `${JSON.stringify(entry)}\n${JSON.stringify(entry)}\n`,
+    );
+
+    expect(loadCompletedMigrations()).toEqual([entry, entry]);
+  });
+
   test('tolerates malformed lines with a warning, continuing past them', () => {
     const dir = join(tmp, '.gbrain', 'migrations');
     mkdirSync(dir, { recursive: true });
