@@ -9,9 +9,9 @@
  * Lock file path: `~/.gbrain/page-locks/<sha256-of-slug>.lock`. SHA-256
  * keeps filenames safe regardless of slug content (slashes, unicode, etc.).
  *
- * File contents: `{pid}\n{iso-timestamp}\n{holder-token}`. A lock is
- * reclaimable only when its PID is no longer alive on this host. Live locks
- * are never stolen solely because a wall-clock timeout elapsed.
+ * The persistent file carries diagnostic `{pid}\n{iso-timestamp}\n{holder-token}`
+ * content. Kernel `flock(2)` is the lock authority: acquisition is atomic and
+ * inode-bound, and a crash releases the lock automatically when the fd closes.
  *
  * Usage:
  *
@@ -26,18 +26,19 @@
 import {
   closeSync,
   chmodSync,
+  constants,
+  fchmodSync,
+  fsyncSync,
   fstatSync,
+  ftruncateSync,
   lstatSync,
   mkdirSync,
   openSync,
-  readFileSync,
-  statSync,
-  unlinkSync,
-  utimesSync,
-  writeFileSync,
+  writeSync,
 } from 'node:fs';
 import { join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
+import { dlopen, FFIType } from 'bun:ffi';
 import { gbrainPath } from './config.ts';
 
 export interface PageLockHandle {
@@ -64,58 +65,47 @@ function lockPathFor(slug: string, lockRoot?: string): string {
   return join(dir, `${sha}.lock`);
 }
 
-function isPidAlive(pid: number): boolean {
-  if (pid <= 0) return false;
-  // Note: unlike cycle.ts (single lock per process), page-lock allows
-  // multiple concurrent locks per process for DIFFERENT slugs. A same-pid
-  // collision on the SAME slug means another concurrent caller in this
-  // process holds it — treat as live and never steal it.
-  if (pid === process.pid) return true;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (e) {
-    const code = (e as NodeJS.ErrnoException).code;
-    // ESRCH = no such process; anything else (e.g. EPERM) = still alive.
-    return code !== 'ESRCH';
-  }
-}
-
 interface LockRecord {
   pid: number;
   timestamp: string;
   token: string;
 }
 
-function parseLockRecord(content: string): LockRecord {
-  const [pidText = '0', timestamp = '', token = ''] = content.trim().split('\n');
-  return {
-    pid: parseInt(pidText, 10),
-    timestamp,
-    token,
-  };
-}
-
 function lockRecordText(record: LockRecord): string {
   return `${record.pid}\n${record.timestamp}\n${record.token}\n`;
 }
 
-function writeExclusiveLock(lockPath: string, record: LockRecord): boolean {
-  let fd: number;
-  try {
-    fd = openSync(lockPath, 'wx', 0o600);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'EEXIST') return false;
-    throw error;
-  }
-  try {
-    writeFileSync(fd, lockRecordText(record), 'utf-8');
-    const stat = fstatSync(fd);
-    if (!stat.isFile()) throw new Error(`page lock is not a regular file: ${lockPath}`);
-  } finally {
-    closeSync(fd);
-  }
-  return true;
+interface FlockSymbols {
+  flock: (fd: number, operation: number) => number;
+}
+
+let flockLibrary: ReturnType<typeof dlopen> | null = null;
+let flockSymbols: FlockSymbols | null = null;
+
+function getFlockSymbols(): FlockSymbols {
+  if (flockSymbols) return flockSymbols;
+  const library =
+    process.platform === 'darwin'
+      ? '/usr/lib/libSystem.B.dylib'
+      : process.platform === 'linux'
+        ? 'libc.so.6'
+        : null;
+  if (!library) throw new Error('page locks require POSIX flock support');
+  flockLibrary = dlopen(library, {
+    flock: {
+      args: [FFIType.i32, FFIType.i32],
+      returns: FFIType.i32,
+    },
+  });
+  flockSymbols = flockLibrary.symbols as unknown as FlockSymbols;
+  return flockSymbols;
+}
+
+function writeLockRecord(fd: number, record: LockRecord): void {
+  const body = lockRecordText(record);
+  ftruncateSync(fd, 0);
+  writeSync(fd, body, 0, 'utf-8');
+  fsyncSync(fd);
 }
 
 function tryAcquireOnce(slug: string, lockPath: string): PageLockHandle | null {
@@ -137,63 +127,52 @@ function tryAcquireOnce(slug: string, lockPath: string): PageLockHandle | null {
       throw new Error(`page-lock root permissions could not be restricted: ${dir}`);
     }
   }
-  const pid = process.pid;
+
+  const fd = openSync(
+    lockPath,
+    constants.O_RDWR | constants.O_CREAT | constants.O_NOFOLLOW,
+    0o600,
+  );
+  const lockStat = fstatSync(fd);
+  if (
+    !lockStat.isFile() ||
+    (effectiveUid !== undefined && lockStat.uid !== effectiveUid)
+  ) {
+    closeSync(fd);
+    throw new Error(`page lock is not a caller-owned regular file: ${lockPath}`);
+  }
+  if ((lockStat.mode & 0o077) !== 0) fchmodSync(fd, 0o600);
+
+  // flock is the authority. It is atomic, inode-bound, and released by the
+  // kernel on process exit, eliminating initialization, stale-reclaim, and
+  // read/check/unlink races from the former PID-file protocol.
+  const LOCK_EX = 2;
+  const LOCK_NB = 4;
+  const LOCK_UN = 8;
+  if (getFlockSymbols().flock(fd, LOCK_EX | LOCK_NB) < 0) {
+    closeSync(fd);
+    return null;
+  }
+
   const token = randomUUID();
   const record = (): LockRecord => ({
-    pid,
+    pid: process.pid,
     timestamp: new Date().toISOString(),
     token,
   });
+  writeLockRecord(fd, record());
 
-  if (!writeExclusiveLock(lockPath, record())) {
-    try {
-      const before = statSync(lockPath);
-      const content = readFileSync(lockPath, 'utf-8').trim();
-      const existing = parseLockRecord(content);
-      const pidAlive = isPidAlive(existing.pid);
-
-      // Never steal from a live process merely because time elapsed. The
-      // previous timeout-or-dead rule allowed a long-running writer to lose
-      // exclusivity between refreshes. PID liveness is the reclaim authority.
-      if (pidAlive) return null;
-      // Reclaim only the exact stale inode we inspected. The subsequent
-      // O_EXCL create is the arbitration point if another waiter races us.
-      const after = statSync(lockPath);
-      const afterContent = readFileSync(lockPath, 'utf-8').trim();
-      if (
-        before.dev !== after.dev ||
-        before.ino !== after.ino ||
-        before.mtimeMs !== after.mtimeMs ||
-        content !== afterContent
-      ) return null;
-      unlinkSync(lockPath);
-    } catch {
-      // A concurrent owner may have refreshed/replaced the path. Never
-      // overwrite it; retry through the O_EXCL arbitration point instead.
-      return null;
-    }
-    if (!writeExclusiveLock(lockPath, record())) return null;
-  }
-
+  let released = false;
   return {
     slug,
     refresh: async () => {
-      try {
-        const held = parseLockRecord(readFileSync(lockPath, 'utf-8'));
-        if (held.pid !== pid || held.token !== token) return;
-        const now = new Date();
-        utimesSync(lockPath, now, now);
-      } catch {
-        /* non-fatal — next acquirer will see it as stale */
-      }
+      if (!released) writeLockRecord(fd, record());
     },
     release: async () => {
-      try {
-        const held = parseLockRecord(readFileSync(lockPath, 'utf-8'));
-        if (held.pid === pid && held.token === token) unlinkSync(lockPath);
-      } catch {
-        /* already gone */
-      }
+      if (released) return;
+      released = true;
+      getFlockSymbols().flock(fd, LOCK_UN);
+      closeSync(fd);
     },
   };
 }

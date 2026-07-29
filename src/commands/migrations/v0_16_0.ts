@@ -90,7 +90,7 @@ async function orchestrator(opts: OrchestratorOpts): Promise<OrchestratorResult>
 
   const a = await phaseASchema(opts);
   phases.push(a);
-  if (a.status === 'failed') return finalize(phases, 'failed');
+  if (a.status === 'failed') return finalize(phases, 'failed', !opts.dryRun);
 
   const b = await phaseBVerify(opts);
   phases.push(b);
@@ -99,11 +99,15 @@ async function orchestrator(opts: OrchestratorOpts): Promise<OrchestratorResult>
   const status: 'complete' | 'partial' | 'failed' =
     b.status === 'failed' ? 'partial' : 'complete';
 
-  return finalize(phases, status);
+  return finalize(phases, status, !opts.dryRun);
 }
 
-function finalize(phases: OrchestratorPhaseResult[], status: 'complete' | 'partial' | 'failed'): OrchestratorResult {
-  if (status !== 'failed') {
+function finalize(
+  phases: OrchestratorPhaseResult[],
+  status: 'complete' | 'partial' | 'failed',
+  persist: boolean,
+): OrchestratorResult {
+  if (persist && status !== 'failed') {
     try {
       appendCompletedMigration({
         version: '0.16.0',

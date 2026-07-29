@@ -7,9 +7,15 @@
  */
 
 import { describe, test, expect } from 'bun:test';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { __testing } from '../src/commands/apply-migrations.ts';
 import type { CompletedMigrationEntry } from '../src/core/preferences.ts';
 import type { Migration } from '../src/commands/migrations/types.ts';
+import { v0_16_0 } from '../src/commands/migrations/v0_16_0.ts';
+import { v0_18_0 } from '../src/commands/migrations/v0_18_0.ts';
+import { withEnv } from './helpers/with-env.ts';
 
 const {
   parseArgs,
@@ -254,5 +260,29 @@ describe('executeDryRunPlan', () => {
       () => {},
     );
     expect(calls).toBe(0);
+  });
+
+  test('legacy pending orchestrators do not write completion ledger during dry-run', async () => {
+    const isolatedHome = mkdtempSync(join(tmpdir(), 'apply-migrations-dry-run-'));
+    try {
+      await withEnv({ GBRAIN_HOME: isolatedHome }, async () => {
+        await executeDryRunPlan(
+          {
+            applied: [],
+            partial: [],
+            pending: [v0_16_0, v0_18_0],
+            skippedFuture: [],
+            wedged: [],
+          },
+          parseArgs(['--dry-run']),
+          () => {},
+        );
+        expect(
+          existsSync(join(isolatedHome, '.gbrain', 'migrations', 'completed.jsonl')),
+        ).toBe(false);
+      });
+    } finally {
+      rmSync(isolatedHome, { recursive: true, force: true });
+    }
   });
 });

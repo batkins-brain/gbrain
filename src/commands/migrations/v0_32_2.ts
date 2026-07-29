@@ -45,6 +45,7 @@ import {
 import { basename, join, dirname, resolve, relative, isAbsolute, sep } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
+import { dlopen, FFIType } from 'bun:ffi';
 
 import type {
   Migration, OrchestratorOpts, OrchestratorResult, OrchestratorPhaseResult,
@@ -311,18 +312,18 @@ function pathEntryExists(path: string): boolean {
 }
 
 /**
- * Linux and Darwin expose open directory descriptors below /proc/self/fd or
- * /dev/fd. Walking from an already-open source-root descriptor makes every
- * subsequent lookup relative to a stable directory object, so swapping an
- * intermediate path component cannot redirect a read or write outside the
- * registered source.
+ * Linux exposes open directory descriptors below /proc/self/fd or /dev/fd;
+ * Darwin uses libc *at(2) calls plus fcntl(F_GETPATH). Walking from an
+ * already-open source-root descriptor makes every subsequent lookup relative
+ * to a stable directory object, so swapping an intermediate path component
+ * cannot redirect a read or write outside the registered source.
  *
  * This migration handles private facts. Platforms without descriptor-relative
  * paths fail closed instead of falling back to race-prone pathname I/O.
  */
 interface AnchoredParent {
   fd: number;
-  procPath: string;
+  descriptorBase: string | null;
   absolutePath: string;
   localPath: string;
   canonicalRoot: string;
@@ -334,12 +335,118 @@ function descriptorFdPath(base: string, fd: number): string {
   return `${base}/${fd}`;
 }
 
+interface NativeAtSymbols {
+  openat: (dirFd: number, path: Uint8Array, flags: number, mode: number) => number;
+  mkdirat: (dirFd: number, path: Uint8Array, mode: number) => number;
+  renameat: (
+    oldDirFd: number,
+    oldPath: Uint8Array,
+    newDirFd: number,
+    newPath: Uint8Array,
+  ) => number;
+  linkat: (
+    oldDirFd: number,
+    oldPath: Uint8Array,
+    newDirFd: number,
+    newPath: Uint8Array,
+    flags: number,
+  ) => number;
+  unlinkat: (dirFd: number, path: Uint8Array, flags: number) => number;
+  fcntl: (fd: number, command: number, buffer: Uint8Array) => number;
+}
+
+let nativeAtLibrary: ReturnType<typeof dlopen> | null = null;
+let nativeAtSymbols: NativeAtSymbols | null = null;
+
+function cString(value: string): Uint8Array {
+  return Buffer.from(`${value}\0`);
+}
+
+function getNativeAtSymbols(): NativeAtSymbols {
+  if (nativeAtSymbols) return nativeAtSymbols;
+  if (process.platform !== 'darwin') {
+    throw new Error('native descriptor-relative migration backend is unavailable');
+  }
+  nativeAtLibrary = dlopen('/usr/lib/libSystem.B.dylib', {
+    openat: {
+      args: [FFIType.i32, FFIType.cstring, FFIType.i32, FFIType.u32],
+      returns: FFIType.i32,
+    },
+    mkdirat: {
+      args: [FFIType.i32, FFIType.cstring, FFIType.u32],
+      returns: FFIType.i32,
+    },
+    renameat: {
+      args: [FFIType.i32, FFIType.cstring, FFIType.i32, FFIType.cstring],
+      returns: FFIType.i32,
+    },
+    linkat: {
+      args: [
+        FFIType.i32,
+        FFIType.cstring,
+        FFIType.i32,
+        FFIType.cstring,
+        FFIType.i32,
+      ],
+      returns: FFIType.i32,
+    },
+    unlinkat: {
+      args: [FFIType.i32, FFIType.cstring, FFIType.i32],
+      returns: FFIType.i32,
+    },
+    fcntl: {
+      args: [FFIType.i32, FFIType.i32, FFIType.ptr],
+      returns: FFIType.i32,
+    },
+  });
+  nativeAtSymbols = nativeAtLibrary.symbols as unknown as NativeAtSymbols;
+  return nativeAtSymbols;
+}
+
+function nativeOpenAt(fd: number, name: string, flags: number, mode = 0): number {
+  const opened = getNativeAtSymbols().openat(fd, cString(name), flags, mode);
+  if (opened < 0) throw new Error(`descriptor-relative open failed: ${name}`);
+  return opened;
+}
+
+function nativeMkdirAt(fd: number, name: string, mode: number): void {
+  if (getNativeAtSymbols().mkdirat(fd, cString(name), mode) < 0) {
+    throw new Error(`descriptor-relative mkdir failed: ${name}`);
+  }
+}
+
+function nativeFdPath(fd: number): string {
+  if (process.platform !== 'darwin') {
+    throw new Error('native descriptor path lookup is unavailable');
+  }
+  // Darwin fcntl(F_GETPATH) writes a NUL-terminated path into MAXPATHLEN.
+  const F_GETPATH = 50;
+  const buffer = Buffer.alloc(4096);
+  if (getNativeAtSymbols().fcntl(fd, F_GETPATH, buffer) < 0) {
+    throw new Error('descriptor canonical-path lookup failed');
+  }
+  const nul = buffer.indexOf(0);
+  return buffer.subarray(0, nul < 0 ? buffer.length : nul).toString('utf-8');
+}
+
 function assertDirectoryFd(fd: number): void {
   const stat = fstatSync(fd);
   if (!stat.isDirectory()) throw new Error('migration path component is not a directory');
 }
 
-function descriptorBaseForFd(fd: number): string {
+function assertTrustedSourceDirectoryFd(fd: number): void {
+  const stat = fstatSync(fd);
+  if (!stat.isDirectory()) throw new Error('migration path component is not a directory');
+  const effectiveUid = process.getuid?.();
+  if (effectiveUid !== undefined && stat.uid !== effectiveUid) {
+    throw new Error('migration source directory is not owned by the effective user');
+  }
+  if ((stat.mode & 0o022) !== 0) {
+    throw new Error('migration source directory is group- or world-writable');
+  }
+}
+
+function descriptorBaseForFd(fd: number): string | null {
   const expected = fstatSync(fd);
   for (const base of ['/proc/self/fd', '/dev/fd']) {
     if (!pathEntryExists(base)) continue;
@@ -357,9 +464,8 @@ function descriptorBaseForFd(fd: number): string {
       if (probeFd !== undefined) closeSync(probeFd);
     }
   }
-  throw new Error(
-    'migration requires descriptor-relative directory I/O (/proc/self/fd or /dev/fd)',
-  );
+  if (process.platform === 'darwin') return null;
+  throw new Error('migration requires descriptor-relative directory I/O');
 }
 
 function openAnchoredParent(
@@ -388,15 +494,23 @@ function openAnchoredParent(
     assertDirectoryFd(fd);
     const descriptorBase = descriptorBaseForFd(fd);
     for (const segment of canonicalSegments) {
-      const childFd = openSync(
-        join(descriptorFdPath(descriptorBase, fd), segment),
-        constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
-      );
+      const childFd = descriptorBase
+        ? openSync(
+            join(descriptorFdPath(descriptorBase, fd), segment),
+            constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+          )
+        : nativeOpenAt(
+            fd,
+            segment,
+            constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+          );
       closeSync(fd);
       fd = childFd;
       assertDirectoryFd(fd);
     }
-    const openedRootPath = realpathSync(descriptorFdPath(descriptorBase, fd));
+    const openedRootPath = descriptorBase
+      ? realpathSync(descriptorFdPath(descriptorBase, fd))
+      : nativeFdPath(fd);
     if (openedRootPath !== canonicalRoot) {
       throw new Error('registered source root changed while opening');
     }
@@ -411,31 +525,46 @@ function openAnchoredParent(
 
     let currentAbsolute = canonicalRoot;
     for (const segment of directorySegments) {
-      const child = join(descriptorFdPath(descriptorBase, fd), segment);
       let childFd: number;
       try {
-        childFd = openSync(
-          child,
-          constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
-        );
+        childFd = descriptorBase
+          ? openSync(
+              join(descriptorFdPath(descriptorBase, fd), segment),
+              constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+            )
+          : nativeOpenAt(
+              fd,
+              segment,
+              constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+            );
       } catch (error) {
         const code = (error as NodeJS.ErrnoException).code;
-        if (!createMissing || code !== 'ENOENT') throw error;
-        mkdirSync(child, { mode: 0o700 });
-        childFd = openSync(
-          child,
-          constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
-        );
+        if (!createMissing || (descriptorBase && code !== 'ENOENT')) throw error;
+        if (descriptorBase) {
+          const child = join(descriptorFdPath(descriptorBase, fd), segment);
+          mkdirSync(child, { mode: 0o700 });
+          childFd = openSync(
+            child,
+            constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+          );
+        } else {
+          nativeMkdirAt(fd, segment, 0o700);
+          childFd = nativeOpenAt(
+            fd,
+            segment,
+            constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+          );
+        }
       }
       closeSync(fd);
       fd = childFd;
       currentAbsolute = join(currentAbsolute, segment);
-      assertDirectoryFd(fd);
+      assertTrustedSourceDirectoryFd(fd);
     }
     const stat = fstatSync(fd);
     return {
       fd,
-      procPath: descriptorFdPath(descriptorBase, fd),
+      descriptorBase,
       absolutePath: currentAbsolute,
       localPath: absoluteRoot,
       canonicalRoot,
@@ -453,7 +582,9 @@ function closeAnchoredParent(parent: AnchoredParent): void {
 }
 
 function assertAnchoredParentStillCurrent(parent: AnchoredParent): void {
-  const openedPath = realpathSync(parent.procPath);
+  const openedPath = parent.descriptorBase
+    ? realpathSync(descriptorFdPath(parent.descriptorBase, parent.fd))
+    : nativeFdPath(parent.fd);
   if (
     openedPath !== parent.absolutePath ||
     !isWriteTargetContained(openedPath, parent.canonicalRoot)
@@ -469,6 +600,7 @@ function assertAnchoredParentStillCurrent(parent: AnchoredParent): void {
   );
   try {
     const stat = fstatSync(currentFd);
+    assertTrustedSourceDirectoryFd(currentFd);
     if (!stat.isDirectory() || stat.dev !== parent.dev || stat.ino !== parent.ino) {
       throw new Error('migration target path changed during descriptor-anchored write');
     }
@@ -481,10 +613,24 @@ function anchoredChildPath(parent: AnchoredParent, name: string): string {
   if (!name || name.includes('/') || name.includes('\\') || name === '.' || name === '..') {
     throw new Error(`unsafe migration child name: ${name}`);
   }
-  return join(parent.procPath, name);
+  if (!parent.descriptorBase) {
+    throw new Error('pathname access is unavailable for the native descriptor backend');
+  }
+  return join(descriptorFdPath(parent.descriptorBase, parent.fd), name);
 }
 
 function anchoredChildExists(parent: AnchoredParent, name: string): boolean {
+  if (!parent.descriptorBase) {
+    let fd: number | undefined;
+    try {
+      fd = nativeOpenAt(parent.fd, name, constants.O_RDONLY | constants.O_NOFOLLOW);
+      return true;
+    } catch {
+      return false;
+    } finally {
+      if (fd !== undefined) closeSync(fd);
+    }
+  }
   try {
     lstatSync(anchoredChildPath(parent, name));
     return true;
@@ -495,8 +641,9 @@ function anchoredChildExists(parent: AnchoredParent, name: string): boolean {
 }
 
 function readRegularFileAt(parent: AnchoredParent, name: string): string {
-  const path = anchoredChildPath(parent, name);
-  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  const fd = parent.descriptorBase
+    ? openSync(anchoredChildPath(parent, name), constants.O_RDONLY | constants.O_NOFOLLOW)
+    : nativeOpenAt(parent.fd, name, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
     if (!fstatSync(fd).isFile()) {
       throw new Error(`migration target is not a regular file: ${name}`);
@@ -508,19 +655,54 @@ function readRegularFileAt(parent: AnchoredParent, name: string): string {
 }
 
 function writeOwnedTempFileAt(parent: AnchoredParent, name: string, body: string): void {
-  const path = anchoredChildPath(parent, name);
-  const fd = openSync(
-    path,
-    constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
-    0o600,
-  );
+  const flags =
+    constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW;
+  const fd = parent.descriptorBase
+    ? openSync(anchoredChildPath(parent, name), flags, 0o600)
+    : nativeOpenAt(parent.fd, name, flags, 0o600);
   try {
     if (!fstatSync(fd).isFile()) {
-      throw new Error(`migration temporary target is not a regular file: ${path}`);
+      throw new Error(`migration temporary target is not a regular file: ${name}`);
     }
     writeFileSync(fd, body, 'utf-8');
   } finally {
     closeSync(fd);
+  }
+}
+
+function renameChildAt(parent: AnchoredParent, from: string, to: string): void {
+  if (parent.descriptorBase) {
+    renameSync(anchoredChildPath(parent, from), anchoredChildPath(parent, to));
+    return;
+  }
+  const symbols = getNativeAtSymbols();
+  if (
+    symbols.renameat(parent.fd, cString(from), parent.fd, cString(to)) < 0
+  ) {
+    throw new Error(`descriptor-relative rename failed: ${from} -> ${to}`);
+  }
+}
+
+function linkChildAt(parent: AnchoredParent, from: string, to: string): void {
+  if (parent.descriptorBase) {
+    linkSync(anchoredChildPath(parent, from), anchoredChildPath(parent, to));
+    return;
+  }
+  const symbols = getNativeAtSymbols();
+  if (
+    symbols.linkat(parent.fd, cString(from), parent.fd, cString(to), 0) < 0
+  ) {
+    throw new Error(`descriptor-relative no-replace publish failed: ${to}`);
+  }
+}
+
+function unlinkChildAt(parent: AnchoredParent, name: string): void {
+  if (parent.descriptorBase) {
+    unlinkSync(anchoredChildPath(parent, name));
+    return;
+  }
+  if (getNativeAtSymbols().unlinkat(parent.fd, cString(name), 0) < 0) {
+    throw new Error(`descriptor-relative unlink failed: ${name}`);
   }
 }
 
@@ -967,19 +1149,13 @@ async function phaseBFenceFacts(
               if (compareBody !== originalBody) {
                 throw new Error('migration destination changed before publication');
               }
-              renameSync(
-                anchoredChildPath(parent, tmpName),
-                anchoredChildPath(parent, fileName),
-              );
+              renameChildAt(parent, tmpName, fileName);
             }
           } else {
             writeOwnedTempFileAt(parent, tmpName, body);
             assertAnchoredParentStillCurrent(parent);
-            linkSync(
-              anchoredChildPath(parent, tmpName),
-              anchoredChildPath(parent, fileName),
-            );
-            unlinkSync(anchoredChildPath(parent, tmpName));
+            linkChildAt(parent, tmpName, fileName);
+            unlinkChildAt(parent, tmpName);
           }
           assertAnchoredParentStillCurrent(parent);
 

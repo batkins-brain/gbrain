@@ -706,6 +706,20 @@ describe('phaseBFenceFacts — happy path backfill', () => {
     }
   });
 
+  test('source-root anchor rejects a group/world-writable descendant directory', () => {
+    const peopleDir = join(brainDir, 'people');
+    const target = join(peopleDir, 'alice.md');
+    mkdirSync(peopleDir, { recursive: true });
+    chmodSync(peopleDir, 0o777);
+    try {
+      expect(() => __testing.openAnchoredParent(brainDir, target, false)).toThrow(
+        /source directory is group- or world-writable/,
+      );
+    } finally {
+      chmodSync(peopleDir, 0o700);
+    }
+  });
+
   test('serializes with canonical page writers and preserves the winner before migration publication', async () => {
     writeEntityPage('people/alice');
     await seedLegacyFact({ entity_slug: 'people/alice', fact: 'Migrated fact' });
