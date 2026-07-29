@@ -269,6 +269,38 @@ function orchestratorOptsFrom(cli: ApplyMigrationsArgs): OrchestratorOpts {
   };
 }
 
+type DryRunResult = Awaited<ReturnType<Migration['orchestrator']>>;
+
+/**
+ * Execute each pending/resumable orchestrator in its side-effect-free dry-run
+ * mode. The runner deliberately does not append completion-ledger entries.
+ * Structured target manifests are rendered verbatim so the operator can see
+ * exact filesystem destinations before authorizing a real migration.
+ */
+async function executeDryRunPlan(
+  plan: Plan,
+  cli: ApplyMigrationsArgs,
+  writeLine: (line: string) => void = line => console.log(line),
+): Promise<DryRunResult[]> {
+  const results: DryRunResult[] = [];
+  for (const migration of [...plan.partial, ...plan.pending]) {
+    writeLine(`\n=== Dry-run migration v${migration.version}: ${migration.featurePitch.headline} ===`);
+    const result = await migration.orchestrator({
+      ...orchestratorOptsFrom(cli),
+      dryRun: true,
+    });
+    results.push(result);
+    const manifest = (result as DryRunResult & { target_manifest?: unknown }).target_manifest;
+    if (manifest !== undefined) {
+      writeLine(`Target manifest:\n${JSON.stringify(manifest, null, 2)}`);
+    }
+    if (result.status === 'failed') {
+      throw new Error(`Migration v${migration.version} dry-run reported status=failed`);
+    }
+  }
+  return results;
+}
+
 /**
  * Entry point. Does not call connectEngine — each phase inside an
  * orchestrator manages its own engine / subprocess lifecycle.
@@ -415,7 +447,18 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
   }
 
   if (cli.list) { printList(plan, installed); process.exit(0); }
-  if (cli.dryRun) { printDryRun(plan, installed); process.exit(0); }
+  if (cli.dryRun) {
+    printDryRun(plan, installed);
+    try {
+      await executeDryRunPlan(plan, cli);
+      process.exit(0);
+    } catch (error) {
+      console.error(
+        `Migration dry-run failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      process.exit(1);
+    }
+  }
 
   const toRun: Migration[] = [...plan.partial, ...plan.pending];
   if (toRun.length === 0) {
@@ -503,4 +546,5 @@ export const __testing = {
   buildPlan,
   indexCompleted,
   statusForVersion,
+  executeDryRunPlan,
 };

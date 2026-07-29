@@ -9,8 +9,9 @@
  * Lock file path: `~/.gbrain/page-locks/<sha256-of-slug>.lock`. SHA-256
  * keeps filenames safe regardless of slug content (slashes, unicode, etc.).
  *
- * File contents: `{pid}\n{iso-timestamp}`. Staleness = mtime older than
- * `LOCK_TTL_MS` (5 min) OR the PID is no longer alive on this host.
+ * File contents: `{pid}\n{iso-timestamp}\n{holder-token}`. A lock is
+ * reclaimable only when its PID is no longer alive on this host. Live locks
+ * are never stolen solely because a wall-clock timeout elapsed.
  *
  * Usage:
  *
@@ -22,17 +23,27 @@
  *   }
  */
 
-import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import {
+  closeSync,
+  chmodSync,
+  fstatSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  statSync,
+  unlinkSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs';
 import { join } from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { gbrainPath } from './config.ts';
-
-const LOCK_TTL_MS = 5 * 60 * 1000; // 5 minutes — matches eng-review fold spec
 
 export interface PageLockHandle {
   /** Release the lock if we still hold it. Idempotent. */
   release: () => Promise<void>;
-  /** Refresh the mtime + timestamp so the TTL doesn't expire mid-operation. */
+  /** Refresh diagnostic mtime without changing the holder identity record. */
   refresh: () => Promise<void>;
   /** Slug the lock was acquired for (for diagnostics). */
   slug: string;
@@ -58,8 +69,7 @@ function isPidAlive(pid: number): boolean {
   // Note: unlike cycle.ts (single lock per process), page-lock allows
   // multiple concurrent locks per process for DIFFERENT slugs. A same-pid
   // collision on the SAME slug means another concurrent caller in this
-  // process holds it — treat as live and let mtime expiry handle stale
-  // post-crash cases.
+  // process holds it — treat as live and never steal it.
   if (pid === process.pid) return true;
   try {
     process.kill(pid, 0);
@@ -71,44 +81,116 @@ function isPidAlive(pid: number): boolean {
   }
 }
 
+interface LockRecord {
+  pid: number;
+  timestamp: string;
+  token: string;
+}
+
+function parseLockRecord(content: string): LockRecord {
+  const [pidText = '0', timestamp = '', token = ''] = content.trim().split('\n');
+  return {
+    pid: parseInt(pidText, 10),
+    timestamp,
+    token,
+  };
+}
+
+function lockRecordText(record: LockRecord): string {
+  return `${record.pid}\n${record.timestamp}\n${record.token}\n`;
+}
+
+function writeExclusiveLock(lockPath: string, record: LockRecord): boolean {
+  let fd: number;
+  try {
+    fd = openSync(lockPath, 'wx', 0o600);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') return false;
+    throw error;
+  }
+  try {
+    writeFileSync(fd, lockRecordText(record), 'utf-8');
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) throw new Error(`page lock is not a regular file: ${lockPath}`);
+  } finally {
+    closeSync(fd);
+  }
+  return true;
+}
+
 function tryAcquireOnce(slug: string, lockPath: string): PageLockHandle | null {
   const dir = join(lockPath, '..');
-  mkdirSync(dir, { recursive: true });
-  const pid = process.pid;
-
-  if (existsSync(lockPath)) {
-    try {
-      const st = statSync(lockPath);
-      const ageMs = Date.now() - st.mtimeMs;
-      const content = readFileSync(lockPath, 'utf-8').trim();
-      const existingPid = parseInt(content.split('\n')[0] || '0', 10);
-      const pidAlive = isPidAlive(existingPid);
-
-      if (pidAlive && ageMs < LOCK_TTL_MS) {
-        return null; // live holder
-      }
-      // Stale — fall through to overwrite.
-    } catch {
-      // Any read/stat error → treat as stale.
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  let dirStat = lstatSync(dir);
+  const effectiveUid = process.getuid?.();
+  if (
+    !dirStat.isDirectory() ||
+    dirStat.isSymbolicLink() ||
+    (effectiveUid !== undefined && dirStat.uid !== effectiveUid)
+  ) {
+    throw new Error(`page-lock root is not a private, caller-owned directory: ${dir}`);
+  }
+  if ((dirStat.mode & 0o077) !== 0) {
+    chmodSync(dir, 0o700);
+    dirStat = lstatSync(dir);
+    if ((dirStat.mode & 0o077) !== 0) {
+      throw new Error(`page-lock root permissions could not be restricted: ${dir}`);
     }
   }
+  const pid = process.pid;
+  const token = randomUUID();
+  const record = (): LockRecord => ({
+    pid,
+    timestamp: new Date().toISOString(),
+    token,
+  });
 
-  writeFileSync(lockPath, `${pid}\n${new Date().toISOString()}\n`);
+  if (!writeExclusiveLock(lockPath, record())) {
+    try {
+      const before = statSync(lockPath);
+      const content = readFileSync(lockPath, 'utf-8').trim();
+      const existing = parseLockRecord(content);
+      const pidAlive = isPidAlive(existing.pid);
+
+      // Never steal from a live process merely because time elapsed. The
+      // previous timeout-or-dead rule allowed a long-running writer to lose
+      // exclusivity between refreshes. PID liveness is the reclaim authority.
+      if (pidAlive) return null;
+      // Reclaim only the exact stale inode we inspected. The subsequent
+      // O_EXCL create is the arbitration point if another waiter races us.
+      const after = statSync(lockPath);
+      const afterContent = readFileSync(lockPath, 'utf-8').trim();
+      if (
+        before.dev !== after.dev ||
+        before.ino !== after.ino ||
+        before.mtimeMs !== after.mtimeMs ||
+        content !== afterContent
+      ) return null;
+      unlinkSync(lockPath);
+    } catch {
+      // A concurrent owner may have refreshed/replaced the path. Never
+      // overwrite it; retry through the O_EXCL arbitration point instead.
+      return null;
+    }
+    if (!writeExclusiveLock(lockPath, record())) return null;
+  }
 
   return {
     slug,
     refresh: async () => {
       try {
-        writeFileSync(lockPath, `${pid}\n${new Date().toISOString()}\n`);
+        const held = parseLockRecord(readFileSync(lockPath, 'utf-8'));
+        if (held.pid !== pid || held.token !== token) return;
+        const now = new Date();
+        utimesSync(lockPath, now, now);
       } catch {
         /* non-fatal — next acquirer will see it as stale */
       }
     },
     release: async () => {
       try {
-        const content = readFileSync(lockPath, 'utf-8').trim();
-        const heldPid = parseInt(content.split('\n')[0] || '0', 10);
-        if (heldPid === pid) unlinkSync(lockPath);
+        const held = parseLockRecord(readFileSync(lockPath, 'utf-8'));
+        if (held.pid === pid && held.token === token) unlinkSync(lockPath);
       } catch {
         /* already gone */
       }

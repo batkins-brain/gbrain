@@ -12,6 +12,7 @@
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -26,8 +27,14 @@ import { dirname, join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
-import { v0_32_2, __setTestEngineOverride, __testing } from '../src/commands/migrations/v0_32_2.ts';
+import {
+  v0_32_2,
+  __setTestEngineOverride,
+  __setTestPageLockRoot,
+  __testing,
+} from '../src/commands/migrations/v0_32_2.ts';
 import { parseFactsFence } from '../src/core/facts-fence.ts';
+import { acquirePageLock } from '../src/core/page-lock.ts';
 
 let engine: PGLiteEngine;
 let brainDir: string;
@@ -41,11 +48,13 @@ beforeAll(async () => {
 
 afterAll(async () => {
   __setTestEngineOverride(null);
+  __setTestPageLockRoot(undefined);
   await engine.disconnect();
 });
 
 beforeEach(async () => {
   brainDir = mkdtempSync(join(tmpdir(), 'mig-v0_32_2-test-'));
+  __setTestPageLockRoot(join(brainDir, '.migration-page-locks'));
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   await (engine as any).db.query('DELETE FROM facts');
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -567,6 +576,34 @@ describe('phaseBFenceFacts — happy path backfill', () => {
     expect(readFileSync(path, 'utf-8')).toBe(before);
   });
 
+  test('never replaces an owned quarantine file with different private content', async () => {
+    const firstId = await seedLegacyFact({
+      entity_slug: 'missing-private-identifier',
+      fact: 'First quarantined fact',
+    });
+    expect((await __testing.phaseBFenceFacts(engine, OPTS)).status).toBe('complete');
+    const slug = __testing.quarantineSlug('default', 'missing-private-identifier');
+    const path = join(brainDir, `${slug}.md`);
+    const published = readFileSync(path, 'utf-8');
+
+    const secondId = await seedLegacyFact({
+      entity_slug: 'missing-private-identifier',
+      fact: 'Later private fact must not replace quarantine',
+    });
+    const second = await __testing.phaseBFenceFacts(engine, OPTS);
+
+    expect(second.status).toBe('failed');
+    expect(second.detail).toContain('quarantine destination is immutable');
+    expect(readFileSync(path, 'utf-8')).toBe(published);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const rows = await (engine as any).db.query(
+      'SELECT id, row_num FROM facts WHERE id IN ($1, $2) ORDER BY id',
+      [firstId, secondId],
+    );
+    expect(rows.rows[0].row_num).not.toBeNull();
+    expect(rows.rows[1].row_num).toBeNull();
+  });
+
   test('owned temporary writes reject in-root and out-of-root symlinks', () => {
     const outsideDir = mkdtempSync(join(tmpdir(), 'mig-v0_32_2-tmp-outside-'));
     const inRootVictim = join(brainDir, 'in-root-victim.md');
@@ -590,7 +627,7 @@ describe('phaseBFenceFacts — happy path backfill', () => {
     }
   });
 
-  test('descriptor-anchored write and rename cannot follow a swapped parent path', () => {
+  test('placement validation rejects a descriptor parent moved outside the source before staging', () => {
     const outsideDir = mkdtempSync(join(tmpdir(), 'mig-v0_32_2-race-outside-'));
     const peopleDir = join(brainDir, 'people');
     const movedPeopleDir = join(brainDir, 'people-before-swap');
@@ -605,14 +642,13 @@ describe('phaseBFenceFacts — happy path backfill', () => {
       renameSync(peopleDir, movedPeopleDir);
       symlinkSync(outsideDir, peopleDir);
 
-      __testing.writeOwnedTempFileAt(parent, '.migration.tmp', 'PRIVATE\n');
-      renameSync(
-        __testing.anchoredChildPath(parent, '.migration.tmp'),
-        __testing.anchoredChildPath(parent, 'alice.md'),
+      expect(() => __testing.assertAnchoredParentStillCurrent(parent)).toThrow(
+        /moved outside its anchored source path/,
       );
 
       expect(readFileSync(join(outsideDir, 'alice.md'), 'utf-8')).toBe('OUTSIDE\n');
-      expect(readFileSync(join(movedPeopleDir, 'alice.md'), 'utf-8')).toBe('PRIVATE\n');
+      expect(readFileSync(join(movedPeopleDir, 'alice.md'), 'utf-8')).toBe('ORIGINAL\n');
+      expect(existsSync(join(movedPeopleDir, '.migration.tmp'))).toBe(false);
     } finally {
       __testing.closeAnchoredParent(parent);
       rmSync(outsideDir, { recursive: true, force: true });
@@ -648,6 +684,46 @@ describe('phaseBFenceFacts — happy path backfill', () => {
     const slug = ':(exclude)people/alice';
     writeEntityPage(slug);
     expect(__testing.areTargetPathsDirty(brainDir, [slug])).toBe(true);
+  });
+
+  test('dirty guard fails closed for a corrupt Git worktree', () => {
+    writeFileSync(join(brainDir, '.git'), 'this is not a valid gitdir\n');
+    expect(() => __testing.areTargetPathsDirty(brainDir, ['people/alice'])).toThrow(
+      /could not prove migration source Git state/,
+    );
+  });
+
+  test('source-root anchor rejects a group/world-writable registered root', () => {
+    const target = join(brainDir, 'people', 'alice.md');
+    mkdirSync(join(brainDir, 'people'), { recursive: true });
+    chmodSync(brainDir, 0o777);
+    try {
+      expect(() => __testing.openAnchoredParent(brainDir, target, false)).toThrow(
+        /source root is group- or world-writable/,
+      );
+    } finally {
+      chmodSync(brainDir, 0o700);
+    }
+  });
+
+  test('serializes with canonical page writers and preserves the winner before migration publication', async () => {
+    writeEntityPage('people/alice');
+    await seedLegacyFact({ entity_slug: 'people/alice', fact: 'Migrated fact' });
+    const lockRoot = join(brainDir, '.migration-page-locks');
+    const holder = await acquirePageLock('people/alice', { lockRoot });
+    expect(holder).not.toBeNull();
+
+    const migration = __testing.phaseBFenceFacts(engine, OPTS);
+    await new Promise(resolvePromise => setTimeout(resolvePromise, 40));
+    const path = join(brainDir, 'people', 'alice.md');
+    writeFileSync(path, `${readFileSync(path, 'utf-8')}\nConcurrent canonical edit.\n`);
+    await holder!.release();
+
+    const result = await migration;
+    expect(result.status).toBe('complete');
+    const published = readFileSync(path, 'utf-8');
+    expect(published).toContain('Concurrent canonical edit.');
+    expect(published).toContain('Migrated fact');
   });
 
   test('leaves a pre-existing legacy .md.tmp file untouched', async () => {

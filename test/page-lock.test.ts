@@ -1,5 +1,13 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtempSync, rmSync, existsSync, writeFileSync, readFileSync, utimesSync } from 'node:fs';
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs';
 import { join, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
@@ -56,6 +64,19 @@ describe('acquirePageLock', () => {
     await lock!.release();
   });
 
+  test('never steals an old lock from a live holder', async () => {
+    const slug = 'people/live-long-operation';
+    const first = await acquirePageLock(slug, { lockRoot: tmp });
+    expect(first).not.toBeNull();
+    const tenMinAgo = new Date(Date.now() - 10 * 60 * 1000);
+    utimesSync(lockFile(slug), tenMinAgo, tenMinAgo);
+
+    const second = await acquirePageLock(slug, { lockRoot: tmp });
+
+    expect(second).toBeNull();
+    await first!.release();
+  });
+
   test('reclaims lock when holder PID is no longer alive', async () => {
     const slug = 'people/charlie';
     const path = lockFile(slug);
@@ -71,13 +92,14 @@ describe('acquirePageLock', () => {
     const lock = await acquirePageLock('test/refresh', { lockRoot: tmp });
     expect(lock).not.toBeNull();
     const path = lockFile('test/refresh');
-    const t1 = readFileSync(path, 'utf-8');
+    const content = readFileSync(path, 'utf-8');
+    const t1 = statSync(path).mtimeMs;
     await new Promise(r => setTimeout(r, 50));
     await lock!.refresh();
-    const t2 = readFileSync(path, 'utf-8');
-    // Same pid, different timestamp.
-    expect(t1.split('\n')[0]).toBe(t2.split('\n')[0]);
-    expect(t1).not.toBe(t2);
+    const t2 = statSync(path).mtimeMs;
+    // Holder identity remains stable; only diagnostic mtime changes.
+    expect(readFileSync(path, 'utf-8')).toBe(content);
+    expect(t2).toBeGreaterThan(t1);
     await lock!.release();
   });
 
@@ -94,6 +116,19 @@ describe('acquirePageLock', () => {
     // Release should be a no-op (different pid).
     await lock!.release();
     expect(existsSync(path)).toBe(true);
+  });
+
+  test('release() does not delete a replacement lock from the same process', async () => {
+    const slug = 'test/same-pid-replacement';
+    const path = lockFile(slug);
+    const lock = await acquirePageLock(slug, { lockRoot: tmp });
+    expect(lock).not.toBeNull();
+    writeFileSync(path, `${process.pid}\n${new Date().toISOString()}\nreplacement-token\n`);
+
+    await lock!.release();
+
+    expect(existsSync(path)).toBe(true);
+    expect(readFileSync(path, 'utf-8')).toContain('replacement-token');
   });
 });
 

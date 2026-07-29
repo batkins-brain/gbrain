@@ -43,7 +43,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { basename, join, dirname, resolve, relative, isAbsolute, sep } from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 
 import type {
@@ -54,10 +54,15 @@ import { loadConfig, toEngineConfig } from '../../core/config.ts';
 import { createEngine } from '../../core/engine-factory.ts';
 import { upsertFactRow, parseFactsFence } from '../../core/facts-fence.ts';
 import { isWriteTargetContained } from '../../core/path-confine.ts';
+import { withPageLock } from '../../core/page-lock.ts';
 
 let testEngineOverride: BrainEngine | null = null;
+let testPageLockRoot: string | undefined;
 export function __setTestEngineOverride(engine: BrainEngine | null): void {
   testEngineOverride = engine;
+}
+export function __setTestPageLockRoot(lockRoot: string | undefined): void {
+  testPageLockRoot = lockRoot;
 }
 
 async function getEngine(): Promise<BrainEngine | null> {
@@ -211,17 +216,30 @@ function areTargetPathsDirty(
     ...targetMarkdownSlugs.map(slug => `${slug}.md`),
     ...additionalRelativePaths,
   ];
-  try {
-    // A missing Git repository is supported. Once Git recognizes the worktree,
-    // however, status errors must fail closed rather than silently authorizing
-    // a migration write.
-    execFileSync('git', ['-C', localPath, 'rev-parse', '--is-inside-work-tree'], {
+  // Distinguish a proven non-repository from an operational error. A missing
+  // git binary, timeout, permission problem, or corrupt repository must not
+  // silently authorize writes to migration destinations.
+  const probe = spawnSync(
+    'git',
+    ['-C', localPath, 'rev-parse', '--is-inside-work-tree'],
+    {
       encoding: 'utf-8',
-      stdio: ['ignore', 'pipe', 'ignore'],
+      stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 10_000,
-    });
-  } catch {
-    return false;
+    },
+  );
+  if (probe.error) {
+    throw new Error(`could not inspect migration source Git state: ${probe.error.message}`);
+  }
+  if (probe.status !== 0) {
+    const diagnostic = `${probe.stderr ?? ''}\n${probe.stdout ?? ''}`.trim();
+    if (/not a git repository/i.test(diagnostic)) return false;
+    throw new Error(
+      `could not prove migration source Git state${diagnostic ? `: ${diagnostic}` : ''}`,
+    );
+  }
+  if (probe.stdout.trim() !== 'true') {
+    throw new Error('could not prove migration source is inside a Git worktree');
   }
   try {
     const out = execFileSync('git', [
@@ -229,12 +247,16 @@ function areTargetPathsDirty(
       'status', '--porcelain', '--', ...targetPaths,
     ], {
       encoding: 'utf-8',
-      stdio: ['ignore', 'pipe', 'ignore'],
+      stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 10_000,
     });
     return out.trim().length > 0;
-  } catch {
-    return true;
+  } catch (error) {
+    throw new Error(
+      `could not inspect migration destination Git state: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
   }
 }
 
@@ -303,6 +325,7 @@ interface AnchoredParent {
   procPath: string;
   absolutePath: string;
   localPath: string;
+  canonicalRoot: string;
   dev: number;
   ino: number;
 }
@@ -356,22 +379,37 @@ function openAnchoredParent(
     throw new Error(`migration target has an unsafe path component: ${targetPath}`);
   }
   const canonicalRoot = realpathSync(absoluteRoot);
-  const canonicalRootStat = lstatSync(canonicalRoot);
+  const canonicalSegments = canonicalRoot.split(sep).filter(Boolean);
   let fd = openSync(
-    canonicalRoot,
+    sep,
     constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
   );
   try {
     assertDirectoryFd(fd);
-    const openedRootStat = fstatSync(fd);
-    if (
-      openedRootStat.dev !== canonicalRootStat.dev ||
-      openedRootStat.ino !== canonicalRootStat.ino
-    ) {
+    const descriptorBase = descriptorBaseForFd(fd);
+    for (const segment of canonicalSegments) {
+      const childFd = openSync(
+        join(descriptorFdPath(descriptorBase, fd), segment),
+        constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+      );
+      closeSync(fd);
+      fd = childFd;
+      assertDirectoryFd(fd);
+    }
+    const openedRootPath = realpathSync(descriptorFdPath(descriptorBase, fd));
+    if (openedRootPath !== canonicalRoot) {
       throw new Error('registered source root changed while opening');
     }
-    const descriptorBase = descriptorBaseForFd(fd);
-    let currentAbsolute = absoluteRoot;
+    const openedRootStat = fstatSync(fd);
+    const effectiveUid = process.getuid?.();
+    if (effectiveUid !== undefined && openedRootStat.uid !== effectiveUid) {
+      throw new Error('registered source root is not owned by the effective user');
+    }
+    if ((openedRootStat.mode & 0o022) !== 0) {
+      throw new Error('registered source root is group- or world-writable');
+    }
+
+    let currentAbsolute = canonicalRoot;
     for (const segment of directorySegments) {
       const child = join(descriptorFdPath(descriptorBase, fd), segment);
       let childFd: number;
@@ -400,6 +438,7 @@ function openAnchoredParent(
       procPath: descriptorFdPath(descriptorBase, fd),
       absolutePath: currentAbsolute,
       localPath: absoluteRoot,
+      canonicalRoot,
       dev: stat.dev,
       ino: stat.ino,
     };
@@ -414,6 +453,13 @@ function closeAnchoredParent(parent: AnchoredParent): void {
 }
 
 function assertAnchoredParentStillCurrent(parent: AnchoredParent): void {
+  const openedPath = realpathSync(parent.procPath);
+  if (
+    openedPath !== parent.absolutePath ||
+    !isWriteTargetContained(openedPath, parent.canonicalRoot)
+  ) {
+    throw new Error('migration target directory moved outside its anchored source path');
+  }
   if (!hasNoSymlinkComponents(parent.absolutePath, parent.localPath)) {
     throw new Error('migration target path changed: symbolic-link component detected');
   }
@@ -760,19 +806,23 @@ async function phaseBFenceFacts(
       } = target;
 
       try {
-        // Re-check immediately before access so a pre-existing intermediate
-        // symlink cannot redirect either the canonical or quarantine write.
-        if (
-          !isWriteTargetContained(filePath, target.localPath) ||
-          !hasNoSymlinkComponents(filePath, target.localPath) ||
-          !isWriteTargetContained(tmpPath, target.localPath) ||
-          !hasNoSymlinkComponents(tmpPath, target.localPath)
-        ) {
-          throw new Error('migration target escapes source root');
-        }
+        // Every supported gbrain markdown writer uses this exact per-page lock
+        // key. Holding it across read, optimistic comparison, publication, and
+        // DB stamping makes the comparison enforceable rather than advisory.
+        await withPageLock(targetMarkdownSlug, async () => {
+          // Re-check immediately before access so a pre-existing intermediate
+          // symlink cannot redirect either the canonical or quarantine write.
+          if (
+            !isWriteTargetContained(filePath, target.localPath) ||
+            !hasNoSymlinkComponents(filePath, target.localPath) ||
+            !isWriteTargetContained(tmpPath, target.localPath) ||
+            !hasNoSymlinkComponents(tmpPath, target.localPath)
+          ) {
+            throw new Error('migration target escapes source root');
+          }
 
-        const parent = openAnchoredParent(target.localPath, filePath, true);
-        try {
+          const parent = openAnchoredParent(target.localPath, filePath, true);
+          try {
           const fileName = basename(filePath);
           const tmpName = basename(tmpPath);
           const targetExistedAtOpen = anchoredChildExists(parent, fileName);
@@ -885,16 +935,13 @@ async function phaseBFenceFacts(
             assignments.push({ id: row.id, row_num: rowNum });
           }
 
-          // Atomic write within the anchored parent. New files use link+unlink
-          // so an unexpected destination collision fails rather than replacing
-          // an unrelated file; existing verified targets use atomic rename.
-          writeOwnedTempFileAt(parent, tmpName, body);
-          const tmpBody = readRegularFileAt(parent, tmpName);
-          const parsed = parseFactsFence(tmpBody);
+          // Parse in memory first: private bytes are not staged anywhere on
+          // disk until the descriptor-anchored destination has passed its
+          // placement and optimistic-content checks.
+          const parsed = parseFactsFence(body);
           if (parsed.warnings.length > 0) {
             outcome.failed_pages.push(`${targetMarkdownSlug} (${parsed.warnings.join('; ')})`);
-            // .tmp stays for inspection; do NOT publish.
-            continue;
+            return;
           }
           assertAnchoredParentStillCurrent(parent);
           if (targetExistedAtOpen) {
@@ -904,12 +951,30 @@ async function phaseBFenceFacts(
             }
             if (target.disposition === 'quarantine') {
               assertOwnedQuarantineBody(currentBody, target);
+              // Quarantine publication is append-never. A prior publication
+              // may be reused for exact crash recovery, but never replaced
+              // with different private content.
+              if (body !== originalBody) {
+                throw new Error(
+                  'owned quarantine destination is immutable; refusing replacement',
+                );
+              }
             }
-            renameSync(
-              anchoredChildPath(parent, tmpName),
-              anchoredChildPath(parent, fileName),
-            );
+            if (body !== originalBody) {
+              writeOwnedTempFileAt(parent, tmpName, body);
+              assertAnchoredParentStillCurrent(parent);
+              const compareBody = readRegularFileAt(parent, fileName);
+              if (compareBody !== originalBody) {
+                throw new Error('migration destination changed before publication');
+              }
+              renameSync(
+                anchoredChildPath(parent, tmpName),
+                anchoredChildPath(parent, fileName),
+              );
+            }
           } else {
+            writeOwnedTempFileAt(parent, tmpName, body);
+            assertAnchoredParentStillCurrent(parent);
             linkSync(
               anchoredChildPath(parent, tmpName),
               anchoredChildPath(parent, fileName),
@@ -927,9 +992,10 @@ async function phaseBFenceFacts(
           }
           outcome.fenced += assignments.length;
           outcome.pages_touched += 1;
-        } finally {
-          closeAnchoredParent(parent);
-        }
+          } finally {
+            closeAnchoredParent(parent);
+          }
+        }, testPageLockRoot ? { lockRoot: testPageLockRoot } : {});
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         outcome.failed_pages.push(`${targetMarkdownSlug} [from ${originalEntitySlug}] (${msg})`);
@@ -1131,6 +1197,7 @@ export const __testing = {
   openAnchoredParent,
   closeAnchoredParent,
   anchoredChildPath,
+  assertAnchoredParentStillCurrent,
   readRegularFileAt,
   writeOwnedTempFileAt,
 };
