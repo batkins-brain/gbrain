@@ -11,7 +11,11 @@
  * shape for the eval_capture doctor check). No new infrastructure; one
  * helper + a stable reason-code constant set.
  *
- * Reasons:
+ * Outcomes/reasons:
+ *   - 'completed'       — extraction pipeline settled normally; detail carries
+ *                         inserted/duplicate/superseded counts.
+ *   - 'timeout'         — CLI teardown's bounded fact window elapsed and
+ *                         cooperatively aborted the model call.
  *   - 'gateway_error'   — HTTP 429/5xx, timeout, network blip on chat() or embed().
  *   - 'parse_failure'   — LLM returned malformed JSON, all 4 parser fallback strategies failed.
  *   - 'queue_overflow'  — getFactsQueue() cap hit; oldest entry dropped.
@@ -29,6 +33,8 @@ import type { BrainEngine } from '../engine.ts';
 import { GBrainError } from '../types.ts';
 
 export const FACTS_ABSORB_REASONS = [
+  'completed',
+  'timeout',
   'gateway_error',
   'parse_failure',
   'queue_overflow',
@@ -126,6 +132,10 @@ export function classifyFactsAbsorbError(err: unknown): FactsAbsorbReason {
   if (!err) return 'pipeline_error';
   const msg = err instanceof Error ? err.message : String(err);
   const name = err instanceof Error ? err.name : '';
+
+  if (name === 'AbortError' || /(?:operation|delay) was aborted|^aborted$/i.test(msg.trim())) {
+    return 'timeout';
+  }
 
   // Anthropic / OpenAI / Voyage all surface 4xx/5xx + timeouts in similar shapes.
   if (/timeout|timed?\s?out|ETIMEDOUT/i.test(msg)) return 'gateway_error';

@@ -358,6 +358,8 @@ interface CaptureResult {
   path?: string;
   source_kind: string;
   captured_at: string;
+  /** Storage completed independently; fact extraction is queued or skipped. */
+  facts_extraction?: { queued: boolean } | { skipped: string };
 }
 
 function printReceipt(result: CaptureResult, quiet: boolean, json: boolean): void {
@@ -375,6 +377,12 @@ function printReceipt(result: CaptureResult, quiet: boolean, json: boolean): voi
   console.log(`  content_hash:  ${result.content_hash.slice(0, 16)}…`);
   if (result.path) {
     console.log(`  file:          ${result.path}`);
+  }
+  if (result.facts_extraction) {
+    const extraction = 'queued' in result.facts_extraction
+      ? (result.facts_extraction.queued ? 'queued' : 'not_queued')
+      : `skipped (${result.facts_extraction.skipped})`;
+    console.log(`  facts:         ${extraction}`);
   }
   console.log(`  captured_at:   ${result.captured_at}`);
 }
@@ -526,6 +534,7 @@ export async function runCapture(engine: BrainEngine | null, args: string[]): Pr
       status?: string;
       chunks?: number;
       write_through?: { written: boolean; path?: string };
+      facts_backstop?: { queued: boolean } | { skipped: string };
     }>(raw);
     const result: CaptureResult = {
       slug: remoteResult.slug,
@@ -540,6 +549,7 @@ export async function runCapture(engine: BrainEngine | null, args: string[]): Pr
       // root cause of WARN-8's audit-trail labeling problem.
       source_kind: 'capture-cli',
       captured_at: capturedAt,
+      facts_extraction: remoteResult.facts_backstop,
     };
     printReceipt(result, parsed.quiet ?? false, parsed.json ?? false);
     return;
@@ -592,6 +602,7 @@ export async function runCapture(engine: BrainEngine | null, args: string[]): Pr
       status?: string;
       chunks?: number;
       write_through?: { written: boolean; path?: string; skipped?: string };
+      facts_backstop?: { queued: boolean } | { skipped: string };
     };
     printReceipt(
       {
@@ -604,6 +615,7 @@ export async function runCapture(engine: BrainEngine | null, args: string[]): Pr
         // CV3: source_kind is the channel taxonomy, NOT the DB source FK.
         source_kind: 'capture-cli',
         captured_at: capturedAt,
+        facts_extraction: result.facts_backstop,
       },
       parsed.quiet ?? false,
       parsed.json ?? false,

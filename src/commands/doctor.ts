@@ -6701,7 +6701,8 @@ export async function buildChecks(
   // Mirrors the eval_capture check shape but reads facts:absorb rows
   // (written by writeFactsAbsorbLog from src/core/facts/absorb-log.ts).
   // Iterates over EVERY source so multi-source brains see per-source
-  // failure rates instead of only 'default'. Threshold configurable via
+  // outcomes instead of only 'default'. `completed` is reported as activity
+  // but never counted as a failure. Threshold configurable via
   // `facts.absorb_warn_threshold` (default 10 over the last 24h, per
   // source, per reason). When the threshold is exceeded for any
   // (source, reason) pair, status flips to warn and the message names
@@ -6745,7 +6746,7 @@ export async function buildChecks(
       for (const r of rows) {
         const n = typeof r.n === 'number' ? r.n : parseInt(r.n, 10);
         if (!Number.isFinite(n)) continue;
-        if (n >= threshold) anyOverThreshold = true;
+        if (r.reason !== 'completed' && n >= threshold) anyOverThreshold = true;
         if (!bySource.has(r.source_id)) bySource.set(r.source_id, []);
         bySource.get(r.source_id)!.push({ reason: r.reason, n });
       }

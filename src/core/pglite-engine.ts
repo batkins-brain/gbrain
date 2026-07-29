@@ -2731,6 +2731,7 @@ export class PGLiteEngine implements BrainEngine {
     name: string,
     dirPrefix?: string,
     minSimilarity: number = 0.55,
+    opts?: { sourceId?: string; sourceIds?: string[] },
   ): Promise<{ slug: string; similarity: number } | null> {
     // Inline threshold comparison instead of `SET LOCAL pg_trgm.similarity_threshold`.
     // The GUC only scopes to the current transaction and pglite auto-commits each
@@ -2738,14 +2739,24 @@ export class PGLiteEngine implements BrainEngine {
     // directly gives predictable behavior. Tie-breaker: sort by slug so re-runs
     // pick the same winner.
     const prefixPattern = dirPrefix ? `${dirPrefix}/%` : '%';
+    const params: unknown[] = [name, prefixPattern, minSimilarity];
+    let sourceClause = '';
+    if (opts?.sourceIds && opts.sourceIds.length > 0) {
+      params.push(opts.sourceIds);
+      sourceClause = ` AND source_id = ANY($${params.length}::text[])`;
+    } else if (opts?.sourceId) {
+      params.push(opts.sourceId);
+      sourceClause = ` AND source_id = $${params.length}`;
+    }
     const { rows } = await this.db.query(
       `SELECT slug, similarity(title, $1) AS sim
        FROM pages
        WHERE similarity(title, $1) >= $3
          AND slug LIKE $2
+         ${sourceClause}
        ORDER BY sim DESC, slug ASC
        LIMIT 1`,
-      [name, prefixPattern, minSimilarity]
+      params,
     );
     if (rows.length === 0) return null;
     const row = rows[0] as { slug: string; sim: number };

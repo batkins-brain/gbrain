@@ -204,6 +204,17 @@ type: concept
 This relates to [[struktura]].
 `;
 
+function personAtCompany(company: string): string {
+  return `---
+title: Alice Example
+type: person
+company: ${company}
+---
+
+Alice works at [[${company}]].
+`;
+}
+
 describe('issue #972 — put_page auto-link', () => {
   test('newly-written page with bare wikilink → basename edge when flag ON', async () => {
     // Need the target page to exist first (auto-link validates against the
@@ -278,5 +289,97 @@ describe('issue #972 — put_page auto-link', () => {
     });
     outLinks = await engine.getLinks('concepts/knowledge-graph');
     expect(outLinks.find(l => l.to_slug === 'projects/struktura')).toBeUndefined();
+  });
+});
+
+describe('TAN-18 — put_page typed frontmatter persistence', () => {
+  test('existing target persists frontmatter and body provenance separately', async () => {
+    await engine.putPage('companies/acme-example', {
+      type: 'company', title: 'Acme Example',
+      compiled_truth: 'An example company.', timeline: '',
+    });
+
+    const { operations } = await import('../../src/core/operations.ts');
+    const putPage = operations.find(op => op.name === 'put_page')!;
+    const result = await putPage.handler(
+      { engine, remote: false } as never,
+      {
+        slug: 'people/alice-example',
+        content: personAtCompany('companies/acme-example'),
+      },
+    ) as { auto_links?: { unresolved?: unknown[] } };
+
+    expect(result.auto_links?.unresolved).toEqual([]);
+    const links = await engine.getLinks('people/alice-example');
+    expect(links).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        to_slug: 'companies/acme-example',
+        link_type: 'works_at',
+        link_source: 'frontmatter',
+        origin_slug: 'people/alice-example',
+        origin_field: 'company',
+      }),
+      expect.objectContaining({
+        to_slug: 'companies/acme-example',
+        link_source: 'markdown',
+      }),
+    ]));
+  });
+
+  test('missing target is reported and does not persist a dead edge', async () => {
+    const { operations } = await import('../../src/core/operations.ts');
+    const putPage = operations.find(op => op.name === 'put_page')!;
+    const result = await putPage.handler(
+      { engine, remote: false } as never,
+      {
+        slug: 'people/alice-example',
+        content: personAtCompany('companies/missing-example'),
+      },
+    ) as { auto_links?: { unresolved?: Array<{ field: string; name: string }> } };
+
+    expect(result.auto_links?.unresolved).toEqual([
+      { field: 'company', name: 'companies/missing-example' },
+    ]);
+    expect(await engine.getLinks('people/alice-example')).toEqual([]);
+  });
+
+  test('target in another source stays unresolved in the active source', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config)
+       VALUES ('alpha', 'Alpha', '{}'::jsonb), ('beta', 'Beta', '{}'::jsonb)
+       ON CONFLICT (id) DO NOTHING`,
+    );
+    await engine.putPage(
+      'companies/acme-example',
+      {
+        type: 'company', title: 'Acme Example',
+        compiled_truth: 'Only present in alpha.', timeline: '',
+      },
+      { sourceId: 'alpha' },
+    );
+
+    const { operations } = await import('../../src/core/operations.ts');
+    const putPage = operations.find(op => op.name === 'put_page')!;
+    const result = await putPage.handler(
+      { engine, remote: false, sourceId: 'beta' } as never,
+      {
+        slug: 'people/alice-example',
+        content: `---
+title: Alice Example
+type: person
+company: Acme Example
+---
+
+Alice works at Acme Example.
+`,
+      },
+    ) as { auto_links?: { unresolved?: Array<{ field: string; name: string }> } };
+
+    expect(result.auto_links?.unresolved).toEqual([
+      { field: 'company', name: 'Acme Example' },
+    ]);
+    expect(
+      await engine.getLinks('people/alice-example', { sourceId: 'beta' }),
+    ).toEqual([]);
   });
 });

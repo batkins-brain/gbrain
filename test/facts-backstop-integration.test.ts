@@ -183,6 +183,14 @@ describe('facts:absorb — multi-source isolation', () => {
 });
 
 describe('queue-mode → drains successfully on happy path', () => {
+  async function waitForQueueDrain(): Promise<void> {
+    const queue = getFactsQueue();
+    const start = Date.now();
+    while ((queue.pendingCount() > 0 || queue.inflightCount() > 0) && Date.now() - start < 2000) {
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+  }
+
   test('queue worker completes; counters reflect work done', async () => {
     chatStub([{ fact: 'queue-drain-test', kind: 'fact', notability: 'medium', entity: null }]);
 
@@ -196,7 +204,7 @@ describe('queue-mode → drains successfully on happy path', () => {
       },
       {
         engine,
-        sourceId: 'queue-drain-source',
+        sourceId: 'default',
         sessionId: 'queue-drain-session',
         source: 'sync:import',
         mode: 'queue',
@@ -207,28 +215,29 @@ describe('queue-mode → drains successfully on happy path', () => {
     if (r.mode === 'queue') expect(r.enqueued).toBe(true);
 
     // Wait for the queue to drain.
-    const queue = getFactsQueue();
-    const start = Date.now();
-    while ((queue.pendingCount() > 0 || queue.inflightCount() > 0) && Date.now() - start < 2000) {
-      await new Promise(rr => setTimeout(rr, 25));
-    }
+    await waitForQueueDrain();
 
+    const queue = getFactsQueue();
     const counters = queue.getCounters();
     expect(counters.completed).toBeGreaterThanOrEqual(1);
     expect(counters.failed).toBe(0);
+
+    const completedRows = await engine.executeRaw<{ summary: string }>(
+      `SELECT summary FROM ingest_log
+        WHERE source_id = $1 AND source_type = 'facts:absorb' AND source_ref = $2`,
+      ['default', slug],
+    );
+    const completed = completedRows.find(row => row.summary.startsWith('completed:'));
+    expect(completed).toBeDefined();
+    expect(completed!.summary).toContain('inserted=');
   });
 
-  test('extract.ts absorbs gateway errors silently — net effect is empty extraction', async () => {
-    // The contract: extract.ts catches gateway errors and returns [] without
-    // re-throwing (only AbortError re-throws). Backstop's catch only sees
-    // errors from layers ABOVE extract — resolver, dedup, insert. Document
-    // this here so future work that wants chat-error visibility knows to
-    // rewire extract.ts itself rather than the backstop catch.
+  test('queue mode records an absorbed gateway error without false completion', async () => {
     __setChatTransportForTests(async () => {
       throw new Error('429 rate limit');
     });
 
-    const slug = 'meetings/silent-absorb-' + Math.random().toString(36).slice(2, 8);
+    const slug = 'meetings/gateway-absorb-' + Math.random().toString(36).slice(2, 8);
     const r = await runFactsBackstop(
       {
         slug,
@@ -238,22 +247,91 @@ describe('queue-mode → drains successfully on happy path', () => {
       },
       {
         engine,
-        sourceId: 'silent-source',
-        sessionId: 'silent-session',
+        sourceId: 'gateway-source',
+        sessionId: 'gateway-session',
+        source: 'mcp:put_page',
+        mode: 'queue',
+      },
+    );
+
+    expect(r.mode).toBe('queue');
+    if (r.mode === 'queue') expect(r.enqueued).toBe(true);
+    await waitForQueueDrain();
+
+    const rows = await engine.executeRaw<{ summary: string }>(
+      `SELECT summary FROM ingest_log
+        WHERE source_id = $1 AND source_type = 'facts:absorb' AND source_ref = $2`,
+      ['gateway-source', slug],
+    );
+    expect(rows.filter(row => row.summary.startsWith('gateway_error:'))).toHaveLength(1);
+    expect(rows.some(row => row.summary.startsWith('completed:'))).toBe(false);
+  });
+
+  test('queue mode records malformed extractor JSON without false completion', async () => {
+    __setChatTransportForTests(async (): Promise<ChatResult> => ({
+      text: 'this is not JSON',
+      blocks: [],
+      stopReason: 'end',
+      usage: { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0 },
+      model: 'test:stub',
+      providerId: 'test',
+    }));
+
+    const slug = 'meetings/parse-absorb-' + Math.random().toString(36).slice(2, 8);
+    const r = await runFactsBackstop(
+      {
+        slug,
+        type: 'meeting',
+        compiled_truth: LONG_BODY,
+        frontmatter: {},
+      },
+      {
+        engine,
+        sourceId: 'parse-source',
+        sessionId: 'parse-session',
+        source: 'mcp:put_page',
+        mode: 'queue',
+      },
+    );
+
+    expect(r.mode).toBe('queue');
+    if (r.mode === 'queue') expect(r.enqueued).toBe(true);
+    await waitForQueueDrain();
+
+    const rows = await engine.executeRaw<{ summary: string }>(
+      `SELECT summary FROM ingest_log
+        WHERE source_id = $1 AND source_type = 'facts:absorb' AND source_ref = $2`,
+      ['parse-source', slug],
+    );
+    expect(rows.filter(row => row.summary.startsWith('parse_failure:'))).toHaveLength(1);
+    expect(rows.some(row => row.summary.startsWith('completed:'))).toBe(false);
+  });
+
+  test('inline mode keeps the best-effort empty-result contract on gateway errors', async () => {
+    __setChatTransportForTests(async () => {
+      throw new Error('429 rate limit');
+    });
+
+    const r = await runFactsBackstop(
+      {
+        slug: 'meetings/inline-absorb-' + Math.random().toString(36).slice(2, 8),
+        type: 'meeting',
+        compiled_truth: LONG_BODY,
+        frontmatter: {},
+      },
+      {
+        engine,
+        sourceId: 'inline-source',
+        sessionId: 'inline-session',
         source: 'mcp:put_page',
         mode: 'inline',
       },
     );
 
-    // Inline-mode envelope returns zero counts; no error thrown.
     expect(r.mode).toBe('inline');
     if (r.mode === 'inline') {
       expect(r.inserted).toBe(0);
       expect(r.duplicate).toBe(0);
     }
-
-    // Note for future work: writeFactsAbsorbLog from extract.ts itself
-    // would close this visibility gap — surface gateway errors via
-    // ingest_log without changing extract's "best-effort" return contract.
   });
 });
