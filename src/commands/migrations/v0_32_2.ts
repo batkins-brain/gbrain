@@ -9,8 +9,8 @@
  *
  * Phases:
  *   A. Schema       — assert migration v51 has run.
- *   B. Fence facts  — backfill DB facts → entity-page fences (dry-run
- *                     by default; explicit --write required).
+ *   B. Fence facts  — backfill DB facts → entity-page fences. The runner's
+ *                     explicit --dry-run mode plans without writing.
  *   C. Verify       — re-parse each touched page, count rows, compare
  *                     against the DB rows for that page; partial on
  *                     mismatch.
@@ -18,9 +18,9 @@
  *
  * Idempotency: phase B only touches rows with row_num IS NULL. Re-runs
  * after a partial completion pick up where the previous run stopped.
- * Per-page atomic (.tmp + parse + rename, same primitive as
- * fence-write.ts). Dirty-tree refusal mirrors src/core/dry-fix.ts so
- * the user can review the diff before committing.
+ * Per-page atomic (.tmp + parse + descriptor-anchored publish). Dirty-tree
+ * refusal is scoped to the exact migration destinations so unrelated edits
+ * remain untouched.
  *
  * Facts with NULL entity_slug are structurally unfenceable (no page to
  * fence onto). They're skipped with a warning; the operator decides
@@ -31,16 +31,18 @@
 import {
   closeSync,
   constants,
-  existsSync,
   fstatSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
+  realpathSync,
   renameSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { join, dirname, resolve, relative, isAbsolute, sep } from 'node:path';
+import { basename, join, dirname, resolve, relative, isAbsolute, sep } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 
@@ -125,6 +127,15 @@ interface LegacyFactRow {
   valid_until: Date | null;
   source: string;
   confidence: number;
+  claim_metric: string | null;
+  claim_value: number | null;
+  claim_unit: string | null;
+  claim_period: string | null;
+}
+
+interface FencedFactRow extends LegacyFactRow {
+  row_num: number;
+  source_markdown_slug: string;
 }
 
 interface SourceLookup {
@@ -278,14 +289,171 @@ function pathEntryExists(path: string): boolean {
 }
 
 /**
- * Open an existing migration target without following a symbolic link.
- * Re-checking at open time closes the plan/read race for symlink swaps.
+ * Linux and Darwin expose open directory descriptors below /proc/self/fd or
+ * /dev/fd. Walking from an already-open source-root descriptor makes every
+ * subsequent lookup relative to a stable directory object, so swapping an
+ * intermediate path component cannot redirect a read or write outside the
+ * registered source.
+ *
+ * This migration handles private facts. Platforms without descriptor-relative
+ * paths fail closed instead of falling back to race-prone pathname I/O.
  */
-function readRegularFileNoFollow(path: string): string {
+interface AnchoredParent {
+  fd: number;
+  procPath: string;
+  absolutePath: string;
+  localPath: string;
+  dev: number;
+  ino: number;
+}
+
+function descriptorFdPath(base: string, fd: number): string {
+  return `${base}/${fd}`;
+}
+
+function assertDirectoryFd(fd: number): void {
+  const stat = fstatSync(fd);
+  if (!stat.isDirectory()) throw new Error('migration path component is not a directory');
+}
+
+function descriptorBaseForFd(fd: number): string {
+  const expected = fstatSync(fd);
+  for (const base of ['/proc/self/fd', '/dev/fd']) {
+    if (!pathEntryExists(base)) continue;
+    let probeFd: number | undefined;
+    try {
+      probeFd = openSync(
+        `${descriptorFdPath(base, fd)}/.`,
+        constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+      );
+      const actual = fstatSync(probeFd);
+      if (actual.dev === expected.dev && actual.ino === expected.ino) return base;
+    } catch {
+      // Try the next platform descriptor filesystem.
+    } finally {
+      if (probeFd !== undefined) closeSync(probeFd);
+    }
+  }
+  throw new Error(
+    'migration requires descriptor-relative directory I/O (/proc/self/fd or /dev/fd)',
+  );
+}
+
+function openAnchoredParent(
+  localPath: string,
+  targetPath: string,
+  createMissing: boolean,
+): AnchoredParent {
+  const absoluteRoot = resolve(localPath);
+  const absoluteTarget = resolve(targetPath);
+  const rel = relative(absoluteRoot, absoluteTarget);
+  if (!rel || rel.startsWith('..') || isAbsolute(rel)) {
+    throw new Error(`migration target escapes source root: ${targetPath}`);
+  }
+  const segments = rel.split(sep);
+  const directorySegments = segments.slice(0, -1);
+  if (segments.some(segment => !segment || segment === '.' || segment === '..')) {
+    throw new Error(`migration target has an unsafe path component: ${targetPath}`);
+  }
+  const canonicalRoot = realpathSync(absoluteRoot);
+  const canonicalRootStat = lstatSync(canonicalRoot);
+  let fd = openSync(
+    canonicalRoot,
+    constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+  );
+  try {
+    assertDirectoryFd(fd);
+    const openedRootStat = fstatSync(fd);
+    if (
+      openedRootStat.dev !== canonicalRootStat.dev ||
+      openedRootStat.ino !== canonicalRootStat.ino
+    ) {
+      throw new Error('registered source root changed while opening');
+    }
+    const descriptorBase = descriptorBaseForFd(fd);
+    let currentAbsolute = absoluteRoot;
+    for (const segment of directorySegments) {
+      const child = join(descriptorFdPath(descriptorBase, fd), segment);
+      let childFd: number;
+      try {
+        childFd = openSync(
+          child,
+          constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+        );
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (!createMissing || code !== 'ENOENT') throw error;
+        mkdirSync(child, { mode: 0o700 });
+        childFd = openSync(
+          child,
+          constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+        );
+      }
+      closeSync(fd);
+      fd = childFd;
+      currentAbsolute = join(currentAbsolute, segment);
+      assertDirectoryFd(fd);
+    }
+    const stat = fstatSync(fd);
+    return {
+      fd,
+      procPath: descriptorFdPath(descriptorBase, fd),
+      absolutePath: currentAbsolute,
+      localPath: absoluteRoot,
+      dev: stat.dev,
+      ino: stat.ino,
+    };
+  } catch (error) {
+    closeSync(fd);
+    throw error;
+  }
+}
+
+function closeAnchoredParent(parent: AnchoredParent): void {
+  closeSync(parent.fd);
+}
+
+function assertAnchoredParentStillCurrent(parent: AnchoredParent): void {
+  if (!hasNoSymlinkComponents(parent.absolutePath, parent.localPath)) {
+    throw new Error('migration target path changed: symbolic-link component detected');
+  }
+  const currentFd = openSync(
+    parent.absolutePath,
+    constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+  );
+  try {
+    const stat = fstatSync(currentFd);
+    if (!stat.isDirectory() || stat.dev !== parent.dev || stat.ino !== parent.ino) {
+      throw new Error('migration target path changed during descriptor-anchored write');
+    }
+  } finally {
+    closeSync(currentFd);
+  }
+}
+
+function anchoredChildPath(parent: AnchoredParent, name: string): string {
+  if (!name || name.includes('/') || name.includes('\\') || name === '.' || name === '..') {
+    throw new Error(`unsafe migration child name: ${name}`);
+  }
+  return join(parent.procPath, name);
+}
+
+function anchoredChildExists(parent: AnchoredParent, name: string): boolean {
+  try {
+    lstatSync(anchoredChildPath(parent, name));
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
+function readRegularFileAt(parent: AnchoredParent, name: string): string {
+  const path = anchoredChildPath(parent, name);
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
     if (!fstatSync(fd).isFile()) {
-      throw new Error(`migration target is not a regular file: ${path}`);
+      throw new Error(`migration target is not a regular file: ${name}`);
     }
     return readFileSync(fd, 'utf-8');
   } finally {
@@ -293,12 +461,8 @@ function readRegularFileNoFollow(path: string): string {
   }
 }
 
-/**
- * Create a migration-owned temporary file exclusively and write through the
- * verified descriptor. O_EXCL prevents clobbering user files; O_NOFOLLOW
- * rejects a final-component symlink.
- */
-function writeOwnedTempFileNoFollow(path: string, body: string): void {
+function writeOwnedTempFileAt(parent: AnchoredParent, name: string, body: string): void {
+  const path = anchoredChildPath(parent, name);
   const fd = openSync(
     path,
     constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
@@ -314,12 +478,89 @@ function writeOwnedTempFileNoFollow(path: string, body: string): void {
   }
 }
 
+function migrationTargetFingerprint(sourceId: string, entitySlug: string): string {
+  return createHash('sha256').update(`${sourceId}\0${entitySlug}`).digest('hex');
+}
+
 function quarantineSlug(sourceId: string, entitySlug: string): string {
-  const digest = createHash('sha256')
-    .update(`${sourceId}\0${entitySlug}`)
-    .digest('hex')
-    .slice(0, 16);
+  const digest = migrationTargetFingerprint(sourceId, entitySlug).slice(0, 16);
   return `quarantine/migrations/v0-32-2/${digest}`;
+}
+
+function frontmatterValues(body: string, key: string): string[] {
+  const match = body.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
+  if (!match) return [];
+  return match[1]
+    .split(/\r?\n/)
+    .map(line => line.match(/^([A-Za-z0-9_-]+):\s*(.*?)\s*$/))
+    .filter((entry): entry is RegExpMatchArray => Boolean(entry))
+    .filter(entry => entry[1] === key)
+    .map(entry => entry[2]);
+}
+
+function assertOwnedQuarantineBody(body: string, target: PlannedTarget): void {
+  const required = new Map<string, string>([
+    ['gbrain_migration_owner', 'v0.32.2'],
+    ['gbrain_migration_target_sha256',
+      migrationTargetFingerprint(target.sourceId, target.originalEntitySlug)],
+    ['slug', target.targetMarkdownSlug],
+    ['visibility', 'private'],
+  ]);
+  for (const [key, expected] of required) {
+    const values = frontmatterValues(body, key);
+    if (values.length !== 1 || values[0] !== expected) {
+      throw new Error(
+        `quarantine destination is not owned by migration v0.32.2 (${key})`,
+      );
+    }
+  }
+}
+
+function dateOnly(value: Date | string | null | undefined): string {
+  if (!value) return '';
+  const date = value instanceof Date ? value : new Date(value);
+  if (!Number.isFinite(date.getTime())) return '';
+  return date.toISOString().slice(0, 10);
+}
+
+function normalizedConfidence(value: number): number {
+  return Number.parseFloat(Number(value).toFixed(2));
+}
+
+function dbFactIdentity(row: LegacyFactRow): string {
+  return JSON.stringify({
+    claim: row.fact,
+    kind: row.kind,
+    confidence: normalizedConfidence(row.confidence),
+    visibility: row.visibility,
+    notability: row.notability,
+    validFrom: dateOnly(row.valid_from),
+    validUntil: dateOnly(row.valid_until),
+    source: row.source ?? '',
+    context: row.context ?? '',
+    claimMetric: row.claim_metric ?? '',
+    claimValue: row.claim_value ?? null,
+    claimUnit: row.claim_unit ?? '',
+    claimPeriod: row.claim_period ?? '',
+  });
+}
+
+function fenceFactIdentity(row: ReturnType<typeof parseFactsFence>['facts'][number]): string {
+  return JSON.stringify({
+    claim: row.claim,
+    kind: row.kind,
+    confidence: normalizedConfidence(row.confidence),
+    visibility: row.visibility,
+    notability: row.notability,
+    validFrom: row.validFrom ?? '',
+    validUntil: row.validUntil ?? '',
+    source: row.source ?? '',
+    context: row.context ?? '',
+    claimMetric: row.claimMetric ?? '',
+    claimValue: row.claimValue ?? null,
+    claimUnit: row.claimUnit ?? '',
+    claimPeriod: row.claimPeriod ?? '',
+  });
 }
 
 async function buildTargetPlan(
@@ -333,7 +574,8 @@ async function buildTargetPlan(
 
   const legacy = await engine.executeRaw<LegacyFactRow>(
     `SELECT id, source_id, entity_slug, fact, kind, visibility, notability,
-            context, valid_from, valid_until, source, confidence
+            context, valid_from, valid_until, source, confidence,
+            claim_metric, claim_value, claim_unit, claim_period
        FROM facts
       WHERE row_num IS NULL
       ORDER BY source_id, entity_slug, id`,
@@ -386,7 +628,7 @@ async function buildTargetPlan(
         `migration quarantine target escapes source root: ${targetMarkdownSlug}`,
       );
     }
-    plan.push({
+    const target: PlannedTarget = {
       sourceId,
       originalEntitySlug,
       targetMarkdownSlug,
@@ -394,10 +636,22 @@ async function buildTargetPlan(
       filePath,
       tmpPath,
       rows,
-      targetExisted: existsSync(filePath),
+      targetExisted: pathEntryExists(filePath),
       disposition: safeExisting ? 'existing' : 'quarantine',
       reason: safeExisting ? 'existing_target' : unsafeTarget ? 'unsafe_target' : 'missing_target',
-    });
+    };
+    if (target.disposition === 'quarantine' && target.targetExisted) {
+      const parent = openAnchoredParent(localPath, filePath, false);
+      try {
+        assertOwnedQuarantineBody(
+          readRegularFileAt(parent, basename(filePath)),
+          target,
+        );
+      } finally {
+        closeAnchoredParent(parent);
+      }
+    }
+    plan.push(target);
   }
   plan.sort((a, b) =>
     a.sourceId.localeCompare(b.sourceId) ||
@@ -517,99 +771,165 @@ async function phaseBFenceFacts(
           throw new Error('migration target escapes source root');
         }
 
-        // Read existing body or stub-create with minimum frontmatter.
-        let body: string;
-        if (existsSync(filePath)) {
-          body = readRegularFileNoFollow(filePath);
-        } else {
-          mkdirSync(dirname(filePath), { recursive: true });
-          const prefix = targetMarkdownSlug.split('/')[0];
-          const type =
-            prefix === 'people'    ? 'person' :
-            prefix === 'companies' ? 'company' :
-            prefix === 'deals'     ? 'deal' :
-            /* fallback */           'concept';
-          const title = target.disposition === 'quarantine'
-            ? `Quarantined Legacy Facts ${targetMarkdownSlug.split('/').at(-1)}`
-            : targetMarkdownSlug.split('/').slice(1).join('/')
-                .replace(/[-_/]+/g, ' ').replace(/\b\w/g, c => c.toUpperCase()) ||
-              targetMarkdownSlug;
-          body = `---\ntype: ${type}\ntitle: ${title}\nslug: ${targetMarkdownSlug}\nvisibility: private\n---\n\n# ${title}\n`;
-        }
+        const parent = openAnchoredParent(target.localPath, filePath, true);
+        try {
+          const fileName = basename(filePath);
+          const tmpName = basename(tmpPath);
+          const targetExistedAtOpen = anchoredChildExists(parent, fileName);
 
-        // Append each legacy row, collecting the assigned row_nums.
-        // Already-fenced rows (row_num already set) are skipped at the
-        // DB-row level by the WHERE clause, but if the SAME (entity,
-        // source, claim, source-text) tuple was previously appended in
-        // a partial-completion re-run, parseFactsFence will see the
-        // existing row and append a duplicate. We dedup on (claim,
-        // source) before append to handle this.
-        const existingFence = parseFactsFence(body);
-        const existingKeySet = new Set(existingFence.facts.map(f => `${f.claim}\0${f.source ?? ''}`));
+          // Read existing body or stub-create with minimum frontmatter.
+          let body: string;
+          if (targetExistedAtOpen) {
+            body = readRegularFileAt(parent, fileName);
+            if (target.disposition === 'quarantine') {
+              assertOwnedQuarantineBody(body, target);
+            }
+          } else {
+            const prefix = targetMarkdownSlug.split('/')[0];
+            const type =
+              prefix === 'people'    ? 'person' :
+              prefix === 'companies' ? 'company' :
+              prefix === 'deals'     ? 'deal' :
+              /* fallback */           'concept';
+            const title = target.disposition === 'quarantine'
+              ? `Quarantined Legacy Facts ${targetMarkdownSlug.split('/').at(-1)}`
+              : targetMarkdownSlug.split('/').slice(1).join('/')
+                  .replace(/[-_/]+/g, ' ').replace(/\b\w/g, c => c.toUpperCase()) ||
+                targetMarkdownSlug;
+            const ownership = target.disposition === 'quarantine'
+              ? `gbrain_migration_owner: v0.32.2\n` +
+                `gbrain_migration_target_sha256: ${migrationTargetFingerprint(
+                  target.sourceId,
+                  target.originalEntitySlug,
+                )}\n`
+              : '';
+            body =
+              `---\ntype: ${type}\ntitle: ${title}\nslug: ${targetMarkdownSlug}\n` +
+              `${ownership}visibility: private\n---\n\n# ${title}\n`;
+          }
+          const originalBody = targetExistedAtOpen ? body : null;
 
-        const assignments: Array<{ id: string; row_num: number }> = [];
-        for (const row of group) {
-          const key = `${row.fact}\0${row.source ?? ''}`;
-          if (existingKeySet.has(key)) {
-            // Already fenced (idempotent re-run). Find the existing
-            // row_num and assign it to this DB row.
-            const existing = existingFence.facts.find(f =>
-              f.claim === row.fact && (f.source ?? '') === (row.source ?? ''),
-            );
-            if (existing) {
-              assignments.push({ id: row.id, row_num: existing.rowNum });
+          const existingFence = parseFactsFence(body);
+          if (existingFence.warnings.length > 0) {
+            throw new Error(existingFence.warnings.join('; '));
+          }
+
+          // DB rows already stamped to this page own their row numbers. Validate
+          // that the fence still carries the same full fact identity before
+          // considering any unowned fence rows for crash recovery.
+          const assignedRows = await engine.executeRaw<FencedFactRow>(
+            `SELECT id, source_id, entity_slug, fact, kind, visibility, notability,
+                    context, valid_from, valid_until, source, confidence,
+                    claim_metric, claim_value, claim_unit, claim_period,
+                    row_num, source_markdown_slug
+               FROM facts
+              WHERE source_id = $1
+                AND source_markdown_slug = $2
+                AND row_num IS NOT NULL
+              ORDER BY row_num, id`,
+            [target.sourceId, targetMarkdownSlug],
+          );
+          const fenceByRowNum = new Map(existingFence.facts.map(fact => [fact.rowNum, fact]));
+          const occupiedRowNums = new Set<number>();
+          for (const assigned of assignedRows) {
+            const fenced = fenceByRowNum.get(Number(assigned.row_num));
+            if (!fenced || fenceFactIdentity(fenced) !== dbFactIdentity(assigned)) {
+              throw new Error(
+                `existing DB/fence identity drift at row ${assigned.row_num}`,
+              );
+            }
+            occupiedRowNums.add(Number(assigned.row_num));
+          }
+
+          // Recovery candidates are consumed one-for-one by full normalized
+          // identity. Duplicate legacy facts therefore retain distinct rows,
+          // while a crash after the file rename can safely reuse each orphaned
+          // fence row at most once.
+          const availableByIdentity = new Map<string, number[]>();
+          for (const fact of existingFence.facts) {
+            if (occupiedRowNums.has(fact.rowNum)) continue;
+            const identity = fenceFactIdentity(fact);
+            const queue = availableByIdentity.get(identity) ?? [];
+            queue.push(fact.rowNum);
+            availableByIdentity.set(identity, queue);
+          }
+
+          const assignments: Array<{ id: string; row_num: number }> = [];
+          for (const row of group) {
+            const identity = dbFactIdentity(row);
+            const queue = availableByIdentity.get(identity);
+            const recoveredRowNum = queue?.shift();
+            if (recoveredRowNum !== undefined) {
+              assignments.push({ id: row.id, row_num: recoveredRowNum });
+              occupiedRowNums.add(recoveredRowNum);
               continue;
             }
+
+            const { body: updated, rowNum } = upsertFactRow(body, {
+              claim:      row.fact,
+              kind:       row.kind,
+              confidence: row.confidence,
+              visibility: row.visibility,
+              notability: row.notability,
+              validFrom:  dateOnly(row.valid_from),
+              validUntil: dateOnly(row.valid_until) || undefined,
+              source:     row.source,
+              context:    row.context ?? undefined,
+              claimMetric: row.claim_metric ?? undefined,
+              claimValue:  row.claim_value ?? undefined,
+              claimUnit:   row.claim_unit ?? undefined,
+              claimPeriod: row.claim_period ?? undefined,
+            });
+            body = updated;
+            occupiedRowNums.add(rowNum);
+            assignments.push({ id: row.id, row_num: rowNum });
           }
-          // Append a new row.
-          const validFromStr = (row.valid_from instanceof Date ? row.valid_from : new Date(row.valid_from))
-            .toISOString().slice(0, 10);
-          const validUntilStr = row.valid_until
-            ? (row.valid_until instanceof Date ? row.valid_until : new Date(row.valid_until))
-                .toISOString().slice(0, 10)
-            : undefined;
-          const { body: updated, rowNum } = upsertFactRow(body, {
-            claim:      row.fact,
-            kind:       row.kind,
-            confidence: row.confidence,
-            visibility: row.visibility,
-            notability: row.notability,
-            validFrom:  validFromStr,
-            validUntil: validUntilStr,
-            source:     row.source,
-            context:    row.context ?? undefined,
-          });
-          body = updated;
-          existingKeySet.add(key);
-          assignments.push({ id: row.id, row_num: rowNum });
-        }
 
-        // Atomic write: .tmp + parse + rename.
-        writeOwnedTempFileNoFollow(tmpPath, body);
-        const tmpBody = readRegularFileNoFollow(tmpPath);
-        const parsed = parseFactsFence(tmpBody);
-        if (parsed.warnings.length > 0) {
-          outcome.failed_pages.push(`${targetMarkdownSlug} (${parsed.warnings.join('; ')})`);
-          // .tmp stays for inspection; do NOT rename.
-          continue;
-        }
-        if (
-          !hasNoSymlinkComponents(dirname(filePath), target.localPath) ||
-          !hasNoSymlinkComponents(tmpPath, target.localPath)
-        ) {
-          throw new Error('migration target path changed before rename');
-        }
-        renameSync(tmpPath, filePath);
+          // Atomic write within the anchored parent. New files use link+unlink
+          // so an unexpected destination collision fails rather than replacing
+          // an unrelated file; existing verified targets use atomic rename.
+          writeOwnedTempFileAt(parent, tmpName, body);
+          const tmpBody = readRegularFileAt(parent, tmpName);
+          const parsed = parseFactsFence(tmpBody);
+          if (parsed.warnings.length > 0) {
+            outcome.failed_pages.push(`${targetMarkdownSlug} (${parsed.warnings.join('; ')})`);
+            // .tmp stays for inspection; do NOT publish.
+            continue;
+          }
+          assertAnchoredParentStillCurrent(parent);
+          if (targetExistedAtOpen) {
+            const currentBody = readRegularFileAt(parent, fileName);
+            if (currentBody !== originalBody) {
+              throw new Error('migration destination changed during fence preparation');
+            }
+            if (target.disposition === 'quarantine') {
+              assertOwnedQuarantineBody(currentBody, target);
+            }
+            renameSync(
+              anchoredChildPath(parent, tmpName),
+              anchoredChildPath(parent, fileName),
+            );
+          } else {
+            linkSync(
+              anchoredChildPath(parent, tmpName),
+              anchoredChildPath(parent, fileName),
+            );
+            unlinkSync(anchoredChildPath(parent, tmpName));
+          }
+          assertAnchoredParentStillCurrent(parent);
 
-        // UPDATE the DB rows with their new row_nums + source_markdown_slug.
-        for (const a of assignments) {
-          await engine.executeRaw(
-            `UPDATE facts SET row_num = $1, source_markdown_slug = $2 WHERE id = $3`,
-            [a.row_num, targetMarkdownSlug, a.id],
-          );
+          // UPDATE the DB rows with their new row_nums + source_markdown_slug.
+          for (const a of assignments) {
+            await engine.executeRaw(
+              `UPDATE facts SET row_num = $1, source_markdown_slug = $2 WHERE id = $3`,
+              [a.row_num, targetMarkdownSlug, a.id],
+            );
+          }
+          outcome.fenced += assignments.length;
+          outcome.pages_touched += 1;
+        } finally {
+          closeAnchoredParent(parent);
         }
-        outcome.fenced += assignments.length;
-        outcome.pages_touched += 1;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         outcome.failed_pages.push(`${targetMarkdownSlug} [from ${originalEntitySlug}] (${msg})`);
@@ -652,34 +972,72 @@ async function phaseCVerify(
     const localPathById = new Map<string, string | null>();
     for (const s of sources) localPathById.set(s.id, s.local_path);
 
-    const groups = await engine.executeRaw<{ source_id: string; source_markdown_slug: string; n: string }>(
-      `SELECT source_id, source_markdown_slug, COUNT(*) AS n
+    const rows = await engine.executeRaw<FencedFactRow>(
+      `SELECT id, source_id, entity_slug, fact, kind, visibility, notability,
+              context, valid_from, valid_until, source, confidence,
+              claim_metric, claim_value, claim_unit, claim_period,
+              row_num, source_markdown_slug
          FROM facts
         WHERE row_num IS NOT NULL
-        GROUP BY source_id, source_markdown_slug`,
+        ORDER BY source_id, source_markdown_slug, row_num, id`,
     );
+    const groups = new Map<string, FencedFactRow[]>();
+    for (const row of rows) {
+      const key = `${row.source_id}\0${row.source_markdown_slug}`;
+      const group = groups.get(key) ?? [];
+      group.push(row);
+      groups.set(key, group);
+    }
 
     const mismatches: string[] = [];
     let pagesChecked = 0;
 
-    for (const g of groups) {
-      const localPath = localPathById.get(g.source_id);
+    for (const [key, group] of groups) {
+      const [sourceId, sourceMarkdownSlug] = key.split('\0');
+      const localPath = localPathById.get(sourceId);
       if (!localPath) continue;
-      const filePath = join(localPath, `${g.source_markdown_slug}.md`);
+      const filePath = join(localPath, `${sourceMarkdownSlug}.md`);
       if (
         !isWriteTargetContained(filePath, localPath) ||
-        !hasNoSymlinkComponents(filePath, localPath) ||
-        !existsSync(filePath)
+        !hasNoSymlinkComponents(filePath, localPath)
       ) {
-        mismatches.push(`${g.source_markdown_slug} (file missing)`);
+        mismatches.push(`${sourceMarkdownSlug} (file missing or unsafe)`);
         continue;
       }
-      const body = readRegularFileNoFollow(filePath);
-      const parsed = parseFactsFence(body);
-      const fenceCount = parsed.facts.length;
-      const dbCount = parseInt(g.n, 10);
-      if (fenceCount !== dbCount) {
-        mismatches.push(`${g.source_markdown_slug} (fence=${fenceCount}, db=${dbCount})`);
+      try {
+        const parent = openAnchoredParent(localPath, filePath, false);
+        try {
+          if (!anchoredChildExists(parent, basename(filePath))) {
+            mismatches.push(`${sourceMarkdownSlug} (file missing)`);
+            continue;
+          }
+          const body = readRegularFileAt(parent, basename(filePath));
+          const parsed = parseFactsFence(body);
+          if (parsed.warnings.length > 0) {
+            mismatches.push(`${sourceMarkdownSlug} (${parsed.warnings.join('; ')})`);
+            continue;
+          }
+          const fenceByRowNum = new Map(parsed.facts.map(fact => [fact.rowNum, fact]));
+          if (parsed.facts.length !== group.length) {
+            mismatches.push(
+              `${sourceMarkdownSlug} (fence=${parsed.facts.length}, db=${group.length})`,
+            );
+            continue;
+          }
+          const drifted = group.find(row => {
+            const fenced = fenceByRowNum.get(Number(row.row_num));
+            return !fenced || fenceFactIdentity(fenced) !== dbFactIdentity(row);
+          });
+          if (drifted) {
+            mismatches.push(`${sourceMarkdownSlug} (identity drift at row=${drifted.row_num})`);
+          }
+        } finally {
+          closeAnchoredParent(parent);
+        }
+      } catch (error) {
+        mismatches.push(
+          `${sourceMarkdownSlug} (${error instanceof Error ? error.message : String(error)})`,
+        );
       }
       pagesChecked += 1;
     }
@@ -755,8 +1113,8 @@ export const v0_32_2: Omit<Migration, 'orchestrator'> & {
       'fenced `## Facts` table on each entity page canonical: every new fact writes to markdown ' +
       'first, then stamps the DB index. Existing v0.31 facts are backfilled to fences on this ' +
       'migration. `gbrain rebuild` (v0.32.3) becomes a one-line disaster-recovery flow because ' +
-      'the DB is now fully derivable from the repo. Migration is dry-run by default; pass ' +
-      '`--write` to apply.',
+      'the DB is now fully derivable from the repo. Use `gbrain apply-migrations --dry-run` ' +
+      'to inspect the deterministic target manifest before applying.',
   },
   orchestrator,
 };
@@ -769,5 +1127,10 @@ export const __testing = {
   buildTargetPlan,
   areTargetPathsDirty,
   quarantineSlug,
-  writeOwnedTempFileNoFollow,
+  migrationTargetFingerprint,
+  openAnchoredParent,
+  closeAnchoredParent,
+  anchoredChildPath,
+  readRegularFileAt,
+  writeOwnedTempFileAt,
 };

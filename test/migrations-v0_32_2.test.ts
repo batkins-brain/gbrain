@@ -16,6 +16,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -63,19 +64,31 @@ async function seedLegacyFact(input: {
   source_id?: string;
   visibility?: 'private' | 'world';
   notability?: 'high' | 'medium' | 'low';
+  kind?: 'event' | 'preference' | 'commitment' | 'belief' | 'fact';
+  source?: string;
+  confidence?: number;
+  context?: string | null;
+  valid_from?: string;
+  valid_until?: string | null;
 }): Promise<number> {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const r = await (engine as any).db.query(
     `INSERT INTO facts (source_id, entity_slug, fact, kind, visibility, notability,
-                        valid_from, source, confidence)
-     VALUES ($1, $2, $3, 'fact', $4, $5, now(), 'mcp:put_page', 1.0)
+                        valid_from, valid_until, source, confidence, context)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
      RETURNING id`,
     [
       input.source_id ?? 'default',
       input.entity_slug,
       input.fact,
+      input.kind ?? 'fact',
       input.visibility ?? 'private',
       input.notability ?? 'medium',
+      input.valid_from ?? '2026-07-29',
+      input.valid_until ?? null,
+      input.source ?? 'mcp:put_page',
+      input.confidence ?? 1.0,
+      input.context ?? null,
     ],
   );
   return r.rows[0].id;
@@ -232,6 +245,75 @@ describe('phaseBFenceFacts — happy path backfill', () => {
     expect(rows.rows.map((r: { row_num: number }) => r.row_num)).toEqual([1, 2]);
   });
 
+  test('preserves duplicate claims as distinct rows when metadata differs', async () => {
+    writeEntityPage('people/alice');
+    const privateId = await seedLegacyFact({
+      entity_slug: 'people/alice',
+      fact: 'Shared claim',
+      visibility: 'private',
+      confidence: 0.75,
+    });
+    const worldId = await seedLegacyFact({
+      entity_slug: 'people/alice',
+      fact: 'Shared claim',
+      visibility: 'world',
+      confidence: 0.9,
+    });
+
+    const result = await __testing.phaseBFenceFacts(engine, OPTS);
+    expect(result.status).toBe('complete');
+    const parsed = parseFactsFence(readFileSync(join(brainDir, 'people/alice.md'), 'utf-8'));
+    expect(parsed.facts).toHaveLength(2);
+    expect(parsed.facts.map(f => f.visibility)).toEqual(['private', 'world']);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const rows = await (engine as any).db.query(
+      'SELECT id, row_num FROM facts ORDER BY id',
+    );
+    expect(rows.rows).toEqual([
+      { id: privateId, row_num: 1 },
+      { id: worldId, row_num: 2 },
+    ]);
+  });
+
+  test('partial recovery consumes identical duplicate fence rows one-to-one', async () => {
+    writeEntityPage('people/alice');
+    const firstId = await seedLegacyFact({
+      entity_slug: 'people/alice',
+      fact: 'Exact duplicate',
+    });
+    const secondId = await seedLegacyFact({
+      entity_slug: 'people/alice',
+      fact: 'Exact duplicate',
+    });
+    await __testing.phaseBFenceFacts(engine, OPTS);
+
+    // Simulate a crash after the fence was published and after only the first
+    // DB row was stamped.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (engine as any).db.query(
+      `UPDATE facts SET row_num = NULL, source_markdown_slug = NULL WHERE id = $1`,
+      [secondId],
+    );
+
+    const result = await __testing.phaseBFenceFacts(engine, OPTS);
+    expect(result.status).toBe('complete');
+    const parsed = parseFactsFence(readFileSync(join(brainDir, 'people/alice.md'), 'utf-8'));
+    expect(parsed.facts.map(f => [f.rowNum, f.claim])).toEqual([
+      [1, 'Exact duplicate'],
+      [2, 'Exact duplicate'],
+    ]);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const rows = await (engine as any).db.query(
+      'SELECT id, row_num FROM facts ORDER BY id',
+    );
+    expect(rows.rows).toEqual([
+      { id: firstId, row_num: 1 },
+      { id: secondId, row_num: 2 },
+    ]);
+  });
+
   test('skips facts with NULL entity_slug (unfenceable)', async () => {
     writeEntityPage('people/alice');
     await seedLegacyFact({ entity_slug: 'people/alice', fact: 'Fenceable' });
@@ -292,6 +374,14 @@ describe('phaseBFenceFacts — happy path backfill', () => {
     const quarantinePath = join(brainDir, `${target.target_markdown_slug}.md`);
     expect(existsSync(quarantinePath)).toBe(true);
     expect(readFileSync(quarantinePath, 'utf-8')).toContain('visibility: private');
+    expect(readFileSync(quarantinePath, 'utf-8')).toContain(
+      'gbrain_migration_owner: v0.32.2',
+    );
+    expect(readFileSync(quarantinePath, 'utf-8')).toContain(
+      `gbrain_migration_target_sha256: ${
+        __testing.migrationTargetFingerprint('default', 'flattened-private-identifier')
+      }`,
+    );
     expect(readFileSync(quarantinePath, 'utf-8')).toContain('Preserve this legacy claim');
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -433,6 +523,50 @@ describe('phaseBFenceFacts — happy path backfill', () => {
     }
   });
 
+  test('rejects a clean unrelated file at a deterministic quarantine destination', async () => {
+    await seedLegacyFact({
+      entity_slug: 'missing-private-identifier',
+      fact: 'Must not replace unrelated content',
+    });
+    const slug = __testing.quarantineSlug('default', 'missing-private-identifier');
+    const collisionPath = join(brainDir, `${slug}.md`);
+    mkdirSync(dirname(collisionPath), { recursive: true });
+    writeFileSync(collisionPath, 'UNRELATED CLEAN CONTENT\n');
+    execFileSync('git', ['init', '-q', brainDir]);
+    execFileSync('git', ['-C', brainDir, 'config', 'user.email', 'test@example.com']);
+    execFileSync('git', ['-C', brainDir, 'config', 'user.name', 'test']);
+    execFileSync('git', ['-C', brainDir, 'add', '.']);
+    execFileSync('git', ['-C', brainDir, 'commit', '-qm', 'baseline']);
+
+    await expect(__testing.buildTargetPlan(engine)).rejects.toThrow(
+      /not owned by migration v0\.32\.2/,
+    );
+    const result = await __testing.phaseBFenceFacts(engine, OPTS);
+    expect(result.status).toBe('failed');
+    expect(readFileSync(collisionPath, 'utf-8')).toBe('UNRELATED CLEAN CONTENT\n');
+  });
+
+  test('accepts an owned quarantine destination during partial recovery', async () => {
+    const id = await seedLegacyFact({
+      entity_slug: 'missing-private-identifier',
+      fact: 'Recover this quarantined fact',
+    });
+    const first = await __testing.phaseBFenceFacts(engine, OPTS);
+    expect(first.status).toBe('complete');
+    const slug = __testing.quarantineSlug('default', 'missing-private-identifier');
+    const path = join(brainDir, `${slug}.md`);
+    const before = readFileSync(path, 'utf-8');
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (engine as any).db.query(
+      `UPDATE facts SET row_num = NULL, source_markdown_slug = NULL WHERE id = $1`,
+      [id],
+    );
+    const second = await __testing.phaseBFenceFacts(engine, OPTS);
+    expect(second.status).toBe('complete');
+    expect(readFileSync(path, 'utf-8')).toBe(before);
+  });
+
   test('owned temporary writes reject in-root and out-of-root symlinks', () => {
     const outsideDir = mkdtempSync(join(tmpdir(), 'mig-v0_32_2-tmp-outside-'));
     const inRootVictim = join(brainDir, 'in-root-victim.md');
@@ -444,12 +578,43 @@ describe('phaseBFenceFacts — happy path backfill', () => {
     symlinkSync(inRootVictim, inRootLink);
     symlinkSync(outsideVictim, outsideLink);
 
+    const parent = __testing.openAnchoredParent(brainDir, inRootLink, false);
     try {
-      expect(() => __testing.writeOwnedTempFileNoFollow(inRootLink, 'overwrite')).toThrow();
-      expect(() => __testing.writeOwnedTempFileNoFollow(outsideLink, 'overwrite')).toThrow();
+      expect(() => __testing.writeOwnedTempFileAt(parent, 'in-root-link.tmp', 'overwrite')).toThrow();
+      expect(() => __testing.writeOwnedTempFileAt(parent, 'outside-link.tmp', 'overwrite')).toThrow();
       expect(readFileSync(inRootVictim, 'utf-8')).toBe('IN ROOT\n');
       expect(readFileSync(outsideVictim, 'utf-8')).toBe('OUTSIDE\n');
     } finally {
+      __testing.closeAnchoredParent(parent);
+      rmSync(outsideDir, { recursive: true, force: true });
+    }
+  });
+
+  test('descriptor-anchored write and rename cannot follow a swapped parent path', () => {
+    const outsideDir = mkdtempSync(join(tmpdir(), 'mig-v0_32_2-race-outside-'));
+    const peopleDir = join(brainDir, 'people');
+    const movedPeopleDir = join(brainDir, 'people-before-swap');
+    mkdirSync(peopleDir, { recursive: true });
+    writeFileSync(join(peopleDir, 'alice.md'), 'ORIGINAL\n');
+    writeFileSync(join(outsideDir, 'alice.md'), 'OUTSIDE\n');
+
+    const target = join(peopleDir, 'alice.md');
+    const parent = __testing.openAnchoredParent(brainDir, target, false);
+    try {
+      // Swap the pathname after the trusted directory descriptor is open.
+      renameSync(peopleDir, movedPeopleDir);
+      symlinkSync(outsideDir, peopleDir);
+
+      __testing.writeOwnedTempFileAt(parent, '.migration.tmp', 'PRIVATE\n');
+      renameSync(
+        __testing.anchoredChildPath(parent, '.migration.tmp'),
+        __testing.anchoredChildPath(parent, 'alice.md'),
+      );
+
+      expect(readFileSync(join(outsideDir, 'alice.md'), 'utf-8')).toBe('OUTSIDE\n');
+      expect(readFileSync(join(movedPeopleDir, 'alice.md'), 'utf-8')).toBe('PRIVATE\n');
+    } finally {
+      __testing.closeAnchoredParent(parent);
       rmSync(outsideDir, { recursive: true, force: true });
     }
   });
@@ -527,6 +692,22 @@ describe('phaseCVerify', () => {
     expect(r.status).toBe('failed');
     expect(r.detail).toContain('drifted');
     expect(r.detail).toContain('people/alice');
+  });
+
+  test('returns failed when a same-count DB row has different fact identity', async () => {
+    writeEntityPage('people/alice');
+    const id = await seedLegacyFact({ entity_slug: 'people/alice', fact: 'Original' });
+    await __testing.phaseBFenceFacts(engine, OPTS);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (engine as any).db.query(
+      `UPDATE facts SET visibility = 'world' WHERE id = $1`,
+      [id],
+    );
+
+    const result = await __testing.phaseCVerify(engine, OPTS);
+    expect(result.status).toBe('failed');
+    expect(result.detail).toContain('identity drift at row=1');
   });
 });
 
