@@ -9,7 +9,9 @@
  *
  * Infrastructure: point GBRAIN_HOME at a tmpdir so the ledger writes to
  * <GBRAIN_HOME>/.gbrain/migrations/completed.jsonl and never touches the
- * real ledger.
+ * real ledger. This file intentionally runs in the serial-test lane because
+ * GBRAIN_HOME is process-global state; parallel shards can otherwise redirect
+ * another test's ledger operations between append and load.
  */
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
