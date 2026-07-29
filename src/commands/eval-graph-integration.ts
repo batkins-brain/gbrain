@@ -20,6 +20,10 @@ import {
   type LiveGraphEdgeRow,
   type LiveGraphNodeRow,
 } from '../eval/graph-integration/harness.ts';
+import {
+  listGraphReferenceObservations,
+  observationMetricsForLiveEmission,
+} from '../eval/graph-integration/observations.ts';
 
 function help(): void {
   console.log(`Usage: gbrain eval graph-integration <fixture.jsonl> [--json] [--fixture-name <name>] [--live-read-only --source <id>]
@@ -27,9 +31,11 @@ function help(): void {
 Run the TAN-610 graph/backlink acceptance harness in read-only mode.
 Measures outgoing links, incoming backlinks, typed relations, unresolved targets,
 broken references, duplicate edges, cross-source ambiguity, and authority-lifecycle compliance.
-Persisted live links can measure only resolved-edge metrics; unresolved targets,
-broken references, and cross-source ambiguity remain fixture-only and are emitted
-as null in the live result with explicit metric-coverage metadata.
+Persisted live links measure resolved-edge metrics. Unresolved targets, broken
+references, and cross-source ambiguity become numeric live metrics when
+graph_reference_observations rows exist for the source; otherwise they remain
+fixture-only nulls with explicit metric-coverage metadata. This command never
+writes observation rows, pages, or links.
 
 Options:
   --json               Emit machine-readable JSON.
@@ -179,6 +185,8 @@ async function readLiveSnapshot(engine: BrainEngine, sourceId: string): Promise<
       authority_state: undefined,
     }));
   const uniqueBoundaryNodes = [...new Map(boundaryNodes.map(n => [`${n.source_id}\u0000${n.slug}`, n])).values()];
+  const observationRows = await listGraphReferenceObservations(engine, sourceId);
+  const observationMetrics = observationMetricsForLiveEmission(observationRows);
   return {
     // External targets are represented only by edge-derived boundary identities;
     // no out-of-scope page body, title, or frontmatter is loaded.
@@ -192,15 +200,17 @@ async function readLiveSnapshot(engine: BrainEngine, sourceId: string): Promise<
       to_source_id: e.to_source_id,
       evidence: e.evidence ?? undefined,
     })),
-    // `links` contains only resolved FK-backed endpoints and stores explicit
-    // source identities. It cannot reveal unresolved references or missing /
-    // ambiguous source qualification. Those remain deterministic fixture-only
-    // metrics until GBrain persists a dedicated unresolved-reference substrate.
-    fixtureOnlyMetrics: [
-      'unresolved_targets',
-      'broken_references',
-      'cross_source_ambiguity',
-    ],
+    // `links` contains only resolved FK-backed endpoints. The three
+    // observation-backed metrics stay fixture-only until
+    // graph_reference_observations has at least one row for this source.
+    fixtureOnlyMetrics: observationMetrics
+      ? []
+      : [
+          'unresolved_targets',
+          'broken_references',
+          'cross_source_ambiguity',
+        ],
+    ...(observationMetrics ? { observationMetrics } : {}),
   };
 }
 
