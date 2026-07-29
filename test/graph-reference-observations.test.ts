@@ -63,6 +63,38 @@ describe('graph_reference_observations substrate', () => {
     )).toThrow('resolution_status');
   });
 
+  test('insert path revalidates slug and candidate source ids fail-closed', async () => {
+    await expect(insertGraphReferenceObservations({} as any, [{
+      observation_id: 'bad',
+      source_id: 'default',
+      from_slug: '../escape',
+      raw_target: 'x',
+      resolution_status: 'resolved',
+      to_source_id: null,
+      to_slug: null,
+      candidate_source_ids: [],
+      evidence_span: null,
+      scanner_version: 'v',
+      content_hash: 'h',
+      observed_at: new Date(0).toISOString(),
+    } as any])).rejects.toThrow('from_slug');
+
+    await expect(insertGraphReferenceObservations({} as any, [{
+      observation_id: 'bad2',
+      source_id: 'default',
+      from_slug: 'a/b',
+      raw_target: 'x',
+      resolution_status: 'ambiguous',
+      to_source_id: null,
+      to_slug: null,
+      candidate_source_ids: ['BAD_SOURCE'],
+      evidence_span: null,
+      scanner_version: 'v',
+      content_hash: 'h',
+      observed_at: new Date(0).toISOString(),
+    } as any])).rejects.toThrow('candidate_source_ids');
+  });
+
   test('empty observation set stays null for live emission', () => {
     expect(observationMetricsForLiveEmission([])).toBeNull();
     expect(observationMetricsForLiveEmission([
@@ -154,6 +186,7 @@ describe('graph_reference_observations engine path', () => {
 
     const listed = await listGraphReferenceObservations(engine, 'default');
     expect(listed).toHaveLength(5);
+    if (!metrics) throw new Error('expected non-null observation metrics after synthetic load');
     expect(countObservationMetrics(listed)).toEqual(metrics);
 
     const graphRows = parseGraphFixtureJsonl(readFileSync(GRAPH_FIXTURE_PATH, 'utf8'));

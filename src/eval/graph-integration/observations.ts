@@ -72,13 +72,100 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+function normalizeObservationInput(
+  value: unknown,
+  lineNumber: number,
+  label = 'observation fixture',
+): GraphReferenceObservation {
+  if (!isRecord(value)) {
+    throw new Error(`${label} line ${lineNumber}: expected a JSON object`);
+  }
+
+  requireNonEmptyString(value.observation_id, 'observation_id', lineNumber, label);
+  try {
+    assertValidSourceId(value.source_id);
+  } catch (error) {
+    throw new Error(
+      `${label} line ${lineNumber}: invalid source_id: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  requireNonEmptyString(value.from_slug, 'from_slug', lineNumber, label);
+  try {
+    validatePageSlug(value.from_slug);
+  } catch (error) {
+    throw new Error(
+      `${label} line ${lineNumber}: invalid from_slug: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  requireNonEmptyString(value.raw_target, 'raw_target', lineNumber, label);
+  if (!isResolutionStatus(value.resolution_status)) {
+    throw new Error(
+      `${label} line ${lineNumber}: resolution_status must be one of ${RESOLUTION_STATUSES.join(', ')}`,
+    );
+  }
+  requireNonEmptyString(value.scanner_version, 'scanner_version', lineNumber, label);
+  requireNonEmptyString(value.content_hash, 'content_hash', lineNumber, label);
+
+  let to_source_id: string | null = null;
+  if (value.to_source_id !== undefined && value.to_source_id !== null) {
+    try {
+      assertValidSourceId(value.to_source_id);
+      to_source_id = value.to_source_id;
+    } catch (error) {
+      throw new Error(
+        `${label} line ${lineNumber}: invalid to_source_id: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  const to_slug = validateOptionalSlug(value.to_slug, 'to_slug', lineNumber, label);
+  const candidate_source_ids = normalizeCandidateSourceIds(value.candidate_source_ids, lineNumber, label);
+
+  let evidence_span: string | null = null;
+  if (value.evidence_span !== undefined && value.evidence_span !== null) {
+    if (typeof value.evidence_span !== 'string') {
+      throw new Error(`${label} line ${lineNumber}: evidence_span must be a string when provided`);
+    }
+    evidence_span = value.evidence_span;
+  }
+
+  let observed_at: string;
+  if (value.observed_at === undefined || value.observed_at === null) {
+    observed_at = new Date(0).toISOString();
+  } else if (typeof value.observed_at === 'string' && value.observed_at.trim().length > 0) {
+    const parsed = Date.parse(value.observed_at);
+    if (Number.isNaN(parsed)) {
+      throw new Error(`${label} line ${lineNumber}: observed_at must be an ISO-8601 timestamp`);
+    }
+    observed_at = new Date(parsed).toISOString();
+  } else {
+    throw new Error(`${label} line ${lineNumber}: observed_at must be an ISO-8601 timestamp`);
+  }
+
+  return {
+    observation_id: value.observation_id,
+    source_id: value.source_id,
+    from_slug: value.from_slug,
+    raw_target: value.raw_target,
+    resolution_status: value.resolution_status,
+    to_source_id,
+    to_slug,
+    candidate_source_ids,
+    evidence_span,
+    scanner_version: value.scanner_version,
+    content_hash: value.content_hash,
+    observed_at,
+  };
+}
+
 function requireNonEmptyString(
   value: unknown,
   field: string,
   lineNumber: number,
+  label = 'observation fixture',
 ): asserts value is string {
   if (typeof value !== 'string' || value.trim().length === 0) {
-    throw new Error(`observation fixture line ${lineNumber}: ${field} must be a non-empty string`);
+    throw new Error(`${label} line ${lineNumber}: ${field} must be a non-empty string`);
   }
 }
 
@@ -86,23 +173,28 @@ function validateOptionalSlug(
   value: unknown,
   field: string,
   lineNumber: number,
+  label = 'observation fixture',
 ): string | null {
   if (value === undefined || value === null) return null;
-  requireNonEmptyString(value, field, lineNumber);
+  requireNonEmptyString(value, field, lineNumber, label);
   try {
     validatePageSlug(value);
   } catch (error) {
     throw new Error(
-      `observation fixture line ${lineNumber}: invalid ${field}: ${error instanceof Error ? error.message : String(error)}`,
+      `${label} line ${lineNumber}: invalid ${field}: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
   return value;
 }
 
-function normalizeCandidateSourceIds(value: unknown, lineNumber: number): string[] {
+function normalizeCandidateSourceIds(
+  value: unknown,
+  lineNumber: number,
+  label = 'observation fixture',
+): string[] {
   if (value === undefined || value === null) return [];
   if (!Array.isArray(value)) {
-    throw new Error(`observation fixture line ${lineNumber}: candidate_source_ids must be an array`);
+    throw new Error(`${label} line ${lineNumber}: candidate_source_ids must be an array`);
   }
   const out: string[] = [];
   for (const item of value) {
@@ -110,7 +202,7 @@ function normalizeCandidateSourceIds(value: unknown, lineNumber: number): string
       assertValidSourceId(item);
     } catch (error) {
       throw new Error(
-        `observation fixture line ${lineNumber}: invalid candidate_source_ids entry: ${error instanceof Error ? error.message : String(error)}`,
+        `${label} line ${lineNumber}: invalid candidate_source_ids entry: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
     out.push(item);
@@ -138,85 +230,15 @@ function isResolutionStatus(value: unknown): value is ResolutionStatus {
 }
 
 function validateObservationRow(value: unknown, lineNumber: number): GraphReferenceObservation {
-  if (!isRecord(value)) {
-    throw new Error(`observation fixture line ${lineNumber}: expected a JSON object`);
-  }
+  return normalizeObservationInput(value, lineNumber, 'observation fixture');
+}
 
-  requireNonEmptyString(value.observation_id, 'observation_id', lineNumber);
-  try {
-    assertValidSourceId(value.source_id);
-  } catch (error) {
-    throw new Error(
-      `observation fixture line ${lineNumber}: invalid source_id: ${error instanceof Error ? error.message : String(error)}`,
-    );
-  }
-  requireNonEmptyString(value.from_slug, 'from_slug', lineNumber);
-  try {
-    validatePageSlug(value.from_slug);
-  } catch (error) {
-    throw new Error(
-      `observation fixture line ${lineNumber}: invalid from_slug: ${error instanceof Error ? error.message : String(error)}`,
-    );
-  }
-  requireNonEmptyString(value.raw_target, 'raw_target', lineNumber);
-  if (!isResolutionStatus(value.resolution_status)) {
-    throw new Error(
-      `observation fixture line ${lineNumber}: resolution_status must be one of ${RESOLUTION_STATUSES.join(', ')}`,
-    );
-  }
-  requireNonEmptyString(value.scanner_version, 'scanner_version', lineNumber);
-  requireNonEmptyString(value.content_hash, 'content_hash', lineNumber);
-
-  let to_source_id: string | null = null;
-  if (value.to_source_id !== undefined && value.to_source_id !== null) {
-    try {
-      assertValidSourceId(value.to_source_id);
-      to_source_id = value.to_source_id;
-    } catch (error) {
-      throw new Error(
-        `observation fixture line ${lineNumber}: invalid to_source_id: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
-  }
-
-  const to_slug = validateOptionalSlug(value.to_slug, 'to_slug', lineNumber);
-  const candidate_source_ids = normalizeCandidateSourceIds(value.candidate_source_ids, lineNumber);
-
-  let evidence_span: string | null = null;
-  if (value.evidence_span !== undefined && value.evidence_span !== null) {
-    if (typeof value.evidence_span !== 'string') {
-      throw new Error(`observation fixture line ${lineNumber}: evidence_span must be a string when provided`);
-    }
-    evidence_span = value.evidence_span;
-  }
-
-  let observed_at: string;
-  if (value.observed_at === undefined || value.observed_at === null) {
-    observed_at = new Date(0).toISOString();
-  } else if (typeof value.observed_at === 'string' && value.observed_at.trim().length > 0) {
-    const parsed = Date.parse(value.observed_at);
-    if (Number.isNaN(parsed)) {
-      throw new Error(`observation fixture line ${lineNumber}: observed_at must be an ISO-8601 timestamp`);
-    }
-    observed_at = new Date(parsed).toISOString();
-  } else {
-    throw new Error(`observation fixture line ${lineNumber}: observed_at must be an ISO-8601 timestamp`);
-  }
-
-  return {
-    observation_id: value.observation_id,
-    source_id: value.source_id,
-    from_slug: value.from_slug,
-    raw_target: value.raw_target,
-    resolution_status: value.resolution_status,
-    to_source_id,
-    to_slug,
-    candidate_source_ids,
-    evidence_span,
-    scanner_version: value.scanner_version,
-    content_hash: value.content_hash,
-    observed_at,
-  };
+/** Fail-closed revalidation for direct insert callers (not only JSONL parse). */
+export function assertValidGraphReferenceObservation(
+  row: unknown,
+  index = 0,
+): GraphReferenceObservation {
+  return normalizeObservationInput(row, index + 1, 'graph_reference_observation');
 }
 
 export function parseObservationFixtureJsonl(text: string): GraphReferenceObservation[] {
@@ -328,6 +350,10 @@ export async function insertGraphReferenceObservations(
   rows: readonly GraphReferenceObservation[],
 ): Promise<number> {
   if (rows.length === 0) return 0;
+  // Fail-closed field validation before any engine I/O so direct callers
+  // cannot bypass parser invariants even when the table is missing.
+  const validated = rows.map((raw, index) => assertValidGraphReferenceObservation(raw, index));
+
   const exists = await graphReferenceObservationsTableExists(engine);
   if (!exists) {
     throw new Error(
@@ -336,9 +362,7 @@ export async function insertGraphReferenceObservations(
   }
 
   let inserted = 0;
-  for (const row of rows) {
-    assertValidSourceId(row.source_id);
-    if (row.to_source_id) assertValidSourceId(row.to_source_id);
+  for (const row of validated) {
     await engine.executeRaw(
       `INSERT INTO graph_reference_observations (
          observation_id, source_id, from_slug, raw_target, resolution_status,
