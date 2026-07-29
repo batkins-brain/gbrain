@@ -27,6 +27,7 @@ import { waitForCompletion, TimeoutError } from '../minions/wait-for-completion.
 import type { MinionJobInput, SubagentHandlerData } from '../minions/types.ts';
 import { serializeMarkdown } from '../markdown.ts';
 import type { Page, PageType } from '../types.ts';
+import { withFilePageLock } from '../page-lock.ts';
 
 export interface PatternsPhaseOpts {
   brainDir: string;
@@ -273,8 +274,10 @@ async function reverseWriteRefs(
       const filePath = source_id === 'default'
         ? join(brainDir, `${slug}.md`)
         : join(brainDir, '.sources', source_id, `${slug}.md`);
-      mkdirSync(dirname(filePath), { recursive: true });
-      writeFileSync(filePath, md, 'utf8');
+      await withFilePageLock(filePath, async () => {
+        mkdirSync(dirname(filePath), { recursive: true });
+        writeFileSync(filePath, md, 'utf8');
+      }, { timeoutMs: 5_000 });
       count++;
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);

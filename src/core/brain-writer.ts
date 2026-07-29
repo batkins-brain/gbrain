@@ -28,6 +28,7 @@ import {
   type ParseValidationError,
 } from './markdown.ts';
 import { isSyncable, pruneDir, slugifyPath } from './sync.ts';
+import { withFilePageLockSync } from './page-lock.ts';
 
 export type { ParseValidationCode };
 
@@ -351,18 +352,20 @@ export function writeBrainPage(
     fixes = result.fixes;
   }
 
-  let backupPath: string | undefined;
-  if (existsSync(filePath)) {
-    backupPath = createFrontmatterBackup(filePath, {
-      sourcePath: opts.sourcePath,
-      backupRoot: opts.backupRoot,
-      runId: opts.backupRunId,
-    });
-  } else {
-    mkdirSync(dirname(filePath), { recursive: true });
-  }
-  writeFileSync(filePath, toWrite, 'utf8');
-  return { fixes, backupPath };
+  return withFilePageLockSync(filePath, () => {
+    let backupPath: string | undefined;
+    if (existsSync(filePath)) {
+      backupPath = createFrontmatterBackup(filePath, {
+        sourcePath: opts.sourcePath,
+        backupRoot: opts.backupRoot,
+        runId: opts.backupRunId,
+      });
+    } else {
+      mkdirSync(dirname(filePath), { recursive: true });
+    }
+    writeFileSync(filePath, toWrite, 'utf8');
+    return { fixes, backupPath };
+  });
 }
 
 // ---------------------------------------------------------------------------

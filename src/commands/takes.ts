@@ -15,7 +15,7 @@
  *   3. applies the edit via takes-fence (upsertTakeRow / supersedeRow)
  *   4. writes the .md file back
  *   5. mirrors to the DB via the engine method
- *   6. releases the lock (auto via withPageLock)
+ *   6. releases the lock (auto via withFilePageLock)
  */
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
@@ -27,7 +27,7 @@ import {
   supersedeRow,
   type ParsedTake,
 } from '../core/takes-fence.ts';
-import { withPageLock } from '../core/page-lock.ts';
+import { withFilePageLock, withFilePageLockSync } from '../core/page-lock.ts';
 
 // --- Helpers ---
 
@@ -186,8 +186,8 @@ async function cmdAdd(engine: BrainEngine, args: string[]): Promise<void> {
   const dirArg = flagValue(args, '--dir');
   const brainDir = await resolveBrainDir(engine, dirArg ?? null);
 
-  await withPageLock(slug, async () => {
-    const path = pageFilePath(brainDir, slug);
+  const path = pageFilePath(brainDir, slug);
+  await withFilePageLock(path, async () => {
     const body = readBodyOrEmpty(path);
     const { body: nextBody, rowNum } = upsertTakeRow(body, {
       claim, kind, holder, weight, source, sinceDate: since, active: true,
@@ -222,12 +222,12 @@ async function cmdUpdate(engine: BrainEngine, args: string[]): Promise<void> {
   const dirArg = flagValue(args, '--dir');
   const brainDir = await resolveBrainDir(engine, dirArg ?? null);
 
-  await withPageLock(slug, async () => {
+  const path = pageFilePath(brainDir, slug);
+  await withFilePageLock(path, async () => {
     const pageId = await getPageId(engine, slug);
     await engine.updateTake(pageId, rowNum, fields);
 
     // Sync the markdown table: read fence, find row, apply field updates, re-render.
-    const path = pageFilePath(brainDir, slug);
     const body = readBodyOrEmpty(path);
     const parsed = parseTakesFence(body);
     const target = parsed.takes.find(t => t.rowNum === rowNum);
@@ -267,7 +267,8 @@ async function cmdSupersede(engine: BrainEngine, args: string[]): Promise<void> 
   const dirArg = flagValue(args, '--dir');
   const brainDir = await resolveBrainDir(engine, dirArg ?? null);
 
-  await withPageLock(slug, async () => {
+  const path = pageFilePath(brainDir, slug);
+  await withFilePageLock(path, async () => {
     const pageId = await getPageId(engine, slug);
 
     // Read existing row to inherit kind/holder unless overridden
@@ -288,7 +289,6 @@ async function cmdSupersede(engine: BrainEngine, args: string[]): Promise<void> 
     });
 
     // Mirror in markdown
-    const path = pageFilePath(brainDir, slug);
     const body = readBodyOrEmpty(path);
     if (parseTakesFence(body).takes.find(t => t.rowNum === rowNum)) {
       const { body: nextBody } = supersedeRow(body, rowNum, {
@@ -362,8 +362,8 @@ async function cmdResolve(engine: BrainEngine, args: string[]): Promise<void> {
   // row has resolution data; pages with no resolved rows keep the 7-col shape.
   // Round-trip via parseTakesFence + renderTakesFence preserves all rows.
   const brainDir = await resolveBrainDir(engine, dirArg ?? null);
-  await withPageLock(slug, async () => {
-    const path = pageFilePath(brainDir, slug);
+  const path = pageFilePath(brainDir, slug);
+  await withFilePageLock(path, async () => {
     const body = readBodyOrEmpty(path);
     if (!body) {
       console.warn(`[takes resolve] markdown file not found at ${path}; DB updated but on-disk page absent.`);
@@ -671,11 +671,13 @@ async function cmdRevisit(_engine: BrainEngine, rest: string[]): Promise<void> {
     process.exit(1);
   }
   // Append a cursor marker if not already present.
-  const existing = readFileSync(filePath, 'utf8');
-  const marker = '\n<!-- gbrain:revisit -->\n';
-  if (!existing.includes('<!-- gbrain:revisit -->')) {
-    writeFileSync(filePath, existing + marker);
-  }
+  withFilePageLockSync(filePath, () => {
+    const existing = readFileSync(filePath, 'utf8');
+    const marker = '\n<!-- gbrain:revisit -->\n';
+    if (!existing.includes('<!-- gbrain:revisit -->')) {
+      writeFileSync(filePath, existing + marker);
+    }
+  });
   const editor = process.env.EDITOR || process.env.VISUAL || 'vi';
   process.stderr.write(`Opening ${filePath} in ${editor}...\n`);
   // Use spawnSync with stdio:'inherit' so the editor takes the terminal.

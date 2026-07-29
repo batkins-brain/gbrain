@@ -34,7 +34,8 @@ import {
   __testing,
 } from '../src/commands/migrations/v0_32_2.ts';
 import { parseFactsFence } from '../src/core/facts-fence.ts';
-import { acquirePageLock } from '../src/core/page-lock.ts';
+import { acquireFilePageLock } from '../src/core/page-lock.ts';
+import { withEnv } from './helpers/with-env.ts';
 
 let engine: PGLiteEngine;
 let brainDir: string;
@@ -721,6 +722,19 @@ describe('phaseBFenceFacts — happy path backfill', () => {
     );
   });
 
+  test('dirty guard fails closed for a corrupt linked worktree from a source subdirectory', () => {
+    const repoDir = join(brainDir, 'linked-worktree');
+    const gitDir = join(brainDir, 'linked-gitdir');
+    const sourceDir = join(repoDir, 'brain-source');
+    mkdirSync(sourceDir, { recursive: true });
+    execFileSync('git', ['init', '-q', `--separate-git-dir=${gitDir}`, repoDir]);
+    renameSync(gitDir, `${gitDir}-missing`);
+
+    expect(() => __testing.areTargetPathsDirty(sourceDir, ['people/alice'])).toThrow(
+      /could not prove migration source Git state/,
+    );
+  });
+
   test('source-root anchor rejects a group/world-writable registered root', () => {
     const target = join(brainDir, 'people', 'alice.md');
     mkdirSync(join(brainDir, 'people'), { recursive: true });
@@ -752,12 +766,12 @@ describe('phaseBFenceFacts — happy path backfill', () => {
     writeEntityPage('people/alice');
     await seedLegacyFact({ entity_slug: 'people/alice', fact: 'Migrated fact' });
     const lockRoot = join(brainDir, '.migration-page-locks');
-    const holder = await acquirePageLock('people/alice', { lockRoot });
+    const path = join(brainDir, 'people', 'alice.md');
+    const holder = await acquireFilePageLock(path, { lockRoot });
     expect(holder).not.toBeNull();
 
     const migration = __testing.phaseBFenceFacts(engine, OPTS);
     await new Promise(resolvePromise => setTimeout(resolvePromise, 40));
-    const path = join(brainDir, 'people', 'alice.md');
     writeFileSync(path, `${readFileSync(path, 'utf-8')}\nConcurrent canonical edit.\n`);
     await holder!.release();
 
@@ -827,9 +841,41 @@ describe('phaseCVerify', () => {
     expect(result.status).toBe('failed');
     expect(result.detail).toContain('identity drift at row=1');
   });
+
+  test('fails when a fenceable legacy row arrives after the phase-B snapshot', async () => {
+    writeEntityPage('people/alice');
+    await seedLegacyFact({ entity_slug: 'people/alice', fact: 'Fenced first' });
+    await __testing.phaseBFenceFacts(engine, OPTS);
+    await seedLegacyFact({ entity_slug: 'people/bob', fact: 'Arrived concurrently' });
+
+    const result = await __testing.phaseCVerify(engine, OPTS);
+
+    expect(result.status).toBe('failed');
+    expect(result.detail).toContain('fenceable legacy rows remain');
+    expect(result.detail).toContain('people/bob');
+  });
 });
 
 describe('orchestrator end-to-end', () => {
+  test('propagates a configured engine connection failure', async () => {
+    const configHome = mkdtempSync(join(tmpdir(), 'mig-v0_32_2-bad-engine-'));
+    mkdirSync(join(configHome, '.gbrain'), { recursive: true });
+    writeFileSync(
+      join(configHome, '.gbrain', 'config.json'),
+      JSON.stringify({ engine: 'pglite', database_path: '/dev/null/gbrain' }),
+      'utf-8',
+    );
+    __setTestEngineOverride(null);
+    try {
+      await withEnv({ GBRAIN_HOME: configHome }, async () => {
+        await expect(v0_32_2.orchestrator(OPTS)).rejects.toThrow();
+      });
+    } finally {
+      __setTestEngineOverride(engine);
+      rmSync(configHome, { recursive: true, force: true });
+    }
+  });
+
   test('clean run returns status:complete with 3 phases', async () => {
     writeEntityPage('people/alice');
     await seedLegacyFact({ entity_slug: 'people/alice', fact: 'Founded Acme' });

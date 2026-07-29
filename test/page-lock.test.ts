@@ -2,16 +2,23 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import {
   existsSync,
   mkdtempSync,
+  mkdirSync,
   readFileSync,
   rmSync,
   statSync,
+  symlinkSync,
   utimesSync,
   writeFileSync,
 } from 'node:fs';
 import { join, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
-import { acquirePageLock, withPageLock } from '../src/core/page-lock.ts';
+import {
+  acquireFilePageLock,
+  acquirePageLock,
+  filePageLockKey,
+  withPageLock,
+} from '../src/core/page-lock.ts';
 
 let tmp: string;
 
@@ -166,6 +173,28 @@ describe('withPageLock', () => {
       }),
     ).rejects.toThrow();
     await first!.release();
+  });
+});
+
+describe('file-path lock identity', () => {
+  test('canonicalizes symlink aliases for existing and not-yet-created pages', async () => {
+    const root = join(tmp, 'brain');
+    const alias = join(tmp, 'brain-alias');
+    const lockRoot = join(tmp, 'locks');
+    mkdirSync(join(root, 'people'), { recursive: true });
+    writeFileSync(join(root, 'people', 'alice.md'), 'alice\n');
+    symlinkSync(root, alias);
+
+    expect(filePageLockKey(join(alias, 'people', 'alice.md')))
+      .toBe(filePageLockKey(join(root, 'people', 'alice.md')));
+    expect(filePageLockKey(join(alias, 'topics', 'new.md')))
+      .toBe(filePageLockKey(join(root, 'topics', 'new.md')));
+
+    const holder = await acquireFilePageLock(join(alias, 'people', 'alice.md'), { lockRoot });
+    expect(holder).not.toBeNull();
+    const contender = await acquireFilePageLock(join(root, 'people', 'alice.md'), { lockRoot });
+    expect(contender).toBeNull();
+    await holder!.release();
   });
 });
 

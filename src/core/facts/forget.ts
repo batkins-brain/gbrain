@@ -36,7 +36,7 @@ import { existsSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 
 import type { BrainEngine } from '../engine.ts';
-import { withPageLock } from '../page-lock.ts';
+import { withFilePageLock } from '../page-lock.ts';
 import { parseFactsFence, renderFactsTable, type ParsedFact } from '../facts-fence.ts';
 
 export interface ForgetFactResult {
@@ -137,7 +137,7 @@ export async function forgetFactInFence(
     return { ok, path: 'legacy_db', reason };
   }
 
-  return withPageLock(slug, async () => {
+  return withFilePageLock(filePath, async () => {
     const body = readFileSync(filePath, 'utf-8');
     const parsed = parseFactsFence(body);
 

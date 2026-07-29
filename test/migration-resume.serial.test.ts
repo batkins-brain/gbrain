@@ -149,6 +149,14 @@ describe('Bug 3 — orchestrator no longer writes the ledger directly', () => {
     // old call site is replaced with a comment.
     expect(source).not.toMatch(/import .*appendCompletedMigration.*from/);
   });
+  test('v0_16_0 does not import or call appendCompletedMigration', async () => {
+    const source = await Bun.file(new URL('../src/commands/migrations/v0_16_0.ts', import.meta.url)).text();
+    expect(source).not.toContain('appendCompletedMigration');
+  });
+  test('v0_18_0 does not import or call appendCompletedMigration', async () => {
+    const source = await Bun.file(new URL('../src/commands/migrations/v0_18_0.ts', import.meta.url)).text();
+    expect(source).not.toContain('appendCompletedMigration');
+  });
 
   test('apply-migrations.ts runner writes the ledger', async () => {
     const source = await Bun.file(new URL('../src/commands/apply-migrations.ts', import.meta.url)).text();

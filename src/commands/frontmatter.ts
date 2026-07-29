@@ -31,6 +31,7 @@ import {
   type AuditFix,
 } from '../core/brain-writer.ts';
 import { isSyncable, pruneDir, slugifyPath } from '../core/sync.ts';
+import { withFilePageLockSync } from '../core/page-lock.ts';
 
 export async function runFrontmatter(args: string[]): Promise<void> {
   const sub = args[0];
@@ -191,11 +192,16 @@ async function runValidate(rest: string[]): Promise<void> {
     };
 
     if (flags.fix && errs.length > 0) {
-      const { content: fixed, fixes } = autoFixFrontmatter(content, { filePath: file });
+      const { fixes } = autoFixFrontmatter(content, { filePath: file });
       result.fixesApplied = fixes;
       if (fixes.length > 0 && !flags.dryRun) {
-        result.backupPath = createFrontmatterBackup(file, { sourcePath: resolved, runId: backupRunId });
-        writeFileSync(file, fixed, 'utf8');
+        withFilePageLockSync(file, () => {
+          const latest = readFileSync(file, 'utf8');
+          const latestFix = autoFixFrontmatter(latest, { filePath: file });
+          if (latestFix.fixes.length === 0) return;
+          result.backupPath = createFrontmatterBackup(file, { sourcePath: resolved, runId: backupRunId });
+          writeFileSync(file, latestFix.content, 'utf8');
+        });
       }
     }
 
@@ -454,12 +460,17 @@ async function runGenerate(args: string[]): Promise<void> {
     });
 
     if (doFix && !dryRun) {
-      const fm = serializeFrontmatter(inferred);
-      const newContent = fm + '\n' + content;
-      // Safety: write a centralized backup first.
-      createFrontmatterBackup(absPath, { sourcePath: brainRoot, runId: backupRunId });
-      writeFileSync(absPath, newContent, 'utf-8');
-      written++;
+      withFilePageLockSync(absPath, () => {
+        const latest = readFileSync(absPath, 'utf-8');
+        const latestInference = inferFrontmatter(relPath, latest);
+        if (latestInference.skipped) return;
+        const fm = serializeFrontmatter(latestInference);
+        const newContent = fm + '\n' + latest;
+        // Safety: write a centralized backup first.
+        createFrontmatterBackup(absPath, { sourcePath: brainRoot, runId: backupRunId });
+        writeFileSync(absPath, newContent, 'utf-8');
+        written++;
+      });
     }
   }
 

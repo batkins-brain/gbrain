@@ -52,7 +52,7 @@ import {
   FACTS_FENCE_END,
   type ParsedFact,
 } from '../facts-fence.ts';
-import { withPageLock } from '../page-lock.ts';
+import { withFilePageLock } from '../page-lock.ts';
 import { parseMarkdown, splitBody, serializeMarkdown } from '../markdown.ts';
 import { tryAcquireDbLock, syncLockId, type DbLockHandle } from '../db-lock.ts';
 import { isAborted } from '../abort-check.ts';
@@ -441,7 +441,7 @@ export async function tryRedirectPhantom(
   // ─── Commit phase (codex #3/#4/#6/#7) ─────────────────────────────
   const canonicalPath = path.join(brainDir, `${canonical}.md`);
   const phantomFence = parseFactsFence(page.compiled_truth ?? '');
-  const newCanonicalBody = await withPageLock(canonical, async () => {
+  const newCanonicalBody = await withFilePageLock(canonicalPath, async () => {
     await materializeCanonicalToDisk(engine, canonical, sourceId, canonicalPath);
 
     // Disk-side first: parse phantom's fence and append to canonical's

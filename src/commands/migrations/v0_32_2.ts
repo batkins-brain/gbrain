@@ -45,7 +45,7 @@ import {
 import { basename, join, dirname, resolve, relative, isAbsolute, sep } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { dlopen, FFIType, ptr } from 'bun:ffi';
+import { dlopen, FFIType } from 'bun:ffi';
 
 import type {
   Migration, OrchestratorOpts, OrchestratorResult, OrchestratorPhaseResult,
@@ -55,7 +55,7 @@ import { loadConfig, toEngineConfig } from '../../core/config.ts';
 import { createEngine } from '../../core/engine-factory.ts';
 import { upsertFactRow, parseFactsFence } from '../../core/facts-fence.ts';
 import { isWriteTargetContained } from '../../core/path-confine.ts';
-import { withPageLock } from '../../core/page-lock.ts';
+import { withFilePageLock } from '../../core/page-lock.ts';
 
 let testEngineOverride: BrainEngine | null = null;
 let testPageLockRoot: string | undefined;
@@ -68,16 +68,12 @@ export function __setTestPageLockRoot(lockRoot: string | undefined): void {
 
 async function getEngine(): Promise<BrainEngine | null> {
   if (testEngineOverride) return testEngineOverride;
-  try {
-    const cfg = loadConfig();
-    if (!cfg) return null;
-    const engineConfig = toEngineConfig(cfg);
-    const engine = await createEngine(engineConfig);
-    await engine.connect(engineConfig);
-    return engine;
-  } catch {
-    return null;
-  }
+  const cfg = loadConfig();
+  if (!cfg) return null;
+  const engineConfig = toEngineConfig(cfg);
+  const engine = await createEngine(engineConfig);
+  await engine.connect(engineConfig);
+  return engine;
 }
 
 // ── Phase A — Schema verify ────────────────────────────────
@@ -234,7 +230,9 @@ function areTargetPathsDirty(
   }
   if (probe.status !== 0) {
     const diagnostic = `${probe.stderr ?? ''}\n${probe.stdout ?? ''}`.trim();
-    if (/not a git repository/i.test(diagnostic)) return false;
+    if (/not a git repository/i.test(diagnostic) && !hasGitControlEntryInAncestors(localPath)) {
+      return false;
+    }
     throw new Error(
       `could not prove migration source Git state${diagnostic ? `: ${diagnostic}` : ''}`,
     );
@@ -311,9 +309,30 @@ function pathEntryExists(path: string): boolean {
   }
 }
 
+function hasGitControlEntryInAncestors(localPath: string): boolean {
+  const sourceRoot = resolve(localPath);
+  let current = sourceRoot;
+  while (true) {
+    // Do not let an unrelated synthetic/corrupt `.git` entry at a shared
+    // sticky boundary (for example /tmp/.git) taint every private source
+    // beneath it. A linked worktree's control entry is found before crossing
+    // that boundary.
+    if (current !== sourceRoot) {
+      const currentStat = lstatSync(current);
+      if ((currentStat.mode & 0o1000) !== 0 && (currentStat.mode & 0o002) !== 0) {
+        return false;
+      }
+    }
+    if (pathEntryExists(join(current, '.git'))) return true;
+    const parent = dirname(current);
+    if (parent === current) return false;
+    current = parent;
+  }
+}
+
 /**
  * Linux exposes open directory descriptors below /proc/self/fd or /dev/fd;
- * Darwin uses libc *at(2) calls plus fcntl(F_GETPATH). Walking from an
+ * Darwin uses libc *at(2) calls plus descriptor device/inode identity. Walking from an
  * already-open source-root descriptor makes every subsequent lookup relative
  * to a stable directory object, so swapping an intermediate path component
  * cannot redirect a read or write outside the registered source.
@@ -352,7 +371,6 @@ interface NativeAtSymbols {
     flags: number,
   ) => number;
   unlinkat: (dirFd: number, path: Uint8Array, flags: number) => number;
-  fcntl: (fd: number, command: number, buffer: ReturnType<typeof ptr>) => number;
 }
 
 let nativeAtLibrary: ReturnType<typeof dlopen> | null = null;
@@ -394,10 +412,6 @@ function getNativeAtSymbols(): NativeAtSymbols {
       args: [FFIType.i32, FFIType.cstring, FFIType.i32],
       returns: FFIType.i32,
     },
-    fcntl: {
-      args: [FFIType.i32, FFIType.i32, FFIType.ptr],
-      returns: FFIType.i32,
-    },
   });
   nativeAtSymbols = nativeAtLibrary.symbols as unknown as NativeAtSymbols;
   return nativeAtSymbols;
@@ -413,20 +427,6 @@ function nativeMkdirAt(fd: number, name: string, mode: number): void {
   if (getNativeAtSymbols().mkdirat(fd, cString(name), mode) < 0) {
     throw new Error(`descriptor-relative mkdir failed: ${name}`);
   }
-}
-
-function nativeFdPath(fd: number): string {
-  if (process.platform !== 'darwin') {
-    throw new Error('native descriptor path lookup is unavailable');
-  }
-  // Darwin fcntl(F_GETPATH) writes a NUL-terminated path into MAXPATHLEN.
-  const F_GETPATH = 50;
-  const buffer = Buffer.alloc(4096);
-  if (getNativeAtSymbols().fcntl(fd, F_GETPATH, ptr(buffer)) < 0) {
-    throw new Error('descriptor canonical-path lookup failed');
-  }
-  const nul = buffer.indexOf(0);
-  return buffer.subarray(0, nul < 0 ? buffer.length : nul).toString('utf-8');
 }
 
 function assertDirectoryFd(fd: number): void {
@@ -508,11 +508,21 @@ function openAnchoredParent(
       fd = childFd;
       assertDirectoryFd(fd);
     }
-    const openedRootPath = descriptorBase
-      ? realpathSync(descriptorFdPath(descriptorBase, fd))
-      : nativeFdPath(fd);
-    if (openedRootPath !== canonicalRoot) {
-      throw new Error('registered source root changed while opening');
+    const canonicalRootFd = openSync(
+      canonicalRoot,
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+    );
+    try {
+      const openedRootStat = fstatSync(fd);
+      const canonicalRootStat = fstatSync(canonicalRootFd);
+      if (
+        openedRootStat.dev !== canonicalRootStat.dev ||
+        openedRootStat.ino !== canonicalRootStat.ino
+      ) {
+        throw new Error('registered source root changed while opening');
+      }
+    } finally {
+      closeSync(canonicalRootFd);
     }
     const openedRootStat = fstatSync(fd);
     const effectiveUid = process.getuid?.();
@@ -585,13 +595,7 @@ function assertAnchoredParentStillCurrent(parent: AnchoredParent): void {
   if (realpathSync(parent.registeredRoot) !== parent.canonicalRoot) {
     throw new Error('registered source root changed during descriptor-anchored write');
   }
-  const openedPath = parent.descriptorBase
-    ? realpathSync(descriptorFdPath(parent.descriptorBase, parent.fd))
-    : nativeFdPath(parent.fd);
-  if (
-    openedPath !== parent.absolutePath ||
-    !isWriteTargetContained(openedPath, parent.canonicalRoot)
-  ) {
+  if (!isWriteTargetContained(parent.absolutePath, parent.canonicalRoot)) {
     throw new Error('migration target directory moved outside its anchored source path');
   }
   if (!hasNoSymlinkComponents(parent.absolutePath, parent.canonicalRoot)) {
@@ -994,7 +998,7 @@ async function phaseBFenceFacts(
         // Every supported gbrain markdown writer uses this exact per-page lock
         // key. Holding it across read, optimistic comparison, publication, and
         // DB stamping makes the comparison enforceable rather than advisory.
-        await withPageLock(targetMarkdownSlug, async () => {
+        await withFilePageLock(filePath, async () => {
           // Re-check immediately before access so a pre-existing intermediate
           // symlink cannot redirect either the canonical or quarantine write.
           if (
@@ -1285,6 +1289,37 @@ async function phaseCVerify(
         );
       }
       pagesChecked += 1;
+    }
+
+    // Phase B plans from a snapshot. A fenceable row inserted while that
+    // snapshot is being published must force a retry, never a terminal
+    // completion that strands the row outside markdown.
+    const remaining = await engine.executeRaw<{
+      id: string;
+      source_id: string;
+      entity_slug: string;
+    }>(
+      `SELECT f.id, f.source_id, f.entity_slug
+         FROM facts f
+         JOIN sources s ON s.id = f.source_id
+        WHERE f.row_num IS NULL
+          AND f.entity_slug IS NOT NULL
+          AND s.local_path IS NOT NULL
+        ORDER BY f.source_id, f.entity_slug, f.id
+        LIMIT 4`,
+    );
+    if (remaining.length > 0) {
+      const sample = remaining
+        .slice(0, 3)
+        .map(row => `${row.source_id}:${row.entity_slug} (${row.id})`)
+        .join(' | ');
+      return {
+        name: 'verify',
+        status: 'failed',
+        detail:
+          `fenceable legacy rows remain after migration snapshot; re-run to converge: ${sample}` +
+          (remaining.length > 3 ? '...' : ''),
+      };
     }
 
     if (mismatches.length > 0) {

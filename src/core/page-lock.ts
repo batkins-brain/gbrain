@@ -6,8 +6,9 @@
  * parallel `gbrain takes add` calls + a `takes seed --refresh` running in
  * autopilot can't race on the same `<slug>.md` file.
  *
- * Lock file path: `~/.gbrain/page-locks/<sha256-of-slug>.lock`. SHA-256
- * keeps filenames safe regardless of slug content (slashes, unicode, etc.).
+ * Lock file path: `~/.gbrain/page-locks/<sha256-of-key>.lock`. Canonical
+ * file writers key by the physical target path so slug aliases and source
+ * root symlink aliases cannot create independent locks for the same page.
  *
  * The persistent file carries diagnostic `{pid}\n{iso-timestamp}\n{holder-token}`
  * content. Kernel `flock(2)` is the lock authority: acquisition is atomic and
@@ -15,7 +16,7 @@
  *
  * Usage:
  *
- *   const lock = await acquirePageLock(slug, { timeoutMs: 30_000 });
+ *   const lock = await acquireFilePageLock(filePath, { timeoutMs: 30_000 });
  *   try {
  *     // read-modify-write the markdown file
  *   } finally {
@@ -34,9 +35,10 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
+  realpathSync,
   writeSync,
 } from 'node:fs';
-import { join } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { dlopen, FFIType } from 'bun:ffi';
 import { gbrainPath } from './config.ts';
@@ -48,6 +50,10 @@ export interface PageLockHandle {
   refresh: () => Promise<void>;
   /** Slug the lock was acquired for (for diagnostics). */
   slug: string;
+}
+
+interface InternalPageLockHandle extends PageLockHandle {
+  releaseSync: () => void;
 }
 
 export interface AcquirePageLockOpts {
@@ -108,7 +114,7 @@ function writeLockRecord(fd: number, record: LockRecord): void {
   fsyncSync(fd);
 }
 
-function tryAcquireOnce(slug: string, lockPath: string): PageLockHandle | null {
+function tryAcquireOnce(slug: string, lockPath: string): InternalPageLockHandle | null {
   const dir = join(lockPath, '..');
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   let dirStat = lstatSync(dir);
@@ -165,20 +171,22 @@ function tryAcquireOnce(slug: string, lockPath: string): PageLockHandle | null {
     writeLockRecord(fd, record());
 
     let released = false;
+    const releaseSync = (): void => {
+      if (released) return;
+      released = true;
+      try {
+        getFlockSymbols().flock(fd, LOCK_UN);
+      } finally {
+        closeSync(fd);
+      }
+    };
     return {
       slug,
       refresh: async () => {
         if (!released) writeLockRecord(fd, record());
       },
-      release: async () => {
-        if (released) return;
-        released = true;
-        try {
-          getFlockSymbols().flock(fd, LOCK_UN);
-        } finally {
-          closeSync(fd);
-        }
-      },
+      releaseSync,
+      release: async () => releaseSync(),
     };
   } catch (error) {
     try {
@@ -232,5 +240,64 @@ export async function withPageLock<T>(
     return await fn();
   } finally {
     await handle.release();
+  }
+}
+
+/**
+ * Stable lock identity for a physical markdown target. Writers that know the
+ * target path must use this instead of inventing a slug namespace so every
+ * read-modify-write path contends on the same kernel lock.
+ */
+export function filePageLockKey(filePath: string): string {
+  let existingAncestor = resolve(filePath);
+  const missingTail: string[] = [];
+  while (true) {
+    try {
+      return `file:${join(realpathSync(existingAncestor), ...[...missingTail].reverse())}`;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') throw error;
+      const parent = dirname(existingAncestor);
+      if (parent === existingAncestor) throw error;
+      missingTail.push(basename(existingAncestor));
+      existingAncestor = parent;
+    }
+  }
+}
+
+export async function acquireFilePageLock(
+  filePath: string,
+  opts: AcquirePageLockOpts = {},
+): Promise<PageLockHandle | null> {
+  return acquirePageLock(filePageLockKey(filePath), opts);
+}
+
+export async function withFilePageLock<T>(
+  filePath: string,
+  fn: () => Promise<T>,
+  opts: AcquirePageLockOpts = {},
+): Promise<T> {
+  return withPageLock(filePageLockKey(filePath), fn, opts);
+}
+
+/**
+ * Synchronous canonical-page fixers cannot poll without blocking the process.
+ * They therefore fail closed if another writer owns the target and leave the
+ * caller free to retry the command.
+ */
+export function withFilePageLockSync<T>(
+  filePath: string,
+  fn: () => T,
+  opts: AcquirePageLockOpts = {},
+): T {
+  const key = filePageLockKey(filePath);
+  const handle = tryAcquireOnce(key, lockPathFor(key, opts.lockRoot));
+  if (!handle) {
+    throw new Error(`withFilePageLockSync: page is busy: ${resolve(filePath)}`);
+  }
+  try {
+    return fn();
+  } finally {
+    handle.releaseSync();
   }
 }

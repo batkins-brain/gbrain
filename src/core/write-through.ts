@@ -27,7 +27,7 @@ import { randomBytes } from 'crypto';
 import type { BrainEngine } from './engine.ts';
 import { serializePageToMarkdown, resolvePageFilePath } from './markdown.ts';
 import { isWriteTargetContained } from './path-confine.ts';
-import { withPageLock } from './page-lock.ts';
+import { withFilePageLock } from './page-lock.ts';
 
 /** Minimal logger surface — structurally compatible with operations.ts `Logger`. */
 export interface WriteThroughLogger {
@@ -129,7 +129,7 @@ export async function writePageThrough(
       return { written: false, skipped: 'path_escapes_source_root' };
     }
 
-    return await withPageLock(slug, async () => {
+    return await withFilePageLock(filePath, async () => {
       const writtenPage = await engine.getPage(slug, { sourceId });
       if (!writtenPage) {
         return { written: false, skipped: 'page_not_found_after_write' };

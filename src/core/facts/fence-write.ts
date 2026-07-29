@@ -11,7 +11,7 @@
  *
  * Concurrency: reuses the v0.28 page-lock primitive
  * (`src/core/page-lock.ts`), an FS-level lockfile under
- * `~/.gbrain/page-locks/<sha256-of-slug>.lock` with kernel `flock(2)`
+ * `~/.gbrain/page-locks/<sha256-of-canonical-file-key>.lock` with kernel `flock(2)`
  * arbitration and holder tokens. Multi-process safe — two `gbrain` invocations writing
  * to the same entity page serialize through the same kernel-visible
  * lockfile. 5-second timeout per the plan's "5s retry" failure mode.
@@ -37,7 +37,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, appendF
 import { join, dirname } from 'node:path';
 
 import type { BrainEngine, NewFact, FactVisibility } from '../engine.ts';
-import { withPageLock } from '../page-lock.ts';
+import { withFilePageLock } from '../page-lock.ts';
 import { gbrainPath } from '../config.ts';
 import { upsertFactRow, parseFactsFence } from '../facts-fence.ts';
 import { extractFactsFromFenceText } from './extract-from-fence.ts';
@@ -169,8 +169,8 @@ export async function writeFactsToFence(
   const filePath = join(target.localPath, `${target.slug}.md`);
   const tmpPath = `${filePath}.tmp`;
 
-  return withPageLock(
-    target.slug,
+  return withFilePageLock(
+    filePath,
     async () => {
       // 1. Read existing body or stub-create.
       let body: string;
