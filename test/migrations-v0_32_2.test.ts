@@ -655,6 +655,34 @@ describe('phaseBFenceFacts — happy path backfill', () => {
     }
   });
 
+  test('supports a stable registered source-root symlink and rejects a root swap', () => {
+    const aliasRoot = `${brainDir}-alias`;
+    const replacementRoot = mkdtempSync(join(tmpdir(), 'mig-v0_32_2-root-swap-'));
+    const peopleDir = join(brainDir, 'people');
+    mkdirSync(peopleDir, { recursive: true });
+    writeFileSync(join(peopleDir, 'alice.md'), 'ORIGINAL\n');
+    symlinkSync(brainDir, aliasRoot);
+
+    const parent = __testing.openAnchoredParent(
+      aliasRoot,
+      join(aliasRoot, 'people', 'alice.md'),
+      false,
+    );
+    try {
+      expect(() => __testing.assertAnchoredParentStillCurrent(parent)).not.toThrow();
+
+      rmSync(aliasRoot);
+      symlinkSync(replacementRoot, aliasRoot);
+      expect(() => __testing.assertAnchoredParentStillCurrent(parent)).toThrow(
+        /registered source root changed/,
+      );
+    } finally {
+      __testing.closeAnchoredParent(parent);
+      rmSync(aliasRoot, { force: true });
+      rmSync(replacementRoot, { recursive: true, force: true });
+    }
+  });
+
   test('dirty guard ignores unrelated changes but blocks an exact target path', () => {
     execFileSync('git', ['init', '-q', brainDir]);
     writeFileSync(join(brainDir, 'unrelated.md'), 'unrelated\n');

@@ -133,48 +133,61 @@ function tryAcquireOnce(slug: string, lockPath: string): PageLockHandle | null {
     constants.O_RDWR | constants.O_CREAT | constants.O_NOFOLLOW,
     0o600,
   );
-  const lockStat = fstatSync(fd);
-  if (
-    !lockStat.isFile() ||
-    (effectiveUid !== undefined && lockStat.uid !== effectiveUid)
-  ) {
-    closeSync(fd);
-    throw new Error(`page lock is not a caller-owned regular file: ${lockPath}`);
-  }
-  if ((lockStat.mode & 0o077) !== 0) fchmodSync(fd, 0o600);
-
   // flock is the authority. It is atomic, inode-bound, and released by the
   // kernel on process exit, eliminating initialization, stale-reclaim, and
   // read/check/unlink races from the former PID-file protocol.
   const LOCK_EX = 2;
   const LOCK_NB = 4;
   const LOCK_UN = 8;
-  if (getFlockSymbols().flock(fd, LOCK_EX | LOCK_NB) < 0) {
-    closeSync(fd);
-    return null;
-  }
+  let locked = false;
+  try {
+    const lockStat = fstatSync(fd);
+    if (
+      !lockStat.isFile() ||
+      (effectiveUid !== undefined && lockStat.uid !== effectiveUid)
+    ) {
+      throw new Error(`page lock is not a caller-owned regular file: ${lockPath}`);
+    }
+    if ((lockStat.mode & 0o077) !== 0) fchmodSync(fd, 0o600);
 
-  const token = randomUUID();
-  const record = (): LockRecord => ({
-    pid: process.pid,
-    timestamp: new Date().toISOString(),
-    token,
-  });
-  writeLockRecord(fd, record());
-
-  let released = false;
-  return {
-    slug,
-    refresh: async () => {
-      if (!released) writeLockRecord(fd, record());
-    },
-    release: async () => {
-      if (released) return;
-      released = true;
-      getFlockSymbols().flock(fd, LOCK_UN);
+    if (getFlockSymbols().flock(fd, LOCK_EX | LOCK_NB) < 0) {
       closeSync(fd);
-    },
-  };
+      return null;
+    }
+    locked = true;
+
+    const token = randomUUID();
+    const record = (): LockRecord => ({
+      pid: process.pid,
+      timestamp: new Date().toISOString(),
+      token,
+    });
+    writeLockRecord(fd, record());
+
+    let released = false;
+    return {
+      slug,
+      refresh: async () => {
+        if (!released) writeLockRecord(fd, record());
+      },
+      release: async () => {
+        if (released) return;
+        released = true;
+        try {
+          getFlockSymbols().flock(fd, LOCK_UN);
+        } finally {
+          closeSync(fd);
+        }
+      },
+    };
+  } catch (error) {
+    try {
+      if (locked) getFlockSymbols().flock(fd, LOCK_UN);
+    } finally {
+      closeSync(fd);
+    }
+    throw error;
+  }
 }
 
 /**

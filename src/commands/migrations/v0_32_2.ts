@@ -325,7 +325,7 @@ interface AnchoredParent {
   fd: number;
   descriptorBase: string | null;
   absolutePath: string;
-  localPath: string;
+  registeredRoot: string;
   canonicalRoot: string;
   dev: number;
   ino: number;
@@ -336,27 +336,31 @@ function descriptorFdPath(base: string, fd: number): string {
 }
 
 interface NativeAtSymbols {
-  openat: (dirFd: number, path: string, flags: number, mode: number) => number;
-  mkdirat: (dirFd: number, path: string, mode: number) => number;
+  openat: (dirFd: number, path: Uint8Array, flags: number, mode: number) => number;
+  mkdirat: (dirFd: number, path: Uint8Array, mode: number) => number;
   renameat: (
     oldDirFd: number,
-    oldPath: string,
+    oldPath: Uint8Array,
     newDirFd: number,
-    newPath: string,
+    newPath: Uint8Array,
   ) => number;
   linkat: (
     oldDirFd: number,
-    oldPath: string,
+    oldPath: Uint8Array,
     newDirFd: number,
-    newPath: string,
+    newPath: Uint8Array,
     flags: number,
   ) => number;
-  unlinkat: (dirFd: number, path: string, flags: number) => number;
+  unlinkat: (dirFd: number, path: Uint8Array, flags: number) => number;
   fcntl: (fd: number, command: number, buffer: ReturnType<typeof ptr>) => number;
 }
 
 let nativeAtLibrary: ReturnType<typeof dlopen> | null = null;
 let nativeAtSymbols: NativeAtSymbols | null = null;
+
+function cString(value: string): Uint8Array {
+  return Buffer.from(`${value}\0`);
+}
 
 function getNativeAtSymbols(): NativeAtSymbols {
   if (nativeAtSymbols) return nativeAtSymbols;
@@ -400,13 +404,13 @@ function getNativeAtSymbols(): NativeAtSymbols {
 }
 
 function nativeOpenAt(fd: number, name: string, flags: number, mode = 0): number {
-  const opened = getNativeAtSymbols().openat(fd, name, flags, mode);
+  const opened = getNativeAtSymbols().openat(fd, cString(name), flags, mode);
   if (opened < 0) throw new Error(`descriptor-relative open failed: ${name}`);
   return opened;
 }
 
 function nativeMkdirAt(fd: number, name: string, mode: number): void {
-  if (getNativeAtSymbols().mkdirat(fd, name, mode) < 0) {
+  if (getNativeAtSymbols().mkdirat(fd, cString(name), mode) < 0) {
     throw new Error(`descriptor-relative mkdir failed: ${name}`);
   }
 }
@@ -562,7 +566,7 @@ function openAnchoredParent(
       fd,
       descriptorBase,
       absolutePath: currentAbsolute,
-      localPath: absoluteRoot,
+      registeredRoot: absoluteRoot,
       canonicalRoot,
       dev: stat.dev,
       ino: stat.ino,
@@ -578,6 +582,9 @@ function closeAnchoredParent(parent: AnchoredParent): void {
 }
 
 function assertAnchoredParentStillCurrent(parent: AnchoredParent): void {
+  if (realpathSync(parent.registeredRoot) !== parent.canonicalRoot) {
+    throw new Error('registered source root changed during descriptor-anchored write');
+  }
   const openedPath = parent.descriptorBase
     ? realpathSync(descriptorFdPath(parent.descriptorBase, parent.fd))
     : nativeFdPath(parent.fd);
@@ -587,7 +594,7 @@ function assertAnchoredParentStillCurrent(parent: AnchoredParent): void {
   ) {
     throw new Error('migration target directory moved outside its anchored source path');
   }
-  if (!hasNoSymlinkComponents(parent.absolutePath, parent.localPath)) {
+  if (!hasNoSymlinkComponents(parent.absolutePath, parent.canonicalRoot)) {
     throw new Error('migration target path changed: symbolic-link component detected');
   }
   const currentFd = openSync(
@@ -673,7 +680,7 @@ function renameChildAt(parent: AnchoredParent, from: string, to: string): void {
   }
   const symbols = getNativeAtSymbols();
   if (
-    symbols.renameat(parent.fd, from, parent.fd, to) < 0
+    symbols.renameat(parent.fd, cString(from), parent.fd, cString(to)) < 0
   ) {
     throw new Error(`descriptor-relative rename failed: ${from} -> ${to}`);
   }
@@ -686,7 +693,7 @@ function linkChildAt(parent: AnchoredParent, from: string, to: string): void {
   }
   const symbols = getNativeAtSymbols();
   if (
-    symbols.linkat(parent.fd, from, parent.fd, to, 0) < 0
+    symbols.linkat(parent.fd, cString(from), parent.fd, cString(to), 0) < 0
   ) {
     throw new Error(`descriptor-relative no-replace publish failed: ${to}`);
   }
@@ -697,7 +704,7 @@ function unlinkChildAt(parent: AnchoredParent, name: string): void {
     unlinkSync(anchoredChildPath(parent, name));
     return;
   }
-  if (getNativeAtSymbols().unlinkat(parent.fd, name, 0) < 0) {
+  if (getNativeAtSymbols().unlinkat(parent.fd, cString(name), 0) < 0) {
     throw new Error(`descriptor-relative unlink failed: ${name}`);
   }
 }
