@@ -28,6 +28,7 @@ import {
 import { loadOperatorLiterals } from '../core/content-sanity-literals.ts';
 import { loadConfig, loadConfigWithEngine, gbrainPath } from '../core/config.ts';
 import type { BrainEngine } from '../core/engine.ts';
+import { withFilePageLock } from '../core/page-lock.ts';
 
 export interface LintIssue {
   file: string;
@@ -462,21 +463,28 @@ export async function runLintCore(opts: LintOpts): Promise<LintResult> {
       if (isAborted(opts.signal)) break;
       await new Promise<void>((resolve) => setImmediate(resolve));
     }
-    const content = readFileSync(page, 'utf-8');
-    const issues = lintContent(content, isSingleFile ? page : relative(opts.target, page), lintOpts);
-    if (issues.length === 0) continue;
-    pagesWithIssues++;
-    totalIssues += issues.length;
+    const inspect = async (): Promise<void> => {
+      const content = readFileSync(page, 'utf-8');
+      const issues = lintContent(content, isSingleFile ? page : relative(opts.target, page), lintOpts);
+      if (issues.length === 0) return;
+      pagesWithIssues++;
+      totalIssues += issues.length;
 
-    if (opts.fix && issues.some(i => i.fixable)) {
-      const fixed = fixContent(content);
-      if (fixed !== content) {
-        const fixCount = issues.filter(i => i.fixable).length;
-        totalFixed += fixCount;
-        if (!opts.dryRun) {
-          writeFileSync(page, fixed);
+      if (opts.fix && issues.some(i => i.fixable)) {
+        const fixed = fixContent(content);
+        if (fixed !== content) {
+          const fixCount = issues.filter(i => i.fixable).length;
+          totalFixed += fixCount;
+          if (!opts.dryRun) {
+            writeFileSync(page, fixed);
+          }
         }
       }
+    };
+    if (opts.fix && !opts.dryRun) {
+      await withFilePageLock(page, inspect, { timeoutMs: 5_000 });
+    } else {
+      await inspect();
     }
   }
 
@@ -527,27 +535,34 @@ export async function runLint(args: string[]) {
   const lintContentOpts: LintContentOpts = { contentSanity };
 
   for (const page of pages) {
-    const content = readFileSync(page, 'utf-8');
-    const relPath = isSingleFile ? page : relative(target, page);
-    const issues = lintContent(content, relPath, lintContentOpts);
-    progress.tick(1);
-    if (issues.length === 0) continue;
+    const inspect = async (): Promise<void> => {
+      const content = readFileSync(page, 'utf-8');
+      const relPath = isSingleFile ? page : relative(target, page);
+      const issues = lintContent(content, relPath, lintContentOpts);
+      progress.tick(1);
+      if (issues.length === 0) return;
 
-    console.log(`\n${relPath}:`);
-    for (const issue of issues) {
-      const fixLabel = issue.fixable ? ' [fixable]' : '';
-      console.log(`  L${issue.line} ${issue.rule}: ${issue.message}${fixLabel}`);
-    }
-
-    if (doFix && issues.some(i => i.fixable)) {
-      const fixed = fixContent(content);
-      if (fixed !== content) {
-        const fixCount = issues.filter(i => i.fixable).length;
-        if (!dryRun) {
-          writeFileSync(page, fixed);
-        }
-        console.log(`  ${dryRun ? '(dry run) ' : ''}Fixed ${fixCount} issue(s)`);
+      console.log(`\n${relPath}:`);
+      for (const issue of issues) {
+        const fixLabel = issue.fixable ? ' [fixable]' : '';
+        console.log(`  L${issue.line} ${issue.rule}: ${issue.message}${fixLabel}`);
       }
+
+      if (doFix && issues.some(i => i.fixable)) {
+        const fixed = fixContent(content);
+        if (fixed !== content) {
+          const fixCount = issues.filter(i => i.fixable).length;
+          if (!dryRun) {
+            writeFileSync(page, fixed);
+          }
+          console.log(`  ${dryRun ? '(dry run) ' : ''}Fixed ${fixCount} issue(s)`);
+        }
+      }
+    };
+    if (doFix && !dryRun) {
+      await withFilePageLock(page, inspect, { timeoutMs: 5_000 });
+    } else {
+      await inspect();
     }
   }
 

@@ -134,7 +134,7 @@ describeE2E('E2E: v0.11.0 orchestrator against live Postgres', () => {
     // The runner (apply-migrations.ts) persists the result after the
     // orchestrator returns. A direct orchestrator call in E2E leaves the
     // ledger empty; the runner path is tested separately in
-    // test/apply-migrations.test.ts + test/migration-resume.test.ts.
+    // test/apply-migrations.test.ts + test/migration-resume.serial.test.ts.
     const completed = loadCompletedMigrations();
     const v0110Entries = completed.filter(e => e.version === '0.11.0');
     expect(v0110Entries.length).toBe(0);

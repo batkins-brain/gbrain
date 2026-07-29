@@ -1,9 +1,24 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtempSync, rmSync, existsSync, writeFileSync, readFileSync, utimesSync } from 'node:fs';
+import {
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs';
 import { join, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
-import { acquirePageLock, withPageLock } from '../src/core/page-lock.ts';
+import {
+  acquireFilePageLock,
+  acquirePageLock,
+  filePageLockKey,
+  withPageLock,
+} from '../src/core/page-lock.ts';
 
 let tmp: string;
 
@@ -27,7 +42,7 @@ describe('acquirePageLock', () => {
     expect(lock!.slug).toBe('people/alice');
     expect(existsSync(lockFile('people/alice'))).toBe(true);
     await lock!.release();
-    expect(existsSync(lockFile('people/alice'))).toBe(false);
+    expect(existsSync(lockFile('people/alice'))).toBe(true);
   });
 
   test('returns null when a live holder exists (timeoutMs=0)', async () => {
@@ -38,7 +53,7 @@ describe('acquirePageLock', () => {
     await first!.release();
   });
 
-  test('reclaims stale lock (mtime > 5 min)', async () => {
+  test('acquires an unlocked persistent file regardless of stale metadata', async () => {
     const slug = 'meetings/2026-04-29';
     // Write a fake stale lock with a non-existent PID.
     const path = lockFile(slug);
@@ -50,13 +65,26 @@ describe('acquirePageLock', () => {
 
     const lock = await acquirePageLock(slug, { lockRoot: tmp });
     expect(lock).not.toBeNull();
-    // We replaced the stale content with our own pid + fresh timestamp.
+    // Kernel lock state, not stale PID text, is authoritative.
     const content = readFileSync(path, 'utf-8').trim();
     expect(content.split('\n')[0]).toBe(String(process.pid));
     await lock!.release();
   });
 
-  test('reclaims lock when holder PID is no longer alive', async () => {
+  test('never steals an old lock from a live holder', async () => {
+    const slug = 'people/live-long-operation';
+    const first = await acquirePageLock(slug, { lockRoot: tmp });
+    expect(first).not.toBeNull();
+    const tenMinAgo = new Date(Date.now() - 10 * 60 * 1000);
+    utimesSync(lockFile(slug), tenMinAgo, tenMinAgo);
+
+    const second = await acquirePageLock(slug, { lockRoot: tmp });
+
+    expect(second).toBeNull();
+    await first!.release();
+  });
+
+  test('acquires an unlocked file even when its prior PID is no longer alive', async () => {
     const slug = 'people/charlie';
     const path = lockFile(slug);
     require('node:fs').mkdirSync(tmp, { recursive: true });
@@ -71,17 +99,21 @@ describe('acquirePageLock', () => {
     const lock = await acquirePageLock('test/refresh', { lockRoot: tmp });
     expect(lock).not.toBeNull();
     const path = lockFile('test/refresh');
-    const t1 = readFileSync(path, 'utf-8');
+    const content = readFileSync(path, 'utf-8').trim().split('\n');
+    const t1 = statSync(path).mtimeMs;
     await new Promise(r => setTimeout(r, 50));
     await lock!.refresh();
-    const t2 = readFileSync(path, 'utf-8');
-    // Same pid, different timestamp.
-    expect(t1.split('\n')[0]).toBe(t2.split('\n')[0]);
-    expect(t1).not.toBe(t2);
+    const t2 = statSync(path).mtimeMs;
+    const refreshed = readFileSync(path, 'utf-8').trim().split('\n');
+    // Holder PID/token remain stable; diagnostic timestamp + mtime change.
+    expect(refreshed[0]).toBe(content[0]);
+    expect(refreshed[1]).not.toBe(content[1]);
+    expect(refreshed[2]).toBe(content[2]);
+    expect(t2).toBeGreaterThan(t1);
     await lock!.release();
   });
 
-  test('release() does not delete a lock held by a different pid', async () => {
+  test('diagnostic metadata changes do not affect kernel-owned release', async () => {
     const slug = 'test/foreign-release';
     const path = lockFile(slug);
     require('node:fs').mkdirSync(tmp, { recursive: true });
@@ -91,9 +123,23 @@ describe('acquirePageLock', () => {
     expect(lock).not.toBeNull();
     // Manually rewrite with a foreign pid.
     writeFileSync(path, `888888888\n${new Date().toISOString()}\n`);
-    // Release should be a no-op (different pid).
+    // The diagnostic text is not the lock authority. Release unlocks our fd
+    // and leaves the persistent inode in place.
     await lock!.release();
     expect(existsSync(path)).toBe(true);
+  });
+
+  test('release leaves the persistent inode and its latest diagnostic text', async () => {
+    const slug = 'test/same-pid-replacement';
+    const path = lockFile(slug);
+    const lock = await acquirePageLock(slug, { lockRoot: tmp });
+    expect(lock).not.toBeNull();
+    writeFileSync(path, `${process.pid}\n${new Date().toISOString()}\nreplacement-token\n`);
+
+    await lock!.release();
+
+    expect(existsSync(path)).toBe(true);
+    expect(readFileSync(path, 'utf-8')).toContain('replacement-token');
   });
 });
 
@@ -105,7 +151,7 @@ describe('withPageLock', () => {
       expect(existsSync(lockFile('synthesis/test'))).toBe(true);
     }, { lockRoot: tmp, timeoutMs: 5000 });
     expect(ran).toBe(true);
-    expect(existsSync(lockFile('synthesis/test'))).toBe(false);
+    expect(existsSync(lockFile('synthesis/test'))).toBe(true);
   });
 
   test('releases lock even when callback throws', async () => {
@@ -114,7 +160,7 @@ describe('withPageLock', () => {
         throw new Error('boom');
       }, { lockRoot: tmp, timeoutMs: 5000 }),
     ).rejects.toThrow('boom');
-    expect(existsSync(lockFile('synthesis/throws'))).toBe(false);
+    expect(existsSync(lockFile('synthesis/throws'))).toBe(true);
   });
 
   test('throws when timeout elapses with a live holder', async () => {
@@ -127,6 +173,28 @@ describe('withPageLock', () => {
       }),
     ).rejects.toThrow();
     await first!.release();
+  });
+});
+
+describe('file-path lock identity', () => {
+  test('canonicalizes symlink aliases for existing and not-yet-created pages', async () => {
+    const root = join(tmp, 'brain');
+    const alias = join(tmp, 'brain-alias');
+    const lockRoot = join(tmp, 'locks');
+    mkdirSync(join(root, 'people'), { recursive: true });
+    writeFileSync(join(root, 'people', 'alice.md'), 'alice\n');
+    symlinkSync(root, alias);
+
+    expect(filePageLockKey(join(alias, 'people', 'alice.md')))
+      .toBe(filePageLockKey(join(root, 'people', 'alice.md')));
+    expect(filePageLockKey(join(alias, 'topics', 'new.md')))
+      .toBe(filePageLockKey(join(root, 'topics', 'new.md')));
+
+    const holder = await acquireFilePageLock(join(alias, 'people', 'alice.md'), { lockRoot });
+    expect(holder).not.toBeNull();
+    const contender = await acquireFilePageLock(join(root, 'people', 'alice.md'), { lockRoot });
+    expect(contender).toBeNull();
+    await holder!.release();
   });
 });
 

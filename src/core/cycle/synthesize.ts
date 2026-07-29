@@ -43,6 +43,7 @@ import { serializeMarkdown, serializePageToMarkdown } from '../markdown.ts';
 import type { Page, PageType } from '../types.ts';
 import { validateSourceId } from '../utils.ts';
 import { safeSplitIndex } from '../text-safe.ts';
+import { withFilePageLock } from '../page-lock.ts';
 
 // Slug regex from validatePageSlug — kept in sync.
 // Used for the orchestrator-written summary index slug.
@@ -1090,8 +1091,10 @@ async function reverseWriteRefs(
       const filePath = source_id === 'default'
         ? join(brainDir, `${slug}.md`)
         : join(brainDir, '.sources', source_id, `${slug}.md`);
-      mkdirSync(dirname(filePath), { recursive: true });
-      writeFileSync(filePath, md, 'utf8');
+      await withFilePageLock(filePath, async () => {
+        mkdirSync(dirname(filePath), { recursive: true });
+        writeFileSync(filePath, md, 'utf8');
+      }, { timeoutMs: 5_000 });
       count++;
     } catch (e) {
       // Per-slug failures are non-fatal — phase continues.
@@ -1182,8 +1185,10 @@ async function writeSummaryPage(
   // Also write to disk (orchestrator dual-write).
   try {
     const filePath = join(brainDir, `${summarySlug}.md`);
-    mkdirSync(dirname(filePath), { recursive: true });
-    writeFileSync(filePath, fullMarkdown, 'utf8');
+    await withFilePageLock(filePath, async () => {
+      mkdirSync(dirname(filePath), { recursive: true });
+      writeFileSync(filePath, fullMarkdown, 'utf8');
+    }, { timeoutMs: 5_000 });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     process.stderr.write(`[dream] summary file-write failed: ${msg}\n`);

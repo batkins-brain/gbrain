@@ -27,6 +27,7 @@ import { randomBytes } from 'crypto';
 import type { BrainEngine } from './engine.ts';
 import { serializePageToMarkdown, resolvePageFilePath } from './markdown.ts';
 import { isWriteTargetContained } from './path-confine.ts';
+import { withFilePageLock } from './page-lock.ts';
 
 /** Minimal logger surface — structurally compatible with operations.ts `Logger`. */
 export interface WriteThroughLogger {
@@ -128,36 +129,37 @@ export async function writePageThrough(
       return { written: false, skipped: 'path_escapes_source_root' };
     }
 
-    const writtenPage = await engine.getPage(slug, { sourceId });
-    if (!writtenPage) {
-      return { written: false, skipped: 'page_not_found_after_write' };
-    }
-
-    const tags = await engine.getTags(slug, { sourceId });
-    const md = serializePageToMarkdown(writtenPage, tags, {
-      frontmatterOverrides: opts.frontmatterOverrides,
-    });
-
-    mkdirSync(dirname(filePath), { recursive: true });
-
-    // Atomic write: unique temp sibling + rename. Unique name (pid + random)
-    // so two concurrent saves to the same target can't clobber each other's
-    // temp file. Clean up the temp on any failure so we never leak a stray
-    // `.tmp` next to the real file.
-    const tmpPath = `${filePath}.tmp.${process.pid}.${randomBytes(4).toString('hex')}`;
-    try {
-      writeFileSync(tmpPath, md, 'utf8');
-      renameSync(tmpPath, filePath);
-    } catch (writeErr) {
-      try {
-        if (existsSync(tmpPath)) unlinkSync(tmpPath);
-      } catch {
-        // best-effort cleanup; surface the original write error below
+    return await withFilePageLock(filePath, async () => {
+      const writtenPage = await engine.getPage(slug, { sourceId });
+      if (!writtenPage) {
+        return { written: false, skipped: 'page_not_found_after_write' };
       }
-      throw writeErr;
-    }
 
-    return { written: true, path: filePath };
+      const tags = await engine.getTags(slug, { sourceId });
+      const md = serializePageToMarkdown(writtenPage, tags, {
+        frontmatterOverrides: opts.frontmatterOverrides,
+      });
+
+      mkdirSync(dirname(filePath), { recursive: true });
+
+      // Atomic write: unique temp sibling + rename. The page lock is held
+      // across render + publication so migration optimistic comparisons and
+      // ordinary write-through cannot race.
+      const tmpPath = `${filePath}.tmp.${process.pid}.${randomBytes(4).toString('hex')}`;
+      try {
+        writeFileSync(tmpPath, md, 'utf8');
+        renameSync(tmpPath, filePath);
+      } catch (writeErr) {
+        try {
+          if (existsSync(tmpPath)) unlinkSync(tmpPath);
+        } catch {
+          // best-effort cleanup; surface the original write error below
+        }
+        throw writeErr;
+      }
+
+      return { written: true, path: filePath };
+    }, { timeoutMs: 5_000 });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     opts.logger?.warn(`[write-through] failed for ${slug}: ${msg}`);

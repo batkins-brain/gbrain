@@ -7,10 +7,23 @@
  */
 
 import { describe, test, expect } from 'bun:test';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { __testing } from '../src/commands/apply-migrations.ts';
 import type { CompletedMigrationEntry } from '../src/core/preferences.ts';
+import type { Migration } from '../src/commands/migrations/types.ts';
+import { v0_16_0 } from '../src/commands/migrations/v0_16_0.ts';
+import { v0_18_0 } from '../src/commands/migrations/v0_18_0.ts';
+import { withEnv } from './helpers/with-env.ts';
 
-const { parseArgs, indexCompleted, buildPlan, statusForVersion } = __testing;
+const {
+  parseArgs,
+  indexCompleted,
+  buildPlan,
+  statusForVersion,
+  executeDryRunPlan,
+} = __testing;
 
 describe('parseArgs', () => {
   test('default flags', () => {
@@ -176,7 +189,100 @@ describe('runApplyMigrations exit codes (v0.36.1.x #1062)', () => {
     const { readFileSync } = await import('fs');
     const src = readFileSync('src/commands/apply-migrations.ts', 'utf8');
     expect(src).toMatch(/cli\.list\s*\)\s*\{\s*printList\(plan,\s*installed\);\s*process\.exit\(0\);/);
-    expect(src).toMatch(/cli\.dryRun\s*\)\s*\{\s*printDryRun\(plan,\s*installed\);\s*process\.exit\(0\);/);
+    expect(src).toMatch(/cli\.dryRun[\s\S]{0,180}await executeDryRunPlan\(plan,\s*cli\);[\s\S]{0,80}process\.exit\(0\);/);
     expect(src).toMatch(/All migrations up to date[\s\S]{0,80}process\.exit\(0\)/);
+  });
+});
+
+describe('executeDryRunPlan', () => {
+  test('executes pending orchestrators in dry-run mode and renders exact target manifests', async () => {
+    const observed: Array<{ dryRun: boolean; yes: boolean }> = [];
+    const migration: Migration = {
+      version: '0.32.2',
+      featurePitch: { headline: 'Fence legacy facts' },
+      orchestrator: async opts => {
+        observed.push({ dryRun: opts.dryRun, yes: opts.yes });
+        return {
+          version: '0.32.2',
+          status: 'complete',
+          phases: [{ name: 'fence_facts', status: 'skipped', detail: 'dry-run' }],
+          target_manifest: {
+            version: '0.32.2',
+            targets: [{
+              source_id: 'default',
+              target_markdown_slug: 'people/alice',
+              fact_ids: ['41'],
+            }],
+          },
+        } as Awaited<ReturnType<Migration['orchestrator']>>;
+      },
+    };
+    const plan = {
+      applied: [],
+      partial: [],
+      pending: [migration],
+      skippedFuture: [],
+      wedged: [],
+    };
+    const output: string[] = [];
+
+    const results = await executeDryRunPlan(
+      plan,
+      parseArgs(['--dry-run']),
+      line => output.push(line),
+    );
+
+    expect(observed).toEqual([{ dryRun: true, yes: false }]);
+    expect(results).toHaveLength(1);
+    expect(output.join('\n')).toContain('"target_markdown_slug": "people/alice"');
+    expect(output.join('\n')).toContain('"fact_ids": [');
+  });
+
+  test('does not invoke applied or future orchestrators', async () => {
+    let calls = 0;
+    const migration: Migration = {
+      version: '0.32.2',
+      featurePitch: { headline: 'Must not run' },
+      orchestrator: async () => {
+        calls += 1;
+        return { version: '0.32.2', status: 'complete', phases: [] };
+      },
+    };
+    await executeDryRunPlan(
+      {
+        applied: [migration],
+        partial: [],
+        pending: [],
+        skippedFuture: [migration],
+        wedged: [],
+      },
+      parseArgs(['--dry-run']),
+      () => {},
+    );
+    expect(calls).toBe(0);
+  });
+
+  test('legacy pending orchestrators do not write completion ledger during dry-run', async () => {
+    const isolatedHome = mkdtempSync(join(tmpdir(), 'apply-migrations-dry-run-'));
+    try {
+      await withEnv({ GBRAIN_HOME: isolatedHome }, async () => {
+        await executeDryRunPlan(
+          {
+            applied: [],
+            partial: [],
+            pending: [v0_16_0, v0_18_0],
+            skippedFuture: [],
+            wedged: [],
+          },
+          parseArgs(['--dry-run']),
+          () => {},
+        );
+        expect(
+          existsSync(join(isolatedHome, '.gbrain', 'migrations', 'completed.jsonl')),
+        ).toBe(false);
+      });
+    } finally {
+      rmSync(isolatedHome, { recursive: true, force: true });
+    }
   });
 });

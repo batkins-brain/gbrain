@@ -11,13 +11,31 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
-import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { execFileSync } from 'node:child_process';
 
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
-import { v0_32_2, __setTestEngineOverride, __testing } from '../src/commands/migrations/v0_32_2.ts';
+import {
+  v0_32_2,
+  __setTestEngineOverride,
+  __setTestPageLockRoot,
+  __testing,
+} from '../src/commands/migrations/v0_32_2.ts';
 import { parseFactsFence } from '../src/core/facts-fence.ts';
+import { acquireFilePageLock } from '../src/core/page-lock.ts';
+import { withEnv } from './helpers/with-env.ts';
 
 let engine: PGLiteEngine;
 let brainDir: string;
@@ -31,11 +49,16 @@ beforeAll(async () => {
 
 afterAll(async () => {
   __setTestEngineOverride(null);
+  __setTestPageLockRoot(undefined);
   await engine.disconnect();
 });
 
 beforeEach(async () => {
   brainDir = mkdtempSync(join(tmpdir(), 'mig-v0_32_2-test-'));
+  // Migration refuses group/world-writable source dirs. mkdtemp is usually
+  // 0700, but pin it so umask drift cannot turn the fixture into a false fail.
+  chmodSync(brainDir, 0o700);
+  __setTestPageLockRoot(join(brainDir, '.migration-page-locks'));
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   await (engine as any).db.query('DELETE FROM facts');
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -54,22 +77,70 @@ async function seedLegacyFact(input: {
   source_id?: string;
   visibility?: 'private' | 'world';
   notability?: 'high' | 'medium' | 'low';
+  kind?: 'event' | 'preference' | 'commitment' | 'belief' | 'fact';
+  source?: string;
+  confidence?: number;
+  context?: string | null;
+  valid_from?: string;
+  valid_until?: string | null;
 }): Promise<number> {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const r = await (engine as any).db.query(
     `INSERT INTO facts (source_id, entity_slug, fact, kind, visibility, notability,
-                        valid_from, source, confidence)
-     VALUES ($1, $2, $3, 'fact', $4, $5, now(), 'mcp:put_page', 1.0)
+                        valid_from, valid_until, source, confidence, context)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
      RETURNING id`,
     [
       input.source_id ?? 'default',
       input.entity_slug,
       input.fact,
+      input.kind ?? 'fact',
       input.visibility ?? 'private',
       input.notability ?? 'medium',
+      input.valid_from ?? '2026-07-29',
+      input.valid_until ?? null,
+      input.source ?? 'mcp:put_page',
+      input.confidence ?? 1.0,
+      input.context ?? null,
     ],
   );
   return r.rows[0].id;
+}
+
+function ensureOwnerOnlyDirs(filePath: string): void {
+  // Walk parents under brainDir and clear group/world write bits. Default
+  // mkdirSync honors umask (often 0002 → 0775), which the migration correctly
+  // rejects as an untrusted source directory.
+  let current = dirname(filePath);
+  const root = brainDir.endsWith('/') ? brainDir.slice(0, -1) : brainDir;
+  while (current.startsWith(root)) {
+    try {
+      chmodSync(current, 0o700);
+    } catch {
+      // Directory may not exist yet; mkdir below creates it.
+    }
+    if (current === root) break;
+    const parent = dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+}
+
+function mkdirOwnerOnly(dirPath: string): void {
+  mkdirSync(dirPath, { recursive: true, mode: 0o700 });
+  // recursive mkdir still applies umask to each created component.
+  ensureOwnerOnlyDirs(join(dirPath, '.keep'));
+}
+
+function writeEntityPage(slug: string): void {
+  const path = join(brainDir, `${slug}.md`);
+  mkdirOwnerOnly(dirname(path));
+  const title = slug.split('/').at(-1) ?? slug;
+  writeFileSync(
+    path,
+    `---\ntype: concept\ntitle: ${title}\nslug: ${slug}\n---\n\n# ${title}\n`,
+    { encoding: 'utf-8', mode: 0o600 },
+  );
 }
 
 describe('phaseASchema', () => {
@@ -101,8 +172,11 @@ describe('phaseBFenceFacts — dry-run reporting', () => {
     const r = await __testing.phaseBFenceFacts(engine, DRY_OPTS);
     expect(r.status).toBe('skipped');
     expect(r.detail).toContain('dry-run');
-    expect(r.detail).toContain('would fence 2 rows');  // 3 total - 1 unparented
-    expect(r.detail).toContain('1 unfenceable');
+    expect(r.detail).toContain('would_fence=2');
+    expect(r.detail).toContain('targets=2');
+    expect(r.detail).toContain('would_create=2');
+    expect(r.detail).toContain('quarantine=2');
+    expect(r.detail).toContain('unfenceable=1');
 
     // No files created.
     expect(existsSync(join(brainDir, 'people/alice.md'))).toBe(false);
@@ -117,15 +191,16 @@ describe('phaseBFenceFacts — dry-run reporting', () => {
 
 describe('phaseBFenceFacts — happy path backfill', () => {
   test('fences legacy DB rows into entity pages + updates row_num', async () => {
+    writeEntityPage('people/alice');
     const id1 = await seedLegacyFact({ entity_slug: 'people/alice', fact: 'Founded Acme in 2017' });
     const id2 = await seedLegacyFact({ entity_slug: 'people/alice', fact: 'Prefers async over meetings' });
 
     const r = await __testing.phaseBFenceFacts(engine, OPTS);
-    expect(r.status).toBe('complete');
+    expect(r).toMatchObject({ status: 'complete' });
     expect(r.detail).toContain('fenced=2');
     expect(r.detail).toContain('pages=1');
 
-    // Stub-page exists with fence content.
+    // Existing page is preserved and receives fence content.
     const filePath = join(brainDir, 'people/alice.md');
     expect(existsSync(filePath)).toBe(true);
     const body = readFileSync(filePath, 'utf-8');
@@ -143,6 +218,9 @@ describe('phaseBFenceFacts — happy path backfill', () => {
   });
 
   test('groups by entity page — multi-entity batch touches multiple files', async () => {
+    writeEntityPage('people/alice');
+    writeEntityPage('companies/acme');
+    writeEntityPage('deals/seed');
     await seedLegacyFact({ entity_slug: 'people/alice', fact: 'A1' });
     await seedLegacyFact({ entity_slug: 'companies/acme', fact: 'C1' });
     await seedLegacyFact({ entity_slug: 'deals/seed', fact: 'D1' });
@@ -158,7 +236,7 @@ describe('phaseBFenceFacts — happy path backfill', () => {
   });
 
   test('appends to existing entity page without overwriting body', async () => {
-    mkdirSync(join(brainDir, 'people'), { recursive: true });
+    mkdirOwnerOnly(join(brainDir, 'people'));
     writeFileSync(
       join(brainDir, 'people/alice.md'),
       '---\ntype: person\ntitle: Alice\nslug: people/alice\n---\n\n# Alice\n\nNotes about Alice.\n',
@@ -175,6 +253,7 @@ describe('phaseBFenceFacts — happy path backfill', () => {
   });
 
   test('idempotent: re-running after partial completion does NOT duplicate rows', async () => {
+    writeEntityPage('people/alice');
     await seedLegacyFact({ entity_slug: 'people/alice', fact: 'First' });
     await seedLegacyFact({ entity_slug: 'people/alice', fact: 'Second' });
 
@@ -204,7 +283,77 @@ describe('phaseBFenceFacts — happy path backfill', () => {
     expect(rows.rows.map((r: { row_num: number }) => r.row_num)).toEqual([1, 2]);
   });
 
+  test('preserves duplicate claims as distinct rows when metadata differs', async () => {
+    writeEntityPage('people/alice');
+    const privateId = await seedLegacyFact({
+      entity_slug: 'people/alice',
+      fact: 'Shared claim',
+      visibility: 'private',
+      confidence: 0.75,
+    });
+    const worldId = await seedLegacyFact({
+      entity_slug: 'people/alice',
+      fact: 'Shared claim',
+      visibility: 'world',
+      confidence: 0.9,
+    });
+
+    const result = await __testing.phaseBFenceFacts(engine, OPTS);
+    expect(result.status).toBe('complete');
+    const parsed = parseFactsFence(readFileSync(join(brainDir, 'people/alice.md'), 'utf-8'));
+    expect(parsed.facts).toHaveLength(2);
+    expect(parsed.facts.map(f => f.visibility)).toEqual(['private', 'world']);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const rows = await (engine as any).db.query(
+      'SELECT id, row_num FROM facts ORDER BY id',
+    );
+    expect(rows.rows).toEqual([
+      { id: privateId, row_num: 1 },
+      { id: worldId, row_num: 2 },
+    ]);
+  });
+
+  test('partial recovery consumes identical duplicate fence rows one-to-one', async () => {
+    writeEntityPage('people/alice');
+    const firstId = await seedLegacyFact({
+      entity_slug: 'people/alice',
+      fact: 'Exact duplicate',
+    });
+    const secondId = await seedLegacyFact({
+      entity_slug: 'people/alice',
+      fact: 'Exact duplicate',
+    });
+    await __testing.phaseBFenceFacts(engine, OPTS);
+
+    // Simulate a crash after the fence was published and after only the first
+    // DB row was stamped.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (engine as any).db.query(
+      `UPDATE facts SET row_num = NULL, source_markdown_slug = NULL WHERE id = $1`,
+      [secondId],
+    );
+
+    const result = await __testing.phaseBFenceFacts(engine, OPTS);
+    expect(result.status).toBe('complete');
+    const parsed = parseFactsFence(readFileSync(join(brainDir, 'people/alice.md'), 'utf-8'));
+    expect(parsed.facts.map(f => [f.rowNum, f.claim])).toEqual([
+      [1, 'Exact duplicate'],
+      [2, 'Exact duplicate'],
+    ]);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const rows = await (engine as any).db.query(
+      'SELECT id, row_num FROM facts ORDER BY id',
+    );
+    expect(rows.rows).toEqual([
+      { id: firstId, row_num: 1 },
+      { id: secondId, row_num: 2 },
+    ]);
+  });
+
   test('skips facts with NULL entity_slug (unfenceable)', async () => {
+    writeEntityPage('people/alice');
     await seedLegacyFact({ entity_slug: 'people/alice', fact: 'Fenceable' });
     await seedLegacyFact({ entity_slug: null, fact: 'Unfenceable' });
 
@@ -236,10 +385,447 @@ describe('phaseBFenceFacts — happy path backfill', () => {
     const rows = await (engine as any).db.query('SELECT row_num FROM facts');
     expect(rows.rows[0].row_num).toBeNull();
   });
+
+  test('routes a missing legacy target into deterministic private quarantine', async () => {
+    const id = await seedLegacyFact({
+      entity_slug: 'flattened-private-identifier',
+      fact: 'Preserve this legacy claim',
+    });
+
+    const { manifest } = await __testing.buildTargetPlan(engine);
+    expect(manifest).toMatchObject({
+      legacy_rows: 1,
+      target_count: 1,
+      would_create_count: 1,
+      quarantine_count: 1,
+    });
+    const target = manifest.targets[0];
+    expect(target.disposition).toBe('quarantine');
+    expect(target.reason).toBe('missing_target');
+    expect(target.target_markdown_slug).toMatch(/^quarantine\/migrations\/v0-32-2\/[0-9a-f]{16}$/);
+    expect(target.target_markdown_slug).not.toContain('private');
+    expect(target.fact_ids).toEqual([String(id)]);
+
+    const r = await __testing.phaseBFenceFacts(engine, OPTS);
+    expect(r.status).toBe('complete');
+    expect(existsSync(join(brainDir, 'flattened-private-identifier.md'))).toBe(false);
+    const quarantinePath = join(brainDir, `${target.target_markdown_slug}.md`);
+    expect(existsSync(quarantinePath)).toBe(true);
+    expect(readFileSync(quarantinePath, 'utf-8')).toContain('visibility: private');
+    expect(readFileSync(quarantinePath, 'utf-8')).toContain(
+      'gbrain_migration_owner: v0.32.2',
+    );
+    expect(readFileSync(quarantinePath, 'utf-8')).toContain(
+      `gbrain_migration_target_sha256: ${
+        __testing.migrationTargetFingerprint('default', 'flattened-private-identifier')
+      }`,
+    );
+    expect(readFileSync(quarantinePath, 'utf-8')).toContain('Preserve this legacy claim');
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const rows = await (engine as any).db.query(
+      'SELECT entity_slug, source_markdown_slug, row_num FROM facts WHERE id = $1',
+      [id],
+    );
+    expect(rows.rows[0]).toMatchObject({
+      entity_slug: 'flattened-private-identifier',
+      source_markdown_slug: target.target_markdown_slug,
+      row_num: 1,
+    });
+  });
+
+  test('does not follow an existing target symlink outside the local source', async () => {
+    const outsideDir = mkdtempSync(join(tmpdir(), 'mig-v0_32_2-outside-'));
+    const outsidePath = join(outsideDir, 'private.md');
+    writeFileSync(outsidePath, 'EXTERNAL PRIVATE CONTENT\n', 'utf-8');
+    mkdirSync(join(brainDir, 'people'), { recursive: true });
+    chmodSync(join(brainDir, 'people'), 0o700);
+    symlinkSync(outsidePath, join(brainDir, 'people/alice.md'));
+
+    try {
+      await seedLegacyFact({
+        entity_slug: 'people/alice',
+        fact: 'Preserve only this legacy claim',
+      });
+
+      const { manifest } = await __testing.buildTargetPlan(engine);
+      expect(manifest.targets[0]).toMatchObject({
+        original_entity_slug: 'people/alice',
+        disposition: 'quarantine',
+        reason: 'unsafe_target',
+      });
+
+      const r = await __testing.phaseBFenceFacts(engine, OPTS);
+      expect(r.status).toBe('complete');
+      expect(readFileSync(outsidePath, 'utf-8')).toBe('EXTERNAL PRIVATE CONTENT\n');
+
+      const quarantinePath = join(
+        brainDir,
+        `${manifest.targets[0].target_markdown_slug}.md`,
+      );
+      const quarantined = readFileSync(quarantinePath, 'utf-8');
+      expect(quarantined).toContain('Preserve only this legacy claim');
+      expect(quarantined).not.toContain('EXTERNAL PRIVATE CONTENT');
+    } finally {
+      rmSync(outsideDir, { recursive: true, force: true });
+    }
+  });
+
+  test('does not follow an intermediate directory symlink outside the local source', async () => {
+    const outsideDir = mkdtempSync(join(tmpdir(), 'mig-v0_32_2-outside-dir-'));
+    const outsidePath = join(outsideDir, 'alice.md');
+    writeFileSync(outsidePath, 'EXTERNAL PRIVATE CONTENT\n', 'utf-8');
+    symlinkSync(outsideDir, join(brainDir, 'people'));
+
+    try {
+      await seedLegacyFact({
+        entity_slug: 'people/alice',
+        fact: 'Preserve only this legacy claim',
+      });
+
+      const { manifest } = await __testing.buildTargetPlan(engine);
+      expect(manifest.targets[0]).toMatchObject({
+        original_entity_slug: 'people/alice',
+        disposition: 'quarantine',
+        reason: 'unsafe_target',
+      });
+
+      const r = await __testing.phaseBFenceFacts(engine, OPTS);
+      expect(r.status).toBe('complete');
+      expect(readFileSync(outsidePath, 'utf-8')).toBe('EXTERNAL PRIVATE CONTENT\n');
+
+      const quarantinePath = join(
+        brainDir,
+        `${manifest.targets[0].target_markdown_slug}.md`,
+      );
+      const quarantined = readFileSync(quarantinePath, 'utf-8');
+      expect(quarantined).toContain('Preserve only this legacy claim');
+      expect(quarantined).not.toContain('EXTERNAL PRIVATE CONTENT');
+    } finally {
+      rmSync(outsideDir, { recursive: true, force: true });
+    }
+  });
+
+  test('rejects an intermediate directory symlink even when it stays inside the source', async () => {
+    const redirectedDir = join(brainDir, 'redirected-people');
+    const redirectedPath = join(redirectedDir, 'alice.md');
+    mkdirOwnerOnly(redirectedDir);
+    writeFileSync(redirectedPath, 'IN-ROOT UNRELATED CONTENT\n', 'utf-8');
+    symlinkSync(redirectedDir, join(brainDir, 'people'));
+
+    await seedLegacyFact({
+      entity_slug: 'people/alice',
+      fact: 'Preserve only this legacy claim',
+    });
+
+    const { manifest } = await __testing.buildTargetPlan(engine);
+    expect(manifest.targets[0]).toMatchObject({
+      original_entity_slug: 'people/alice',
+      disposition: 'quarantine',
+      reason: 'unsafe_target',
+    });
+
+    const r = await __testing.phaseBFenceFacts(engine, OPTS);
+    expect(r.status).toBe('complete');
+    expect(readFileSync(redirectedPath, 'utf-8')).toBe('IN-ROOT UNRELATED CONTENT\n');
+  });
+
+  test('fails closed when an in-root quarantine directory component is a symlink', async () => {
+    mkdirOwnerOnly(join(brainDir, 'redirected-quarantine'));
+    symlinkSync(join(brainDir, 'redirected-quarantine'), join(brainDir, 'quarantine'));
+    await seedLegacyFact({
+      entity_slug: 'missing-private-identifier',
+      fact: 'Must not be redirected',
+    });
+
+    await expect(__testing.buildTargetPlan(engine)).rejects.toThrow(/quarantine target/);
+    const r = await __testing.phaseBFenceFacts(engine, OPTS);
+    expect(r.status).toBe('failed');
+    expect(existsSync(join(brainDir, 'redirected-quarantine', 'migrations'))).toBe(false);
+  });
+
+  test('fails closed when an out-of-root quarantine directory component is a symlink', async () => {
+    const outsideDir = mkdtempSync(join(tmpdir(), 'mig-v0_32_2-quarantine-outside-'));
+    symlinkSync(outsideDir, join(brainDir, 'quarantine'));
+    try {
+      await seedLegacyFact({
+        entity_slug: 'missing-private-identifier',
+        fact: 'Must not escape',
+      });
+
+      await expect(__testing.buildTargetPlan(engine)).rejects.toThrow(/quarantine target/);
+      const r = await __testing.phaseBFenceFacts(engine, OPTS);
+      expect(r.status).toBe('failed');
+      expect(existsSync(join(outsideDir, 'migrations'))).toBe(false);
+    } finally {
+      rmSync(outsideDir, { recursive: true, force: true });
+    }
+  });
+
+  test('rejects a clean unrelated file at a deterministic quarantine destination', async () => {
+    await seedLegacyFact({
+      entity_slug: 'missing-private-identifier',
+      fact: 'Must not replace unrelated content',
+    });
+    const slug = __testing.quarantineSlug('default', 'missing-private-identifier');
+    const collisionPath = join(brainDir, `${slug}.md`);
+    mkdirOwnerOnly(dirname(collisionPath));
+    writeFileSync(collisionPath, 'UNRELATED CLEAN CONTENT\n');
+    execFileSync('git', ['init', '-q', brainDir]);
+    execFileSync('git', ['-C', brainDir, 'config', 'user.email', 'test@example.com']);
+    execFileSync('git', ['-C', brainDir, 'config', 'user.name', 'test']);
+    execFileSync('git', ['-C', brainDir, 'add', '.']);
+    execFileSync('git', ['-C', brainDir, 'commit', '-qm', 'baseline']);
+
+    await expect(__testing.buildTargetPlan(engine)).rejects.toThrow(
+      /not owned by migration v0\.32\.2/,
+    );
+    const result = await __testing.phaseBFenceFacts(engine, OPTS);
+    expect(result.status).toBe('failed');
+    expect(readFileSync(collisionPath, 'utf-8')).toBe('UNRELATED CLEAN CONTENT\n');
+  });
+
+  test('accepts an owned quarantine destination during partial recovery', async () => {
+    const id = await seedLegacyFact({
+      entity_slug: 'missing-private-identifier',
+      fact: 'Recover this quarantined fact',
+    });
+    const first = await __testing.phaseBFenceFacts(engine, OPTS);
+    expect(first.status).toBe('complete');
+    const slug = __testing.quarantineSlug('default', 'missing-private-identifier');
+    const path = join(brainDir, `${slug}.md`);
+    const before = readFileSync(path, 'utf-8');
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (engine as any).db.query(
+      `UPDATE facts SET row_num = NULL, source_markdown_slug = NULL WHERE id = $1`,
+      [id],
+    );
+    const second = await __testing.phaseBFenceFacts(engine, OPTS);
+    expect(second.status).toBe('complete');
+    expect(readFileSync(path, 'utf-8')).toBe(before);
+  });
+
+  test('never replaces an owned quarantine file with different private content', async () => {
+    const firstId = await seedLegacyFact({
+      entity_slug: 'missing-private-identifier',
+      fact: 'First quarantined fact',
+    });
+    expect((await __testing.phaseBFenceFacts(engine, OPTS)).status).toBe('complete');
+    const slug = __testing.quarantineSlug('default', 'missing-private-identifier');
+    const path = join(brainDir, `${slug}.md`);
+    const published = readFileSync(path, 'utf-8');
+
+    const secondId = await seedLegacyFact({
+      entity_slug: 'missing-private-identifier',
+      fact: 'Later private fact must not replace quarantine',
+    });
+    const second = await __testing.phaseBFenceFacts(engine, OPTS);
+
+    expect(second.status).toBe('failed');
+    expect(second.detail).toContain('quarantine destination is immutable');
+    expect(readFileSync(path, 'utf-8')).toBe(published);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const rows = await (engine as any).db.query(
+      'SELECT id, row_num FROM facts WHERE id IN ($1, $2) ORDER BY id',
+      [firstId, secondId],
+    );
+    expect(rows.rows[0].row_num).not.toBeNull();
+    expect(rows.rows[1].row_num).toBeNull();
+  });
+
+  test('owned temporary writes reject in-root and out-of-root symlinks', () => {
+    const outsideDir = mkdtempSync(join(tmpdir(), 'mig-v0_32_2-tmp-outside-'));
+    const inRootVictim = join(brainDir, 'in-root-victim.md');
+    const outsideVictim = join(outsideDir, 'outside-victim.md');
+    writeFileSync(inRootVictim, 'IN ROOT\n');
+    writeFileSync(outsideVictim, 'OUTSIDE\n');
+    const inRootLink = join(brainDir, 'in-root-link.tmp');
+    const outsideLink = join(brainDir, 'outside-link.tmp');
+    symlinkSync(inRootVictim, inRootLink);
+    symlinkSync(outsideVictim, outsideLink);
+
+    const parent = __testing.openAnchoredParent(brainDir, inRootLink, false);
+    try {
+      expect(() => __testing.writeOwnedTempFileAt(parent, 'in-root-link.tmp', 'overwrite')).toThrow();
+      expect(() => __testing.writeOwnedTempFileAt(parent, 'outside-link.tmp', 'overwrite')).toThrow();
+      expect(readFileSync(inRootVictim, 'utf-8')).toBe('IN ROOT\n');
+      expect(readFileSync(outsideVictim, 'utf-8')).toBe('OUTSIDE\n');
+    } finally {
+      __testing.closeAnchoredParent(parent);
+      rmSync(outsideDir, { recursive: true, force: true });
+    }
+  });
+
+  test('placement validation rejects a descriptor parent moved outside the source before staging', () => {
+    const outsideDir = mkdtempSync(join(tmpdir(), 'mig-v0_32_2-race-outside-'));
+    const peopleDir = join(brainDir, 'people');
+    const movedPeopleDir = join(brainDir, 'people-before-swap');
+    mkdirOwnerOnly(peopleDir);
+    writeFileSync(join(peopleDir, 'alice.md'), 'ORIGINAL\n');
+    writeFileSync(join(outsideDir, 'alice.md'), 'OUTSIDE\n');
+
+    const target = join(peopleDir, 'alice.md');
+    const parent = __testing.openAnchoredParent(brainDir, target, false);
+    try {
+      // Swap the pathname after the trusted directory descriptor is open.
+      renameSync(peopleDir, movedPeopleDir);
+      symlinkSync(outsideDir, peopleDir);
+
+      expect(() => __testing.assertAnchoredParentStillCurrent(parent)).toThrow(
+        /moved outside its anchored source path/,
+      );
+
+      expect(readFileSync(join(outsideDir, 'alice.md'), 'utf-8')).toBe('OUTSIDE\n');
+      expect(readFileSync(join(movedPeopleDir, 'alice.md'), 'utf-8')).toBe('ORIGINAL\n');
+      expect(existsSync(join(movedPeopleDir, '.migration.tmp'))).toBe(false);
+    } finally {
+      __testing.closeAnchoredParent(parent);
+      rmSync(outsideDir, { recursive: true, force: true });
+    }
+  });
+
+  test('supports a stable registered source-root symlink and rejects a root swap', () => {
+    const aliasRoot = `${brainDir}-alias`;
+    const replacementRoot = mkdtempSync(join(tmpdir(), 'mig-v0_32_2-root-swap-'));
+    const peopleDir = join(brainDir, 'people');
+    mkdirOwnerOnly(peopleDir);
+    writeFileSync(join(peopleDir, 'alice.md'), 'ORIGINAL\n');
+    symlinkSync(brainDir, aliasRoot);
+
+    const parent = __testing.openAnchoredParent(
+      aliasRoot,
+      join(aliasRoot, 'people', 'alice.md'),
+      false,
+    );
+    try {
+      expect(() => __testing.assertAnchoredParentStillCurrent(parent)).not.toThrow();
+
+      rmSync(aliasRoot);
+      symlinkSync(replacementRoot, aliasRoot);
+      expect(() => __testing.assertAnchoredParentStillCurrent(parent)).toThrow(
+        /registered source root changed/,
+      );
+    } finally {
+      __testing.closeAnchoredParent(parent);
+      rmSync(aliasRoot, { force: true });
+      rmSync(replacementRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('dirty guard ignores unrelated changes but blocks an exact target path', () => {
+    execFileSync('git', ['init', '-q', brainDir]);
+    writeFileSync(join(brainDir, 'unrelated.md'), 'unrelated\n');
+    expect(__testing.areTargetPathsDirty(brainDir, ['people/alice'])).toBe(false);
+
+    writeEntityPage('people/alice');
+    expect(__testing.areTargetPathsDirty(brainDir, ['people/alice'])).toBe(true);
+  });
+
+  test('dirty guard treats glob-shaped destination names literally', () => {
+    execFileSync('git', ['init', '-q', brainDir]);
+    execFileSync('git', ['-C', brainDir, 'config', 'user.email', 'test@example.com']);
+    execFileSync('git', ['-C', brainDir, 'config', 'user.name', 'test']);
+    writeEntityPage('people/literal*');
+    execFileSync('git', ['-C', brainDir, 'add', '.']);
+    execFileSync('git', ['-C', brainDir, 'commit', '-qm', 'baseline']);
+
+    writeEntityPage('people/literal-other');
+    expect(__testing.areTargetPathsDirty(brainDir, ['people/literal*'])).toBe(false);
+
+    writeFileSync(join(brainDir, 'people', 'literal*.md'), 'changed\n');
+    expect(__testing.areTargetPathsDirty(brainDir, ['people/literal*'])).toBe(true);
+  });
+
+  test('dirty guard treats Git pathspec-magic-shaped destinations literally', () => {
+    execFileSync('git', ['init', '-q', brainDir]);
+    const slug = ':(exclude)people/alice';
+    writeEntityPage(slug);
+    expect(__testing.areTargetPathsDirty(brainDir, [slug])).toBe(true);
+  });
+
+  test('dirty guard fails closed for a corrupt Git worktree', () => {
+    writeFileSync(join(brainDir, '.git'), 'this is not a valid gitdir\n');
+    expect(() => __testing.areTargetPathsDirty(brainDir, ['people/alice'])).toThrow(
+      /could not prove migration source Git state/,
+    );
+  });
+
+  test('dirty guard fails closed for a corrupt linked worktree from a source subdirectory', () => {
+    const repoDir = join(brainDir, 'linked-worktree');
+    const gitDir = join(brainDir, 'linked-gitdir');
+    const sourceDir = join(repoDir, 'brain-source');
+    mkdirSync(sourceDir, { recursive: true });
+    execFileSync('git', ['init', '-q', `--separate-git-dir=${gitDir}`, repoDir]);
+    renameSync(gitDir, `${gitDir}-missing`);
+
+    expect(() => __testing.areTargetPathsDirty(sourceDir, ['people/alice'])).toThrow(
+      /could not prove migration source Git state/,
+    );
+  });
+
+  test('source-root anchor rejects a group/world-writable registered root', () => {
+    const target = join(brainDir, 'people', 'alice.md');
+    mkdirSync(join(brainDir, 'people'), { recursive: true });
+    chmodSync(brainDir, 0o777);
+    try {
+      expect(() => __testing.openAnchoredParent(brainDir, target, false)).toThrow(
+        /source root is group- or world-writable/,
+      );
+    } finally {
+      chmodSync(brainDir, 0o700);
+    }
+  });
+
+  test('source-root anchor rejects a group/world-writable descendant directory', () => {
+    const peopleDir = join(brainDir, 'people');
+    const target = join(peopleDir, 'alice.md');
+    mkdirSync(peopleDir, { recursive: true });
+    chmodSync(peopleDir, 0o777);
+    try {
+      expect(() => __testing.openAnchoredParent(brainDir, target, false)).toThrow(
+        /source directory is group- or world-writable/,
+      );
+    } finally {
+      chmodSync(peopleDir, 0o700);
+    }
+  });
+
+  test('serializes with canonical page writers and preserves the winner before migration publication', async () => {
+    writeEntityPage('people/alice');
+    await seedLegacyFact({ entity_slug: 'people/alice', fact: 'Migrated fact' });
+    const lockRoot = join(brainDir, '.migration-page-locks');
+    const path = join(brainDir, 'people', 'alice.md');
+    const holder = await acquireFilePageLock(path, { lockRoot });
+    expect(holder).not.toBeNull();
+
+    const migration = __testing.phaseBFenceFacts(engine, OPTS);
+    await new Promise(resolvePromise => setTimeout(resolvePromise, 40));
+    writeFileSync(path, `${readFileSync(path, 'utf-8')}\nConcurrent canonical edit.\n`);
+    await holder!.release();
+
+    const result = await migration;
+    expect(result.status).toBe('complete');
+    const published = readFileSync(path, 'utf-8');
+    expect(published).toContain('Concurrent canonical edit.');
+    expect(published).toContain('Migrated fact');
+  });
+
+  test('leaves a pre-existing legacy .md.tmp file untouched', async () => {
+    writeEntityPage('people/alice');
+    const legacyTmp = join(brainDir, 'people', 'alice.md.tmp');
+    writeFileSync(legacyTmp, 'USER DATA\n');
+    await seedLegacyFact({ entity_slug: 'people/alice', fact: 'Fenced safely' });
+
+    const r = await __testing.phaseBFenceFacts(engine, OPTS);
+    expect(r.status).toBe('complete');
+    expect(readFileSync(legacyTmp, 'utf-8')).toBe('USER DATA\n');
+  });
 });
 
 describe('phaseCVerify', () => {
   test('returns complete when fence + DB row counts match', async () => {
+    writeEntityPage('people/alice');
     await seedLegacyFact({ entity_slug: 'people/alice', fact: 'F1' });
     await seedLegacyFact({ entity_slug: 'people/alice', fact: 'F2' });
     await __testing.phaseBFenceFacts(engine, OPTS);
@@ -250,6 +836,7 @@ describe('phaseCVerify', () => {
   });
 
   test('returns failed when fence row count drifts from DB', async () => {
+    writeEntityPage('people/alice');
     await seedLegacyFact({ entity_slug: 'people/alice', fact: 'F1' });
     await __testing.phaseBFenceFacts(engine, OPTS);
 
@@ -267,10 +854,59 @@ describe('phaseCVerify', () => {
     expect(r.detail).toContain('drifted');
     expect(r.detail).toContain('people/alice');
   });
+
+  test('returns failed when a same-count DB row has different fact identity', async () => {
+    writeEntityPage('people/alice');
+    const id = await seedLegacyFact({ entity_slug: 'people/alice', fact: 'Original' });
+    await __testing.phaseBFenceFacts(engine, OPTS);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (engine as any).db.query(
+      `UPDATE facts SET visibility = 'world' WHERE id = $1`,
+      [id],
+    );
+
+    const result = await __testing.phaseCVerify(engine, OPTS);
+    expect(result.status).toBe('failed');
+    expect(result.detail).toContain('identity drift at row=1');
+  });
+
+  test('fails when a fenceable legacy row arrives after the phase-B snapshot', async () => {
+    writeEntityPage('people/alice');
+    await seedLegacyFact({ entity_slug: 'people/alice', fact: 'Fenced first' });
+    await __testing.phaseBFenceFacts(engine, OPTS);
+    await seedLegacyFact({ entity_slug: 'people/bob', fact: 'Arrived concurrently' });
+
+    const result = await __testing.phaseCVerify(engine, OPTS);
+
+    expect(result.status).toBe('failed');
+    expect(result.detail).toContain('fenceable legacy rows remain');
+    expect(result.detail).toContain('people/bob');
+  });
 });
 
 describe('orchestrator end-to-end', () => {
+  test('propagates a configured engine connection failure', async () => {
+    const configHome = mkdtempSync(join(tmpdir(), 'mig-v0_32_2-bad-engine-'));
+    mkdirSync(join(configHome, '.gbrain'), { recursive: true });
+    writeFileSync(
+      join(configHome, '.gbrain', 'config.json'),
+      JSON.stringify({ engine: 'pglite', database_path: '/dev/null/gbrain' }),
+      'utf-8',
+    );
+    __setTestEngineOverride(null);
+    try {
+      await withEnv({ GBRAIN_HOME: configHome }, async () => {
+        await expect(v0_32_2.orchestrator(OPTS)).rejects.toThrow();
+      });
+    } finally {
+      __setTestEngineOverride(engine);
+      rmSync(configHome, { recursive: true, force: true });
+    }
+  });
+
   test('clean run returns status:complete with 3 phases', async () => {
+    writeEntityPage('people/alice');
     await seedLegacyFact({ entity_slug: 'people/alice', fact: 'Founded Acme' });
 
     const result = await v0_32_2.orchestrator(OPTS);
@@ -286,6 +922,17 @@ describe('orchestrator end-to-end', () => {
     const result = await v0_32_2.orchestrator(DRY_OPTS);
     expect(result.status).toBe('complete');
     expect(result.phases.every(p => p.status === 'skipped')).toBe(true);
+    expect(result.target_manifest).toMatchObject({
+      version: '0.32.2',
+      legacy_rows: 1,
+      target_count: 1,
+      quarantine_count: 1,
+      targets: [{
+        original_entity_slug: 'people/alice',
+        disposition: 'quarantine',
+        reason: 'missing_target',
+      }],
+    });
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const rows = await (engine as any).db.query('SELECT row_num FROM facts');

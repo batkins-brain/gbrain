@@ -13,25 +13,17 @@ import {
   type Preferences,
 } from '../src/core/preferences.ts';
 
-let origHome: string | undefined;
 let origGbrainHome: string | undefined;
 let tmp: string;
 
 beforeEach(() => {
-  origHome = process.env.HOME;
   origGbrainHome = process.env.GBRAIN_HOME;
   tmp = mkdtempSync(join(tmpdir(), 'gbrain-prefs-test-'));
-  // preferences.ts's gbrainDir() returns `$HOME/.gbrain` when GBRAIN_HOME
-  // is unset. Test fixtures write to `$tmp/.gbrain/...`, so set HOME only
-  // and clear GBRAIN_HOME — setting GBRAIN_HOME would route prefs to $tmp
-  // directly (no .gbrain suffix), which doesn't match the fixture layout.
-  process.env.HOME = tmp;
-  delete process.env.GBRAIN_HOME;
+  // GBRAIN_HOME is a parent directory. configDir() appends `.gbrain`.
+  process.env.GBRAIN_HOME = tmp;
 });
 
 afterEach(() => {
-  if (origHome === undefined) delete process.env.HOME;
-  else process.env.HOME = origHome;
   if (origGbrainHome === undefined) delete process.env.GBRAIN_HOME;
   else process.env.GBRAIN_HOME = origGbrainHome;
   try { rmSync(tmp, { recursive: true, force: true }); } catch { /* best-effort */ }
@@ -56,6 +48,11 @@ describe('validateMinionMode', () => {
 });
 
 describe('loadPreferences', () => {
+  test('uses the same <GBRAIN_HOME>/.gbrain contract as engine config', () => {
+    expect(preferencesPaths.dir()).toBe(join(tmp, '.gbrain'));
+    expect(preferencesPaths.completedJsonl()).toBe(join(tmp, '.gbrain', 'migrations', 'completed.jsonl'));
+  });
+
   test('returns empty object when file is missing', () => {
     expect(loadPreferences()).toEqual({});
   });
@@ -67,6 +64,27 @@ describe('loadPreferences', () => {
       JSON.stringify({ minion_mode: 'always', set_in_version: '0.11.0' }),
     );
     expect(loadPreferences()).toEqual({ minion_mode: 'always', set_in_version: '0.11.0' });
+  });
+
+  test('falls back to the legacy direct-GBRAIN_HOME preferences path', () => {
+    writeFileSync(
+      join(tmp, 'preferences.json'),
+      JSON.stringify({ minion_mode: 'always', set_in_version: 'legacy' }),
+    );
+    expect(loadPreferences()).toEqual({ minion_mode: 'always', set_in_version: 'legacy' });
+  });
+
+  test('canonical preferences take precedence over the legacy fallback', () => {
+    writeFileSync(
+      join(tmp, 'preferences.json'),
+      JSON.stringify({ minion_mode: 'always', set_in_version: 'legacy' }),
+    );
+    mkdirSync(join(tmp, '.gbrain'), { recursive: true });
+    writeFileSync(
+      join(tmp, '.gbrain', 'preferences.json'),
+      JSON.stringify({ minion_mode: 'off', set_in_version: 'canonical' }),
+    );
+    expect(loadPreferences()).toEqual({ minion_mode: 'off', set_in_version: 'canonical' });
   });
 
   test('throws on malformed JSON so callers can surface it', () => {
@@ -146,6 +164,7 @@ describe('appendCompletedMigration', () => {
     expect(parsed.status).toBe('complete');
     expect(parsed.mode).toBe('always');
     expect(parsed.ts).toBeTruthy();
+    expect(statSync(path).mode & 0o777).toBe(0o600);
   });
 
   test('appends instead of overwriting', () => {
@@ -190,6 +209,53 @@ describe('loadCompletedMigrations', () => {
     expect(entries.length).toBe(2);
     expect(entries[0].version).toBe('0.10.0');
     expect(entries[1].status).toBe('partial');
+  });
+
+  test('merges legacy direct-GBRAIN_HOME completion history with canonical history', () => {
+    mkdirSync(join(tmp, 'migrations'), { recursive: true });
+    writeFileSync(
+      join(tmp, 'migrations', 'completed.jsonl'),
+      JSON.stringify({ version: '0.10.0', status: 'complete', ts: '2026-01-01T00:00:00Z' }) + '\n',
+    );
+    appendCompletedMigration({
+      version: '0.11.0',
+      status: 'partial',
+      ts: '2026-02-01T00:00:00Z',
+    });
+
+    expect(loadCompletedMigrations()).toEqual([
+      { version: '0.10.0', status: 'complete', ts: '2026-01-01T00:00:00Z' },
+      { version: '0.11.0', status: 'partial', ts: '2026-02-01T00:00:00Z' },
+    ]);
+  });
+
+  test('deduplicates an exact record present in both legacy and canonical ledgers', () => {
+    const entry = {
+      version: '0.10.0',
+      status: 'complete' as const,
+      ts: '2026-01-01T00:00:00Z',
+    };
+    mkdirSync(join(tmp, 'migrations'), { recursive: true });
+    mkdirSync(join(tmp, '.gbrain', 'migrations'), { recursive: true });
+    writeFileSync(join(tmp, 'migrations', 'completed.jsonl'), JSON.stringify(entry) + '\n');
+    writeFileSync(join(tmp, '.gbrain', 'migrations', 'completed.jsonl'), JSON.stringify(entry) + '\n');
+
+    expect(loadCompletedMigrations()).toEqual([entry]);
+  });
+
+  test('preserves exact repeated records within the canonical ledger', () => {
+    const entry = {
+      version: '0.10.0',
+      status: 'partial' as const,
+      ts: '2026-01-01T00:00:00.000Z',
+    };
+    mkdirSync(join(tmp, '.gbrain', 'migrations'), { recursive: true });
+    writeFileSync(
+      join(tmp, '.gbrain', 'migrations', 'completed.jsonl'),
+      `${JSON.stringify(entry)}\n${JSON.stringify(entry)}\n`,
+    );
+
+    expect(loadCompletedMigrations()).toEqual([entry, entry]);
   });
 
   test('tolerates malformed lines with a warning, continuing past them', () => {

@@ -398,7 +398,7 @@
   "test/migrate.test.ts": 102260,
   "test/migration-orchestrator-v0_21_0.test.ts": 7,
   "test/migration-orchestrator-v0_31_0.test.ts": 12960,
-  "test/migration-resume.test.ts": 9,
+  "test/migration-resume.serial.test.ts": 9,
   "test/migration-v0-29-1.serial.test.ts": 3273,
   "test/migrations-cjk-wave.test.ts": 3280,
   "test/migrations-registry.test.ts": 3,

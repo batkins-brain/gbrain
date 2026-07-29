@@ -6,15 +6,17 @@
  * parallel `gbrain takes add` calls + a `takes seed --refresh` running in
  * autopilot can't race on the same `<slug>.md` file.
  *
- * Lock file path: `~/.gbrain/page-locks/<sha256-of-slug>.lock`. SHA-256
- * keeps filenames safe regardless of slug content (slashes, unicode, etc.).
+ * Lock file path: `~/.gbrain/page-locks/<sha256-of-key>.lock`. Canonical
+ * file writers key by the physical target path so slug aliases and source
+ * root symlink aliases cannot create independent locks for the same page.
  *
- * File contents: `{pid}\n{iso-timestamp}`. Staleness = mtime older than
- * `LOCK_TTL_MS` (5 min) OR the PID is no longer alive on this host.
+ * The persistent file carries diagnostic `{pid}\n{iso-timestamp}\n{holder-token}`
+ * content. Kernel `flock(2)` is the lock authority: acquisition is atomic and
+ * inode-bound, and a crash releases the lock automatically when the fd closes.
  *
  * Usage:
  *
- *   const lock = await acquirePageLock(slug, { timeoutMs: 30_000 });
+ *   const lock = await acquireFilePageLock(filePath, { timeoutMs: 30_000 });
  *   try {
  *     // read-modify-write the markdown file
  *   } finally {
@@ -22,20 +24,36 @@
  *   }
  */
 
-import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { createHash } from 'node:crypto';
+import {
+  closeSync,
+  chmodSync,
+  constants,
+  fchmodSync,
+  fsyncSync,
+  fstatSync,
+  ftruncateSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  realpathSync,
+  writeSync,
+} from 'node:fs';
+import { basename, dirname, join, resolve } from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
+import { dlopen, FFIType } from 'bun:ffi';
 import { gbrainPath } from './config.ts';
-
-const LOCK_TTL_MS = 5 * 60 * 1000; // 5 minutes — matches eng-review fold spec
 
 export interface PageLockHandle {
   /** Release the lock if we still hold it. Idempotent. */
   release: () => Promise<void>;
-  /** Refresh the mtime + timestamp so the TTL doesn't expire mid-operation. */
+  /** Refresh diagnostic mtime without changing the holder identity record. */
   refresh: () => Promise<void>;
   /** Slug the lock was acquired for (for diagnostics). */
   slug: string;
+}
+
+interface InternalPageLockHandle extends PageLockHandle {
+  releaseSync: () => void;
 }
 
 export interface AcquirePageLockOpts {
@@ -53,67 +71,131 @@ function lockPathFor(slug: string, lockRoot?: string): string {
   return join(dir, `${sha}.lock`);
 }
 
-function isPidAlive(pid: number): boolean {
-  if (pid <= 0) return false;
-  // Note: unlike cycle.ts (single lock per process), page-lock allows
-  // multiple concurrent locks per process for DIFFERENT slugs. A same-pid
-  // collision on the SAME slug means another concurrent caller in this
-  // process holds it — treat as live and let mtime expiry handle stale
-  // post-crash cases.
-  if (pid === process.pid) return true;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (e) {
-    const code = (e as NodeJS.ErrnoException).code;
-    // ESRCH = no such process; anything else (e.g. EPERM) = still alive.
-    return code !== 'ESRCH';
-  }
+interface LockRecord {
+  pid: number;
+  timestamp: string;
+  token: string;
 }
 
-function tryAcquireOnce(slug: string, lockPath: string): PageLockHandle | null {
+function lockRecordText(record: LockRecord): string {
+  return `${record.pid}\n${record.timestamp}\n${record.token}\n`;
+}
+
+interface FlockSymbols {
+  flock: (fd: number, operation: number) => number;
+}
+
+let flockLibrary: ReturnType<typeof dlopen> | null = null;
+let flockSymbols: FlockSymbols | null = null;
+
+function getFlockSymbols(): FlockSymbols {
+  if (flockSymbols) return flockSymbols;
+  const library =
+    process.platform === 'darwin'
+      ? '/usr/lib/libSystem.B.dylib'
+      : process.platform === 'linux'
+        ? 'libc.so.6'
+        : null;
+  if (!library) throw new Error('page locks require POSIX flock support');
+  flockLibrary = dlopen(library, {
+    flock: {
+      args: [FFIType.i32, FFIType.i32],
+      returns: FFIType.i32,
+    },
+  });
+  flockSymbols = flockLibrary.symbols as unknown as FlockSymbols;
+  return flockSymbols;
+}
+
+function writeLockRecord(fd: number, record: LockRecord): void {
+  const body = lockRecordText(record);
+  ftruncateSync(fd, 0);
+  writeSync(fd, body, 0, 'utf-8');
+  fsyncSync(fd);
+}
+
+function tryAcquireOnce(slug: string, lockPath: string): InternalPageLockHandle | null {
   const dir = join(lockPath, '..');
-  mkdirSync(dir, { recursive: true });
-  const pid = process.pid;
-
-  if (existsSync(lockPath)) {
-    try {
-      const st = statSync(lockPath);
-      const ageMs = Date.now() - st.mtimeMs;
-      const content = readFileSync(lockPath, 'utf-8').trim();
-      const existingPid = parseInt(content.split('\n')[0] || '0', 10);
-      const pidAlive = isPidAlive(existingPid);
-
-      if (pidAlive && ageMs < LOCK_TTL_MS) {
-        return null; // live holder
-      }
-      // Stale — fall through to overwrite.
-    } catch {
-      // Any read/stat error → treat as stale.
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  let dirStat = lstatSync(dir);
+  const effectiveUid = process.getuid?.();
+  if (
+    !dirStat.isDirectory() ||
+    dirStat.isSymbolicLink() ||
+    (effectiveUid !== undefined && dirStat.uid !== effectiveUid)
+  ) {
+    throw new Error(`page-lock root is not a private, caller-owned directory: ${dir}`);
+  }
+  if ((dirStat.mode & 0o077) !== 0) {
+    chmodSync(dir, 0o700);
+    dirStat = lstatSync(dir);
+    if ((dirStat.mode & 0o077) !== 0) {
+      throw new Error(`page-lock root permissions could not be restricted: ${dir}`);
     }
   }
 
-  writeFileSync(lockPath, `${pid}\n${new Date().toISOString()}\n`);
+  const fd = openSync(
+    lockPath,
+    constants.O_RDWR | constants.O_CREAT | constants.O_NOFOLLOW,
+    0o600,
+  );
+  // flock is the authority. It is atomic, inode-bound, and released by the
+  // kernel on process exit, eliminating initialization, stale-reclaim, and
+  // read/check/unlink races from the former PID-file protocol.
+  const LOCK_EX = 2;
+  const LOCK_NB = 4;
+  const LOCK_UN = 8;
+  let locked = false;
+  try {
+    const lockStat = fstatSync(fd);
+    if (
+      !lockStat.isFile() ||
+      (effectiveUid !== undefined && lockStat.uid !== effectiveUid)
+    ) {
+      throw new Error(`page lock is not a caller-owned regular file: ${lockPath}`);
+    }
+    if ((lockStat.mode & 0o077) !== 0) fchmodSync(fd, 0o600);
 
-  return {
-    slug,
-    refresh: async () => {
+    if (getFlockSymbols().flock(fd, LOCK_EX | LOCK_NB) < 0) {
+      closeSync(fd);
+      return null;
+    }
+    locked = true;
+
+    const token = randomUUID();
+    const record = (): LockRecord => ({
+      pid: process.pid,
+      timestamp: new Date().toISOString(),
+      token,
+    });
+    writeLockRecord(fd, record());
+
+    let released = false;
+    const releaseSync = (): void => {
+      if (released) return;
+      released = true;
       try {
-        writeFileSync(lockPath, `${pid}\n${new Date().toISOString()}\n`);
-      } catch {
-        /* non-fatal — next acquirer will see it as stale */
+        getFlockSymbols().flock(fd, LOCK_UN);
+      } finally {
+        closeSync(fd);
       }
-    },
-    release: async () => {
-      try {
-        const content = readFileSync(lockPath, 'utf-8').trim();
-        const heldPid = parseInt(content.split('\n')[0] || '0', 10);
-        if (heldPid === pid) unlinkSync(lockPath);
-      } catch {
-        /* already gone */
-      }
-    },
-  };
+    };
+    return {
+      slug,
+      refresh: async () => {
+        if (!released) writeLockRecord(fd, record());
+      },
+      releaseSync,
+      release: async () => releaseSync(),
+    };
+  } catch (error) {
+    try {
+      if (locked) getFlockSymbols().flock(fd, LOCK_UN);
+    } finally {
+      closeSync(fd);
+    }
+    throw error;
+  }
 }
 
 /**
@@ -158,5 +240,64 @@ export async function withPageLock<T>(
     return await fn();
   } finally {
     await handle.release();
+  }
+}
+
+/**
+ * Stable lock identity for a physical markdown target. Writers that know the
+ * target path must use this instead of inventing a slug namespace so every
+ * read-modify-write path contends on the same kernel lock.
+ */
+export function filePageLockKey(filePath: string): string {
+  let existingAncestor = resolve(filePath);
+  const missingTail: string[] = [];
+  while (true) {
+    try {
+      return `file:${join(realpathSync(existingAncestor), ...[...missingTail].reverse())}`;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') throw error;
+      const parent = dirname(existingAncestor);
+      if (parent === existingAncestor) throw error;
+      missingTail.push(basename(existingAncestor));
+      existingAncestor = parent;
+    }
+  }
+}
+
+export async function acquireFilePageLock(
+  filePath: string,
+  opts: AcquirePageLockOpts = {},
+): Promise<PageLockHandle | null> {
+  return acquirePageLock(filePageLockKey(filePath), opts);
+}
+
+export async function withFilePageLock<T>(
+  filePath: string,
+  fn: () => Promise<T>,
+  opts: AcquirePageLockOpts = {},
+): Promise<T> {
+  return withPageLock(filePageLockKey(filePath), fn, opts);
+}
+
+/**
+ * Synchronous canonical-page fixers cannot poll without blocking the process.
+ * They therefore fail closed if another writer owns the target and leave the
+ * caller free to retry the command.
+ */
+export function withFilePageLockSync<T>(
+  filePath: string,
+  fn: () => T,
+  opts: AcquirePageLockOpts = {},
+): T {
+  const key = filePageLockKey(filePath);
+  const handle = tryAcquireOnce(key, lockPathFor(key, opts.lockRoot));
+  if (!handle) {
+    throw new Error(`withFilePageLockSync: page is busy: ${resolve(filePath)}`);
+  }
+  try {
+    return fn();
+  } finally {
+    handle.releaseSync();
   }
 }

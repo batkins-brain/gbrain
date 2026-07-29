@@ -7,8 +7,11 @@
  *   - 'retry' marker resets the counter; next run treats it as fresh.
  *   - appendCompletedMigration no-ops on double 'complete' (idempotency).
  *
- * Infrastructure: point HOME at a tmpdir so the ledger writes don't
- * stomp the real ~/.gbrain/migrations/completed.jsonl.
+ * Infrastructure: point GBRAIN_HOME at a tmpdir so the ledger writes to
+ * <GBRAIN_HOME>/.gbrain/migrations/completed.jsonl and never touches the
+ * real ledger. This file intentionally runs in the serial-test lane because
+ * GBRAIN_HOME is process-global state; parallel shards can otherwise redirect
+ * another test's ledger operations between append and load.
  */
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
@@ -17,21 +20,15 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 
 let tmpHome: string;
-const originalHome = process.env.HOME;
 const originalGbrainHome = process.env.GBRAIN_HOME;
 
 beforeEach(() => {
   tmpHome = mkdtempSync(join(tmpdir(), 'gbrain-migration-resume-'));
-  // preferences.ts's gbrainDir() returns `$HOME/.gbrain` when GBRAIN_HOME
-  // is unset. Set HOME only; clear any inherited GBRAIN_HOME so the test
-  // body matches the migrations dir at `$tmpHome/.gbrain/migrations/`.
-  process.env.HOME = tmpHome;
-  delete process.env.GBRAIN_HOME;
+  // GBRAIN_HOME is a parent directory; configDir() appends `.gbrain`.
+  process.env.GBRAIN_HOME = tmpHome;
 });
 
 afterEach(() => {
-  if (originalHome) process.env.HOME = originalHome;
-  else delete process.env.HOME;
   if (originalGbrainHome) process.env.GBRAIN_HOME = originalGbrainHome;
   else delete process.env.GBRAIN_HOME;
   try { rmSync(tmpHome, { recursive: true, force: true }); } catch { /* ignore */ }
@@ -111,8 +108,11 @@ describe('Bug 3 — appendCompletedMigration idempotency', () => {
 
   test('partial always appends (needed for attempt-cap counter)', async () => {
     const { appendCompletedMigration, loadCompletedMigrations } = await import('../src/core/preferences.ts');
-    appendCompletedMigration({ version: '9.9.9', status: 'partial' });
-    appendCompletedMigration({ version: '9.9.9', status: 'partial' });
+    // Identical timestamps make this deterministic: ledger loading must not
+    // collapse two attempts merely because they landed in the same millisecond.
+    const ts = '2026-07-29T00:00:00.000Z';
+    appendCompletedMigration({ version: '9.9.9', status: 'partial', ts });
+    appendCompletedMigration({ version: '9.9.9', status: 'partial', ts });
     const entries = loadCompletedMigrations().filter(e => e.version === '9.9.9');
     expect(entries.length).toBe(2);
   });
@@ -148,6 +148,14 @@ describe('Bug 3 — orchestrator no longer writes the ledger directly', () => {
     // Import statement should not reference appendCompletedMigration; the
     // old call site is replaced with a comment.
     expect(source).not.toMatch(/import .*appendCompletedMigration.*from/);
+  });
+  test('v0_16_0 does not import or call appendCompletedMigration', async () => {
+    const source = await Bun.file(new URL('../src/commands/migrations/v0_16_0.ts', import.meta.url)).text();
+    expect(source).not.toContain('appendCompletedMigration');
+  });
+  test('v0_18_0 does not import or call appendCompletedMigration', async () => {
+    const source = await Bun.file(new URL('../src/commands/migrations/v0_18_0.ts', import.meta.url)).text();
+    expect(source).not.toContain('appendCompletedMigration');
   });
 
   test('apply-migrations.ts runner writes the ledger', async () => {

@@ -52,6 +52,7 @@ import {
   FACTS_FENCE_END,
   type ParsedFact,
 } from '../facts-fence.ts';
+import { withFilePageLock } from '../page-lock.ts';
 import { parseMarkdown, splitBody, serializeMarkdown } from '../markdown.ts';
 import { tryAcquireDbLock, syncLockId, type DbLockHandle } from '../db-lock.ts';
 import { isAborted } from '../abort-check.ts';
@@ -439,19 +440,21 @@ export async function tryRedirectPhantom(
 
   // ─── Commit phase (codex #3/#4/#6/#7) ─────────────────────────────
   const canonicalPath = path.join(brainDir, `${canonical}.md`);
-  await materializeCanonicalToDisk(engine, canonical, sourceId, canonicalPath);
-
-  // Disk-side first: parse phantom's fence and append to canonical's
-  // disk fence (dedup-guarded). If this throws, no DB state has moved
-  // and the cycle can retry next run.
   const phantomFence = parseFactsFence(page.compiled_truth ?? '');
-  appendPhantomFenceRowsToCanonical(canonicalPath, phantomFence.facts);
+  const newCanonicalBody = await withFilePageLock(canonicalPath, async () => {
+    await materializeCanonicalToDisk(engine, canonical, sourceId, canonicalPath);
+
+    // Disk-side first: parse phantom's fence and append to canonical's
+    // disk fence (dedup-guarded). If this throws, no DB state has moved
+    // and the cycle can retry next run.
+    appendPhantomFenceRowsToCanonical(canonicalPath, phantomFence.facts);
+    return fs.readFileSync(canonicalPath, 'utf-8');
+  }, { timeoutMs: 5_000 });
 
   // Codex #7: refresh canonical's compiled_truth + content_hash so the
   // next `gbrain sync` sees the canonical as unchanged. We re-parse the
   // disk body and recompute the hash with the same shape import-file
   // uses, so the idempotency check round-trips byte-for-byte.
-  const newCanonicalBody = fs.readFileSync(canonicalPath, 'utf-8');
   const reparsed = parseMarkdown(newCanonicalBody, `${canonical}.md`);
   const canonicalTags = await engine.getTags(canonical, { sourceId });
   const newContentHash = computePageContentHash({

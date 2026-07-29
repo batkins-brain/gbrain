@@ -15,6 +15,7 @@ import { join, relative, basename } from 'path';
 import { extractEntityRefs as canonicalExtractEntityRefs } from '../core/link-extraction.ts';
 import { createProgress, startHeartbeat } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
+import { withFilePageLockSync } from '../core/page-lock.ts';
 
 interface BacklinkGap {
   /** The page that mentions the entity */
@@ -149,39 +150,42 @@ export function fixBacklinkGaps(brainDir: string, gaps: BacklinkGap[], dryRun: b
     const targetPath = join(brainDir, targetPage);
     if (!existsSync(targetPath)) continue;
 
-    let content = readFileSync(targetPath, 'utf-8');
+    const applyFixes = (): void => {
+      let content = readFileSync(targetPath, 'utf-8');
 
-    for (const gap of targetGaps) {
-      // Compute relative path from target to source
-      const targetDir = targetPage.split('/').slice(0, -1);
-      const sourceDir = gap.sourcePage.split('/');
-      const depth = targetDir.length;
-      const relPrefix = '../'.repeat(depth);
-      const relPath = relPrefix + gap.sourcePage;
+      for (const gap of targetGaps) {
+        // Compute relative path from target to source
+        const targetDir = targetPage.split('/').slice(0, -1);
+        const depth = targetDir.length;
+        const relPrefix = '../'.repeat(depth);
+        const relPath = relPrefix + gap.sourcePage;
 
-      const entry = buildBacklinkEntry(gap.sourceTitle, relPath, today);
+        const entry = buildBacklinkEntry(gap.sourceTitle, relPath, today);
 
-      // Insert into Timeline section
-      if (content.includes('## Timeline')) {
-        const parts = content.split('## Timeline');
-        const afterTimeline = parts[1];
-        const nextSection = afterTimeline.match(/\n## /);
-        if (nextSection) {
-          const insertIdx = parts[0].length + '## Timeline'.length + nextSection.index!;
-          content = content.slice(0, insertIdx) + '\n' + entry + content.slice(insertIdx);
+        // Insert into Timeline section
+        if (content.includes('## Timeline')) {
+          const parts = content.split('## Timeline');
+          const afterTimeline = parts[1];
+          const nextSection = afterTimeline.match(/\n## /);
+          if (nextSection) {
+            const insertIdx = parts[0].length + '## Timeline'.length + nextSection.index!;
+            content = content.slice(0, insertIdx) + '\n' + entry + content.slice(insertIdx);
+          } else {
+            content = content.trimEnd() + '\n' + entry + '\n';
+          }
         } else {
-          content = content.trimEnd() + '\n' + entry + '\n';
+          // Add Timeline section
+          content = content.trimEnd() + '\n\n## Timeline\n\n' + entry + '\n';
         }
-      } else {
-        // Add Timeline section
-        content = content.trimEnd() + '\n\n## Timeline\n\n' + entry + '\n';
+        fixed++;
       }
-      fixed++;
-    }
 
-    if (!dryRun) {
-      writeFileSync(targetPath, content);
-    }
+      if (!dryRun) {
+        writeFileSync(targetPath, content);
+      }
+    };
+    if (dryRun) applyFixes();
+    else withFilePageLockSync(targetPath, applyFixes);
   }
 
   return fixed;

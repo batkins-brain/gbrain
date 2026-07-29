@@ -10,40 +10,7 @@
 
 import { readFileSync, writeFileSync, renameSync, chmodSync, mkdtempSync, rmSync, existsSync, mkdirSync, appendFileSync } from 'fs';
 import { join } from 'path';
-import { homedir } from 'os';
-
-function home(): string {
-  // `os.homedir()` in Bun caches its initial value and ignores later
-  // `process.env.HOME` mutations, which breaks test isolation and any
-  // workflow that needs to run against a specific $HOME (CI, scripted installs).
-  // Prefer the env var; fall back to the cached OS value. Matches the existing
-  // `src/commands/upgrade.ts` pattern.
-  //
-  // NOTE: prefsDir() and migrationsDir() route through gbrainPath() (which
-  // honors GBRAIN_HOME), so this fallback is only used by code paths that
-  // want $HOME directly (none in this file as of v0.30.3).
-  return process.env.HOME || homedir();
-}
-
-/**
- * GBRAIN_HOME-aware override for the .gbrain directory. When the env var
- * is set, this returns it directly (so the directory is GBRAIN_HOME itself,
- * matching the convention `src/core/config.ts:gbrainPath` enforces).
- * When unset, falls back to `<home>/.gbrain` so legacy callers and the
- * doctor's filesystem-only checks keep working.
- *
- * Without this, `~/.gbrain/migrations/completed.jsonl` is the only path
- * doctor reads on filesystem checks — the test isolation contract that
- * `gbrainPath()` provides for everywhere else doesn't extend here.
- */
-function gbrainDir(): string {
-  const override = process.env.GBRAIN_HOME;
-  if (override) {
-    const trimmed = override.trim();
-    if (trimmed) return trimmed;
-  }
-  return join(home(), '.gbrain');
-}
+import { configDir } from './config.ts';
 
 export type MinionMode = 'always' | 'pain_triggered' | 'off';
 
@@ -79,14 +46,32 @@ export interface CompletedMigrationEntry {
 
 const VALID_MODES: ReadonlyArray<MinionMode> = ['always', 'pain_triggered', 'off'];
 
-// Route preferences + migration ledger paths through gbrainDir() so they
-// honor GBRAIN_HOME for hermetic test isolation. Pre-v0.30.3 these used
-// `$HOME/.gbrain` directly, which leaked the developer's local migration
-// ledger into E2E tests and CI runs even when GBRAIN_HOME was set.
-function prefsDir(): string { return gbrainDir(); }
+// Keep preferences and the migration ledger on the same path contract as
+// engine config: GBRAIN_HOME is a parent directory and configDir() appends
+// `.gbrain`. The former local helper treated GBRAIN_HOME as the .gbrain
+// directory itself, splitting config and ledger state across two locations.
+function prefsDir(): string { return configDir(); }
 function prefsPath(): string { return join(prefsDir(), 'preferences.json'); }
-function migrationsDir(): string { return join(gbrainDir(), 'migrations'); }
+function migrationsDir(): string { return join(configDir(), 'migrations'); }
 function completedJsonlPath(): string { return join(migrationsDir(), 'completed.jsonl'); }
+function legacyOverrideDir(): string | null {
+  // Releases that predate the configDir() alignment treated GBRAIN_HOME as
+  // the .gbrain directory itself. When the override is set, keep a read-only
+  // compatibility lane so preferences and terminal migration history are not
+  // silently abandoned. Calling configDir() first validates the override.
+  const canonical = configDir();
+  const raw = process.env.GBRAIN_HOME?.trim();
+  if (!raw || raw === canonical) return null;
+  return raw;
+}
+function legacyPrefsPath(): string | null {
+  const dir = legacyOverrideDir();
+  return dir ? join(dir, 'preferences.json') : null;
+}
+function legacyCompletedJsonlPath(): string | null {
+  const dir = legacyOverrideDir();
+  return dir ? join(dir, 'migrations', 'completed.jsonl') : null;
+}
 
 /** Validate that a value is a recognized minion mode. Throws with the allowed list. */
 export function validateMinionMode(value: unknown): asserts value is MinionMode {
@@ -102,7 +87,15 @@ export function validateMinionMode(value: unknown): asserts value is MinionMode 
  * Malformed JSON throws; caller can catch if they want graceful fallback.
  */
 export function loadPreferences(): Preferences {
-  const path = prefsPath();
+  const canonical = prefsPath();
+  const legacy = legacyPrefsPath();
+  // Canonical state always wins. The legacy path is a read-only fallback;
+  // the next explicit save writes canonically with restrictive permissions.
+  const path = existsSync(canonical)
+    ? canonical
+    : legacy && existsSync(legacy)
+      ? legacy
+      : canonical;
   if (!existsSync(path)) return {};
   const raw = readFileSync(path, 'utf-8');
   const parsed = JSON.parse(raw) as Preferences;
@@ -163,12 +156,11 @@ export function appendCompletedMigration(entry: CompletedMigrationEntry): void {
   };
   const dir = migrationsDir();
   mkdirSync(dir, { recursive: true });
-  appendFileSync(completedJsonlPath(), JSON.stringify(full) + '\n');
+  appendFileSync(completedJsonlPath(), JSON.stringify(full) + '\n', { mode: 0o600 });
+  try { chmodSync(completedJsonlPath(), 0o600); } catch { /* best-effort */ }
 }
 
-/** Read the completed.jsonl file, skipping malformed lines with a warning to stderr. */
-export function loadCompletedMigrations(): CompletedMigrationEntry[] {
-  const path = completedJsonlPath();
+function readCompletedMigrations(path: string): CompletedMigrationEntry[] {
   if (!existsSync(path)) return [];
   const raw = readFileSync(path, 'utf-8');
   const out: CompletedMigrationEntry[] = [];
@@ -184,10 +176,43 @@ export function loadCompletedMigrations(): CompletedMigrationEntry[] {
   return out;
 }
 
+/**
+ * Read canonical and legacy migration ledgers. Canonical entries are appended
+ * after legacy entries so their newer ordering wins, while any legacy
+ * terminal completion remains visible to the runner. Exact overlap between
+ * the two files is removed one-for-one without collapsing repeated entries
+ * within either ledger: repeated partials are distinct migration attempts,
+ * even when their timestamps happen to be identical.
+ */
+export function loadCompletedMigrations(): CompletedMigrationEntry[] {
+  const legacy = legacyCompletedJsonlPath();
+  const legacyEntries = legacy ? readCompletedMigrations(legacy) : [];
+  const canonicalEntries = readCompletedMigrations(completedJsonlPath());
+  const overlappingLegacyCounts = new Map<string, number>();
+  for (const entry of legacyEntries) {
+    const key = JSON.stringify(entry);
+    overlappingLegacyCounts.set(key, (overlappingLegacyCounts.get(key) ?? 0) + 1);
+  }
+
+  const merged = [...legacyEntries];
+  for (const entry of canonicalEntries) {
+    const key = JSON.stringify(entry);
+    const remainingOverlap = overlappingLegacyCounts.get(key) ?? 0;
+    if (remainingOverlap > 0) {
+      overlappingLegacyCounts.set(key, remainingOverlap - 1);
+      continue;
+    }
+    merged.push(entry);
+  }
+  return merged;
+}
+
 /** Paths — exported for tests and rare consumers. */
 export const preferencesPaths = {
   dir: prefsDir,
   file: prefsPath,
   migrationsDir,
   completedJsonl: completedJsonlPath,
+  legacyFile: legacyPrefsPath,
+  legacyCompletedJsonl: legacyCompletedJsonlPath,
 };

@@ -209,6 +209,26 @@ jobs:
       - run: bun install
       - run: bun test test/entity-resolve-perf.slow.test.ts --timeout=300000
 
+  migration-platform-safety:
+    # v0.32.2 uses descriptor-relative directory I/O. gbrain ships a Darwin
+    # binary as well as Linux, so exercise the exact migration + lock suite on
+    # macOS before a PR can be considered green.
+    needs: cache-check
+    if: needs.cache-check.outputs.hit != 'true'
+    runs-on: macos-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: 1.3.13
+      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
+        with:
+          path: ~/.bun/install/cache
+          key: bun-cache-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+      - run: bun install
+      - run: bun test test/page-lock.test.ts test/migrations-v0_32_2.test.ts --timeout=30000
+
   test:
     # Pure matrix shard — no verify, no serial. Each shard runs its slice
     # of the unit test set under one `bun test` invocation.
@@ -259,7 +279,7 @@ jobs:
   # entry written when tests hadn't actually passed).
   # ──────────────────────────────────────────────────────────────────────
   cache-write:
-    needs: [cache-check, gitleaks, verify, serial-tests, slow-eval-longmemeval, slow-entity-resolve-perf, test]
+    needs: [cache-check, gitleaks, verify, serial-tests, slow-eval-longmemeval, slow-entity-resolve-perf, migration-platform-safety, test]
     if: success() && needs.cache-check.outputs.hit != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -283,7 +303,7 @@ jobs:
   # Branch protection (when configured) gates on this single job name.
   # ──────────────────────────────────────────────────────────────────────
   test-status:
-    needs: [cache-check, gitleaks, verify, serial-tests, slow-eval-longmemeval, slow-entity-resolve-perf, test]
+    needs: [cache-check, gitleaks, verify, serial-tests, slow-eval-longmemeval, slow-entity-resolve-perf, migration-platform-safety, test]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -296,9 +316,10 @@ jobs:
           SERIAL="${{ needs.serial-tests.result }}"
           SLOW_EVAL="${{ needs.slow-eval-longmemeval.result }}"
           SLOW_PERF="${{ needs.slow-entity-resolve-perf.result }}"
+          PLATFORM="${{ needs.migration-platform-safety.result }}"
           TEST="${{ needs.test.result }}"
           echo "cache-check.hit=$HIT"
-          echo "gitleaks=$GITLEAKS  verify=$VERIFY  serial-tests=$SERIAL  slow-eval-longmemeval=$SLOW_EVAL  slow-entity-resolve-perf=$SLOW_PERF  test=$TEST"
+          echo "gitleaks=$GITLEAKS  verify=$VERIFY  serial-tests=$SERIAL  slow-eval-longmemeval=$SLOW_EVAL  slow-entity-resolve-perf=$SLOW_PERF  migration-platform-safety=$PLATFORM  test=$TEST"
           if [ "$GITLEAKS" != "success" ]; then
             echo "✗ gitleaks did not succeed (got $GITLEAKS) — CI fail"
             exit 1
@@ -308,7 +329,7 @@ jobs:
             exit 0
           fi
           # Cache miss: every remaining gated test job must have succeeded.
-          for r in "$VERIFY" "$SERIAL" "$SLOW_EVAL" "$SLOW_PERF" "$TEST"; do
+          for r in "$VERIFY" "$SERIAL" "$SLOW_EVAL" "$SLOW_PERF" "$PLATFORM" "$TEST"; do
             if [ "$r" != "success" ]; then
               echo "✗ gated job did not succeed (got $r) — CI fail"
               exit 1
