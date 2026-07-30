@@ -29,6 +29,7 @@ import {
 } from './markdown.ts';
 import { isSyncable, pruneDir, slugifyPath } from './sync.ts';
 import { withFilePageLockSync } from './page-lock.ts';
+import { preserveCanonicalFences } from './canonical-fences.ts';
 
 export type { ParseValidationCode };
 
@@ -344,17 +345,20 @@ export function writeBrainPage(
     );
   }
 
-  let toWrite = content;
-  let fixes: AuditFix[] = [];
-  if (opts.autoFix) {
-    const result = autoFixFrontmatter(content, { filePath });
-    toWrite = result.content;
-    fixes = result.fixes;
-  }
-
   return withFilePageLockSync(filePath, () => {
+    const current = existsSync(filePath) ? readFileSync(filePath, 'utf8') : null;
+    let toWrite = content;
+    let fixes: AuditFix[] = [];
+    if (opts.autoFix) {
+      const result = autoFixFrontmatter(current ?? content, { filePath });
+      toWrite = result.content;
+      fixes = result.fixes;
+    } else if (current !== null) {
+      toWrite = preserveCanonicalFences(toWrite, current);
+    }
+
     let backupPath: string | undefined;
-    if (existsSync(filePath)) {
+    if (current !== null) {
       backupPath = createFrontmatterBackup(filePath, {
         sourcePath: opts.sourcePath,
         backupRoot: opts.backupRoot,

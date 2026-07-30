@@ -44,6 +44,7 @@ import type { Page, PageType } from '../types.ts';
 import { validateSourceId } from '../utils.ts';
 import { safeSplitIndex } from '../text-safe.ts';
 import { withFilePageLock } from '../page-lock.ts';
+import { preserveCanonicalFences } from '../canonical-fences.ts';
 
 // Slug regex from validatePageSlug — kept in sync.
 // Used for the orchestrator-written summary index slug.
@@ -1080,22 +1081,27 @@ async function reverseWriteRefs(
   for (const { slug, source_id } of refs) {
     // v0.32.8 F6: validate source_id is filesystem-safe before any join().
     validateSourceId(source_id);
-    const page = await engine.getPage(slug, { sourceId: source_id });
-    if (!page) continue;
-    const tags = await engine.getTags(slug, { sourceId: source_id });
     try {
-      const md = renderPageToMarkdown(page, tags);
       // v0.32.8 F6: non-default sources land at brainDir/.sources/<id>/<slug>.md
       // so same-slug-different-source pages don't collide. Default-source
       // pages stay at brainDir/<slug>.md so single-source brains see no change.
       const filePath = source_id === 'default'
         ? join(brainDir, `${slug}.md`)
         : join(brainDir, '.sources', source_id, `${slug}.md`);
+      let wrote = false;
       await withFilePageLock(filePath, async () => {
+        const page = await engine.getPage(slug, { sourceId: source_id });
+        if (!page) return;
+        const tags = await engine.getTags(slug, { sourceId: source_id });
+        let md = renderPageToMarkdown(page, tags);
+        if (existsSync(filePath)) {
+          md = preserveCanonicalFences(md, readFileSync(filePath, 'utf8'));
+        }
         mkdirSync(dirname(filePath), { recursive: true });
         writeFileSync(filePath, md, 'utf8');
+        wrote = true;
       }, { timeoutMs: 5_000 });
-      count++;
+      if (wrote) count++;
     } catch (e) {
       // Per-slug failures are non-fatal — phase continues.
       const msg = e instanceof Error ? e.message : String(e);
@@ -1186,8 +1192,11 @@ async function writeSummaryPage(
   try {
     const filePath = join(brainDir, `${summarySlug}.md`);
     await withFilePageLock(filePath, async () => {
+      const body = existsSync(filePath)
+        ? preserveCanonicalFences(fullMarkdown, readFileSync(filePath, 'utf8'))
+        : fullMarkdown;
       mkdirSync(dirname(filePath), { recursive: true });
-      writeFileSync(filePath, fullMarkdown, 'utf8');
+      writeFileSync(filePath, body, 'utf8');
     }, { timeoutMs: 5_000 });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);

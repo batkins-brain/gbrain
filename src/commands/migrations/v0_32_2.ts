@@ -372,6 +372,7 @@ interface NativeAtSymbols {
     flags: number,
   ) => number;
   unlinkat: (dirFd: number, path: Uint8Array, flags: number) => number;
+  fchmod: (fd: number, mode: number) => number;
 }
 
 let nativeAtLibrary: ReturnType<typeof dlopen> | null = null;
@@ -413,6 +414,10 @@ function getNativeAtSymbols(): NativeAtSymbols {
       args: [FFIType.i32, FFIType.cstring, FFIType.i32],
       returns: FFIType.i32,
     },
+    fchmod: {
+      args: [FFIType.i32, FFIType.u32],
+      returns: FFIType.i32,
+    },
   });
   nativeAtSymbols = nativeAtLibrary.symbols as unknown as NativeAtSymbols;
   return nativeAtSymbols;
@@ -440,6 +445,16 @@ function nativeMkdirAt(fd: number, name: string, mode: number): void {
     fchmodSync(childFd, mode);
   } finally {
     closeSync(childFd);
+  }
+}
+
+function setPrivateFileMode(fd: number, nativeBackend: boolean): void {
+  if (nativeBackend) {
+    if (getNativeAtSymbols().fchmod(fd, 0o600) < 0) {
+      throw new Error('descriptor-relative fchmod failed');
+    }
+  } else {
+    fchmodSync(fd, 0o600);
   }
 }
 
@@ -684,13 +699,18 @@ function writeOwnedTempFileAt(parent: AnchoredParent, name: string, body: string
     ? openSync(anchoredChildPath(parent, name), flags, 0o600)
     : nativeOpenAt(parent.fd, name, flags, 0o600);
   try {
-    if (!fstatSync(fd).isFile()) {
+    // Darwin arm64 passes variadic C arguments differently from fixed FFI
+    // arguments, so openat(..., O_CREAT, mode) may create with mode 000.
+    // The descriptor is already exclusively ours; establish and verify the
+    // private mode explicitly before any publication.
+    setPrivateFileMode(fd, !parent.descriptorBase);
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) {
       throw new Error(`migration temporary target is not a regular file: ${name}`);
     }
-    // Force owner-only mode after create. Darwin's openat(2) is variadic; the
-    // bun:ffi binding can silently drop the mode argument and leave mode 0
-    // files that later fail with EACCES for the same effective user.
-    fchmodSync(fd, 0o600);
+    if ((stat.mode & 0o777) !== 0o600) {
+      throw new Error(`migration temporary target mode is not private: ${name}`);
+    }
     writeFileSync(fd, body, 'utf-8');
   } finally {
     closeSync(fd);

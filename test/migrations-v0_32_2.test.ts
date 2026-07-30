@@ -19,6 +19,7 @@ import {
   readFileSync,
   renameSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
@@ -204,6 +205,7 @@ describe('phaseBFenceFacts — happy path backfill', () => {
     const filePath = join(brainDir, 'people/alice.md');
     expect(existsSync(filePath)).toBe(true);
     const body = readFileSync(filePath, 'utf-8');
+    expect(statSync(filePath).mode & 0o777).toBe(0o600);
     expect(body).toContain('## Facts');
     expect(body).toContain('Founded Acme in 2017');
     expect(body).toContain('Prefers async over meetings');
