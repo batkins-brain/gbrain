@@ -31,6 +31,10 @@ import { join } from 'node:path';
 //   - consolidate.ts (v0.35.4 — chronological writeback)
 //   - facts/forget.ts (v0.32.2 — user-initiated `gbrain forget`; user is
 //     the supersession authority, not the probe)
+//   - commands/migrations/v0_32_2.ts (v0.32.2 — one-time canonicalization
+//     copies a legacy row's explicit valid_until/expired_at date into its
+//     Facts fence and derived DB identity; it does not infer supersession and
+//     is never reachable from the contradiction probe)
 //   - postgres-engine.ts + pglite-engine.ts (v0.42.56.0, #2390 — Life
 //     Chronicle ontology: `mergeOntologyFact` forward-supersession closes
 //     the prior OPEN row's valid_until when a NEW value arrives for the
@@ -42,6 +46,7 @@ import { join } from 'node:path';
 const VALID_UNTIL_WRITE_ALLOWLIST: ReadonlySet<string> = new Set([
   'src/core/cycle/phases/consolidate.ts',
   'src/core/facts/forget.ts',
+  'src/commands/migrations/v0_32_2.ts',
   'src/core/postgres-engine.ts',
   'src/core/pglite-engine.ts',
 ]);
