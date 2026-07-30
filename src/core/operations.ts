@@ -494,6 +494,54 @@ export function resolveRequestedScope(
 }
 
 /**
+ * TAN-576 ordinary retrieval scope.
+ *
+ * Unqualified search on a trusted local caller must include federated sources
+ * (documented as "appears in cross-source default search"). Explicit
+ * `source_id` / `__all__` keep resolveRequestedScope semantics. Remote callers
+ * stay grant-scoped — never auto-expand beyond allowedSources / scalar grant.
+ *
+ * Shape:
+ *   - explicit source_id / __all__ / all_sources → resolveRequestedScope
+ *   - remote / existing sourceIds grant → unchanged
+ *   - trusted local scalar ctx.sourceId → union(ctx.sourceId, federated ids)
+ *   - sources table unavailable → scalar fallback
+ */
+export async function resolveSearchScope(
+  ctx: OperationContext,
+  sourceIdParam: string | undefined,
+  allSourcesParam = false,
+): Promise<{ sourceId?: string; sourceIds?: string[] }> {
+  // Explicit request paths keep the strict resolver (including __all__).
+  if (allSourcesParam || sourceIdParam !== undefined) {
+    return resolveRequestedScope(ctx, sourceIdParam, allSourcesParam);
+  }
+
+  const base = sourceScopeOpts(ctx);
+  // Already a multi-source grant, or unscoped legacy empty scope.
+  if ((base.sourceIds && base.sourceIds.length > 0) || !base.sourceId) {
+    return base;
+  }
+
+  // Remote callers must not inherit host-local federation membership.
+  if (ctx.remote !== false) {
+    return base;
+  }
+
+  try {
+    const { loadAllSources } = await import('./sources-load.ts');
+    const federated = await loadAllSources(ctx.engine, { federatedOnly: true });
+    const ids = new Set<string>([base.sourceId]);
+    for (const row of federated) ids.add(row.id);
+    if (ids.size <= 1) return base;
+    return { sourceIds: [...ids].sort() };
+  } catch {
+    // Pre-sources / mid-init brains: keep the scalar scope.
+    return base;
+  }
+}
+
+/**
  * Code-intel adapter for `resolveRequestedScope`. Graph traversal
  * (code_callers/code_callees/code_blast/code_flow) is single-source by design —
  * the engine APIs and the traversal cache key take ONE `sourceId` string, not a
@@ -1430,7 +1478,8 @@ const search: Operation = {
     const queryText = p.query as string;
     const limit = (p.limit as number) || 20;
     const offset = (p.offset as number) || 0;
-    const scope = sourceScopeOpts(ctx);
+    // TAN-576: ordinary unqualified search includes federated sources for local callers.
+    const scope = await resolveSearchScope(ctx, undefined);
 
     // T4/D5 — per-call mode honored ONLY for trusted/local callers so a remote
     // OAuth client can't escalate to the costly tokenmax bundle. Local + unknown
@@ -1592,7 +1641,8 @@ const query: Operation = {
     // is spread into BOTH the image-similarity searchVector path and the text
     // hybridSearch path below, so both honor the same grant.
     const sourceIdParam = typeof p.source_id === 'string' ? p.source_id : undefined;
-    const querySourceScope = resolveRequestedScope(ctx, sourceIdParam);
+    // TAN-576: ordinary unqualified query includes federated sources for local callers.
+    const querySourceScope = await resolveSearchScope(ctx, sourceIdParam);
 
     // v0.27.1: image-similarity branch. Bypasses hybridSearch (which is
     // text-only); embeds the image via embedMultimodal and runs a direct
@@ -4393,7 +4443,7 @@ const search_by_image: Operation = {
     // after it (double-application: the spread silently won, and `__all__`
     // didn't opt out for local callers with ctx.sourceId set). One resolver,
     // one spread — `__all__` spans the brain only for trusted local callers.
-    const imageSourceScope = resolveRequestedScope(ctx, sourceIdParam);
+    const imageSourceScope = await resolveSearchScope(ctx, sourceIdParam);
 
     const { searchByImage } = await import('./search/by-image.ts');
     const results = await searchByImage(
