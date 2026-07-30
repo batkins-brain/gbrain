@@ -47,6 +47,7 @@ import {
   parseStringCell,
   escapeFenceCell,
 } from './fence-shared.ts';
+import { insertSectionBeforeTimeline } from './markdown-sections.ts';
 
 // HTML-comment fence markers — verbatim per spec. Same shape as the takes
 // fence markers so anyone who's seen one immediately recognizes the other.
@@ -396,8 +397,7 @@ export function upsertFactRow(
   if (beginIdx !== -1 && endIdx !== -1) {
     out = body.slice(0, beginIdx) + newFence + body.slice(endIdx + FACTS_FENCE_END.length);
   } else {
-    const sep = body.endsWith('\n') ? '\n' : '\n\n';
-    out = `${body}${sep}## Facts\n\n${newFence}\n`;
+    out = insertSectionBeforeTimeline(body, `## Facts\n\n${newFence}`);
   }
   return { body: out, rowNum: nextRowNum };
 }
@@ -448,9 +448,18 @@ export function stripFactsFence(body: string, opts: StripFactsFenceOpts = {}): s
   // strip is a safe no-op rather than crashing on `undefined.indexOf`.
   if (typeof body !== 'string') return body;
   const beginIdx = body.indexOf(FACTS_FENCE_BEGIN);
-  if (beginIdx === -1) return body;
+  const endFirstIdx = body.indexOf(FACTS_FENCE_END);
+  if (beginIdx === -1 && endFirstIdx === -1) return body;
+  if (
+    beginIdx === -1 ||
+    endFirstIdx === -1 ||
+    body.indexOf(FACTS_FENCE_BEGIN, beginIdx + FACTS_FENCE_BEGIN.length) !== -1 ||
+    body.indexOf(FACTS_FENCE_END, endFirstIdx + FACTS_FENCE_END.length) !== -1
+  ) {
+    return '';
+  }
   const endIdx = body.indexOf(FACTS_FENCE_END, beginIdx + FACTS_FENCE_BEGIN.length);
-  if (endIdx === -1) return body;
+  if (endIdx === -1) return '';
 
   // Whole-fence strip mode (chunker case).
   if (!opts.keepVisibility || opts.keepVisibility.length === 0) {

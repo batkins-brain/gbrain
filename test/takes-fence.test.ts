@@ -164,6 +164,34 @@ describe('upsertTakeRow', () => {
     expect(takes).toHaveLength(1);
   });
 
+  test('creates a new Takes section before the timeline channel', () => {
+    const fresh = '# New Page\n\nSome content.\n\n<!-- timeline -->\n## Timeline\n\n- private event\n';
+    const { body } = upsertTakeRow(fresh, {
+      claim: 'Private take',
+      kind: 'take',
+      holder: 'brain',
+      weight: 0.8,
+      active: true,
+    });
+
+    expect(body.indexOf(TAKES_FENCE_BEGIN)).toBeLessThan(body.indexOf('<!-- timeline -->'));
+    expect(body.slice(body.indexOf('<!-- timeline -->'))).not.toContain(TAKES_FENCE_BEGIN);
+  });
+
+  test('creates a new Takes section before a blank-line legacy timeline separator', () => {
+    const fresh = '# New Page\n\nSome content.\n\n---\n\n## History\n\n- private event\n';
+    const { body } = upsertTakeRow(fresh, {
+      claim: 'Private take',
+      kind: 'take',
+      holder: 'brain',
+      weight: 0.8,
+      active: true,
+    });
+
+    expect(body.indexOf(TAKES_FENCE_BEGIN)).toBeLessThan(body.indexOf('---\n\n## History'));
+    expect(body.slice(body.indexOf('---\n\n## History'))).not.toContain(TAKES_FENCE_BEGIN);
+  });
+
   test('row_num is monotonic — never reuses gaps', () => {
     // Body where rows 2 and 4 are present (1 and 3 deleted by hand-edit)
     const body = `## Takes
@@ -234,6 +262,14 @@ describe('stripTakesFence', () => {
   test('returns body unchanged when no fence present', () => {
     const body = '# Plain page\n\nNo takes here.';
     expect(stripTakesFence(body)).toBe(body);
+  });
+
+  test('fails closed on unbalanced fence markers', () => {
+    expect(stripTakesFence(`Public\n${TAKES_FENCE_BEGIN}\nPRIVATE_MALFORMED_TAKE`)).toBe('');
+  });
+
+  test('fails closed on duplicated fence blocks', () => {
+    expect(stripTakesFence(`${SAMPLE_BODY}\n${SAMPLE_BODY}`)).toBe('');
   });
 });
 

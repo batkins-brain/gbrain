@@ -34,7 +34,8 @@ import {
   __setTestPageLockRoot,
   __testing,
 } from '../src/commands/migrations/v0_32_2.ts';
-import { parseFactsFence } from '../src/core/facts-fence.ts';
+import { parseFactsFence, renderFactsTable } from '../src/core/facts-fence.ts';
+import { extractFactsFromFenceText } from '../src/core/facts/extract-from-fence.ts';
 import { acquireFilePageLock } from '../src/core/page-lock.ts';
 import { withEnv } from './helpers/with-env.ts';
 
@@ -217,6 +218,97 @@ describe('phaseBFenceFacts — happy path backfill', () => {
     );
     expect(rows.rows[0]).toMatchObject({ id: id1, row_num: 1, source_markdown_slug: 'people/alice' });
     expect(rows.rows[1]).toMatchObject({ id: id2, row_num: 2, source_markdown_slug: 'people/alice' });
+  });
+
+  test('preserves expired and superseded legacy facts as inactive canonical rows', async () => {
+    writeEntityPage('people/alice');
+    const expiredId = await seedLegacyFact({
+      entity_slug: 'people/alice',
+      fact: 'Old preference',
+      context: 'Original context',
+    });
+    const successorId = await seedLegacyFact({
+      entity_slug: 'people/alice',
+      fact: 'Replacement preference',
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (engine as any).db.query(
+      `UPDATE facts
+          SET expired_at = '2026-07-20T12:00:00Z', superseded_by = $1
+        WHERE id = $2`,
+      [successorId, expiredId],
+    );
+
+    const result = await __testing.phaseBFenceFacts(engine, OPTS);
+    expect(result.status).toBe('complete');
+
+    const parsed = parseFactsFence(readFileSync(join(brainDir, 'people/alice.md'), 'utf-8'));
+    expect(parsed.warnings).toEqual([]);
+    const expired = parsed.facts.find(fact => fact.claim === 'Old preference');
+    expect(expired).toBeDefined();
+    expect(expired!.active).toBe(false);
+    expect(expired!.validUntil).toBe('2026-07-20');
+    expect(expired!.context).toContain(`legacy superseded fact id ${successorId}`);
+
+    const rebuilt = extractFactsFromFenceText(parsed.facts, 'people/alice', 'default', {
+      nowOverride: new Date('2026-07-29T00:00:00Z'),
+    });
+    expect(rebuilt.find(fact => fact.fact === 'Old preference')?.valid_until?.toISOString())
+      .toStartWith('2026-07-20');
+
+    const verify = await __testing.phaseCVerify(engine, OPTS);
+    expect(verify.status).toBe('complete');
+  });
+
+  test('does not apply legacy expiration markers to an existing canonical forgotten row', async () => {
+    const forgottenContext = 'forgotten: explicit user request';
+    const assignedId = await seedLegacyFact({
+      entity_slug: 'people/alice',
+      fact: 'Already forgotten',
+      context: forgottenContext,
+      valid_until: '2026-07-10',
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (engine as any).db.query(
+      `UPDATE facts
+          SET row_num = 1,
+              source_markdown_slug = 'people/alice'
+        WHERE id = $1`,
+      [assignedId],
+    );
+    const existingFence = renderFactsTable([{
+      rowNum: 1,
+      claim: 'Already forgotten',
+      kind: 'fact',
+      confidence: 1,
+      visibility: 'private',
+      notability: 'medium',
+      validFrom: '2026-07-29',
+      validUntil: '2026-07-10',
+      source: 'mcp:put_page',
+      context: forgottenContext,
+      active: false,
+      forgotten: true,
+    }]);
+    mkdirOwnerOnly(join(brainDir, 'people'));
+    writeFileSync(
+      join(brainDir, 'people/alice.md'),
+      `---\ntype: person\ntitle: alice\nslug: people/alice\n---\n\n# alice\n\n## Facts\n\n${existingFence}\n`,
+      { encoding: 'utf-8', mode: 0o600 },
+    );
+    await seedLegacyFact({
+      entity_slug: 'people/alice',
+      fact: 'New legacy fact',
+    });
+
+    const result = await __testing.phaseBFenceFacts(engine, OPTS);
+    expect(result.status).toBe('complete');
+    const parsed = parseFactsFence(readFileSync(join(brainDir, 'people/alice.md'), 'utf-8'));
+    const forgotten = parsed.facts.find(fact => fact.claim === 'Already forgotten');
+    expect(forgotten?.context).toBe(forgottenContext);
+    expect(forgotten?.context).not.toContain('legacy expired');
+    expect(parsed.facts.some(fact => fact.claim === 'New legacy fact')).toBe(true);
+    expect((await __testing.phaseCVerify(engine, OPTS)).status).toBe('complete');
   });
 
   test('groups by entity page — multi-entity batch touches multiple files', async () => {
@@ -867,6 +959,30 @@ describe('phaseCVerify', () => {
       `UPDATE facts SET visibility = 'world' WHERE id = $1`,
       [id],
     );
+
+    const result = await __testing.phaseCVerify(engine, OPTS);
+    expect(result.status).toBe('failed');
+    expect(result.detail).toContain('identity drift at row=1');
+  });
+
+  test('returns failed when an expired migrated row is rendered active', async () => {
+    writeEntityPage('people/alice');
+    const id = await seedLegacyFact({
+      entity_slug: 'people/alice',
+      fact: 'Expired preference',
+      valid_until: '2026-07-20',
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (engine as any).db.query(
+      `UPDATE facts SET expired_at = '2026-07-20T12:00:00Z' WHERE id = $1`,
+      [id],
+    );
+    await __testing.phaseBFenceFacts(engine, OPTS);
+
+    const path = join(brainDir, 'people/alice.md');
+    const body = readFileSync(path, 'utf-8');
+    expect(body).toContain('~~Expired preference~~');
+    writeFileSync(path, body.replace('~~Expired preference~~', 'Expired preference'), 'utf-8');
 
     const result = await __testing.phaseCVerify(engine, OPTS);
     expect(result.status).toBe('failed');

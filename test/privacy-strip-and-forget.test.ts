@@ -261,6 +261,69 @@ describe('forgetFactInFence — fallback paths', () => {
     expect(after.rows[0].expired_at).not.toBeNull();
   });
 
+  test('hands off to the canonical fence when migration stamps row_num first', async () => {
+    // Start from the legacy shape observed by forgetFactInFence's first read.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const inserted = await (engine as any).db.query(
+      `INSERT INTO facts (source_id, entity_slug, fact, kind, visibility, notability,
+                          valid_from, source, confidence)
+       VALUES ('default', 'people/alice', 'migration race', 'fact', 'world', 'medium',
+               '2026-01-01', 's', 1.0) RETURNING id`,
+    );
+    const id = inserted.rows[0].id;
+    seedFile(
+      'people/alice',
+      `| 1 | migration race | fact | 1.0 | world | medium | 2026-01-01 |  | s |  |`,
+    );
+
+    const raceEngine = Object.create(engine) as PGLiteEngine;
+    const originalExpire = engine.expireFact.bind(engine);
+    let migrationWon = false;
+    Object.defineProperty(raceEngine, 'expireFact', {
+      value: async (
+        factId: number,
+        opts?: { supersededBy?: number; at?: Date; requireUnfenced?: boolean },
+      ) => {
+        if (opts?.requireUnfenced && !migrationWon) {
+          migrationWon = true;
+          // Simulate v0.32.2 committing publication + row_num while the
+          // conditional legacy expiry is waiting on its row lock.
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          await (engine as any).db.query(
+            `UPDATE facts
+                SET row_num = 1, source_markdown_slug = 'people/alice'
+              WHERE id = $1`,
+            [factId],
+          );
+          return false;
+        }
+        return originalExpire(factId, opts);
+      },
+    });
+
+    const result = await forgetFactInFence(raceEngine, id, { reason: 'race-safe' });
+    expect(result).toMatchObject({ ok: true, path: 'fence' });
+    const body = readFileSync(join(brainDir, 'people/alice.md'), 'utf-8');
+    expect(body).toContain('~~migration race~~');
+    expect(body).toContain('forgotten: race-safe');
+  });
+
+  test('requireUnfenced refuses to expire an already canonical row', async () => {
+    const id = await seedV51Fact({
+      entity_slug: 'people/alice',
+      source_markdown_slug: 'people/alice',
+      row_num: 1,
+      fact: 'canonical',
+    });
+    expect(await engine.expireFact(id, { requireUnfenced: true })).toBe(false);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const after = await (engine as any).db.query(
+      'SELECT expired_at FROM facts WHERE id = $1',
+      [id],
+    );
+    expect(after.rows[0].expired_at).toBeNull();
+  });
+
   test('missing local_path on source falls back to DB-only', async () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (engine as any).db.query(`UPDATE sources SET local_path = NULL WHERE id = 'default'`);

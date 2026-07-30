@@ -190,6 +190,28 @@ describe('writeBrainPage', () => {
     expect(fixes.some(f => f.code === 'NESTED_QUOTES')).toBe(true);
     expect(readFileSync(file, 'utf8')).toMatch(/^title: '.*'\s*$/m);
   });
+
+  test('autoFix: true writes supplied content while preserving current canonical fences', () => {
+    const file = join(tmp, 'people', 'jane.md');
+    mkdirSync(join(tmp, 'people'), { recursive: true });
+    writeFileSync(
+      file,
+      `${fence}\ntype: person\ntitle: Old\n${fence}\n\nold body\n\n`
+        + '<!--- gbrain:facts:begin -->\n'
+        + '| row_num | claim |\n|---:|---|\n| 1 | Current canonical fact |\n'
+        + '<!--- gbrain:facts:end -->\n',
+    );
+    const incoming = `${fence}\ntype: person\ntitle: "New "Nickname" Person"\n${fence}\n\nnew body`;
+
+    const { fixes } = writeBrainPage(file, incoming, { sourcePath: tmp, autoFix: true });
+    const written = readFileSync(file, 'utf8');
+
+    expect(fixes.some(f => f.code === 'NESTED_QUOTES')).toBe(true);
+    expect(written).toContain("title: 'New \"Nickname\" Person'");
+    expect(written).toContain('new body');
+    expect(written).not.toContain('old body');
+    expect(written).toContain('Current canonical fact');
+  });
 });
 
 describe('scanBrainSources (PGLite)', () => {

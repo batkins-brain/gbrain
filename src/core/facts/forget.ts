@@ -108,9 +108,16 @@ export async function forgetFactInFence(
     row.entity_slug !== null;
 
   if (!canFence) {
-    // Legacy path — DB-only forget. Doesn't survive `gbrain rebuild`.
-    const ok = await engine.expireFact(factId); // gbrain-allow-direct-insert: legacy fallback path inside forgetFactInFence — fence rewrite not possible (pre-v51 row / missing local_path / file deleted / row_num drift)
-    return { ok, path: 'legacy_db', reason };
+    // Legacy path — DB-only forget. Make the expiry conditional on the row
+    // still being unfenced. Migration v0.32.2 holds the row lock through
+    // canonical publication + row_num stamping, so whichever writer wins has
+    // an enforceable handoff:
+    //   - forget wins: migration re-reads the expired row and renders inactive
+    //   - migration wins: this UPDATE affects zero rows and we retry through
+    //     the now-canonical fence path
+    const ok = await engine.expireFact(factId, { requireUnfenced: true }); // gbrain-allow-direct-insert: legacy fallback path inside forgetFactInFence — fence rewrite not possible (pre-v51 row / missing local_path / file deleted / row_num drift)
+    if (ok) return { ok: true, path: 'legacy_db', reason };
+    return forgetFactInFence(engine, factId, opts);
   }
 
   // Look up source.local_path.

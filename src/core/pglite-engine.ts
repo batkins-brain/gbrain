@@ -3915,12 +3915,16 @@ export class PGLiteEngine implements BrainEngine {
     return { id: ins.rows[0].id, status: 'inserted' };
   }
 
-  async expireFact(id: number, opts?: { supersededBy?: number; at?: Date }): Promise<boolean> {
+  async expireFact(
+    id: number,
+    opts?: { supersededBy?: number; at?: Date; requireUnfenced?: boolean },
+  ): Promise<boolean> {
     const at = opts?.at ?? new Date();
     const result = await this.db.query(
       `UPDATE facts SET expired_at = $1, superseded_by = COALESCE($2, superseded_by)
-       WHERE id = $3 AND expired_at IS NULL`,
-      [at, opts?.supersededBy ?? null, id],
+       WHERE id = $3 AND expired_at IS NULL
+         AND ($4 = false OR row_num IS NULL)`,
+      [at, opts?.supersededBy ?? null, id, opts?.requireUnfenced === true],
     );
     return (result.affectedRows ?? 0) > 0;
   }

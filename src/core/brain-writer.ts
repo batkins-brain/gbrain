@@ -350,8 +350,10 @@ export function writeBrainPage(
     let toWrite = content;
     let fixes: AuditFix[] = [];
     if (opts.autoFix) {
-      const result = autoFixFrontmatter(current ?? content, { filePath });
-      toWrite = result.content;
+      const result = autoFixFrontmatter(content, { filePath });
+      toWrite = current === null
+        ? result.content
+        : preserveCanonicalFences(result.content, current);
       fixes = result.fixes;
     } else if (current !== null) {
       toWrite = preserveCanonicalFences(toWrite, current);

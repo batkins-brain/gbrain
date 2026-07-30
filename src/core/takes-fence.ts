@@ -132,6 +132,7 @@ export const TAKES_FENCE_END   = '<!--- gbrain:takes:end -->';
  * v0.32 emits warnings only.
  */
 import { SLUG_SEGMENT_PATTERN } from './sync.ts';
+import { insertSectionBeforeTimeline } from './markdown-sections.ts';
 export const HOLDER_REGEX = new RegExp(
   `^(?:world|brain|(?:people|companies)/${SLUG_SEGMENT_PATTERN.source}|${SLUG_SEGMENT_PATTERN.source})$`,
 );
@@ -486,9 +487,7 @@ export function upsertTakeRow(
   if (beginIdx !== -1 && endIdx !== -1) {
     out = body.slice(0, beginIdx) + newFence + body.slice(endIdx + TAKES_FENCE_END.length);
   } else {
-    // No fence yet — append a fresh Takes section at the end.
-    const sep = body.endsWith('\n') ? '\n' : '\n\n';
-    out = `${body}${sep}## Takes\n\n${newFence}\n`;
+    out = insertSectionBeforeTimeline(body, `## Takes\n\n${newFence}`);
   }
   return { body: out, rowNum: nextRowNum };
 }
@@ -552,8 +551,17 @@ export function stripTakesFence(body: string): string {
   // than crashing on `undefined.indexOf`.
   if (typeof body !== 'string') return body;
   const beginIdx = body.indexOf(TAKES_FENCE_BEGIN);
-  if (beginIdx === -1) return body;
+  const endFirstIdx = body.indexOf(TAKES_FENCE_END);
+  if (beginIdx === -1 && endFirstIdx === -1) return body;
+  if (
+    beginIdx === -1 ||
+    endFirstIdx === -1 ||
+    body.indexOf(TAKES_FENCE_BEGIN, beginIdx + TAKES_FENCE_BEGIN.length) !== -1 ||
+    body.indexOf(TAKES_FENCE_END, endFirstIdx + TAKES_FENCE_END.length) !== -1
+  ) {
+    return '';
+  }
   const endIdx = body.indexOf(TAKES_FENCE_END, beginIdx + TAKES_FENCE_BEGIN.length);
-  if (endIdx === -1) return body;
+  if (endIdx === -1) return '';
   return body.slice(0, beginIdx) + body.slice(endIdx + TAKES_FENCE_END.length);
 }

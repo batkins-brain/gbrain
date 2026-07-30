@@ -6,16 +6,18 @@ import {
   TAKES_FENCE_BEGIN,
   TAKES_FENCE_END,
 } from './takes-fence.ts';
+import { insertSectionBeforeTimeline } from './markdown-sections.ts';
 
 interface FenceMarkers {
   begin: string;
   end: string;
   name: string;
+  heading: string;
 }
 
 const MANAGED_FENCES: FenceMarkers[] = [
-  { begin: FACTS_FENCE_BEGIN, end: FACTS_FENCE_END, name: 'facts' },
-  { begin: TAKES_FENCE_BEGIN, end: TAKES_FENCE_END, name: 'takes' },
+  { begin: FACTS_FENCE_BEGIN, end: FACTS_FENCE_END, name: 'facts', heading: '## Facts' },
+  { begin: TAKES_FENCE_BEGIN, end: TAKES_FENCE_END, name: 'takes', heading: '## Takes' },
 ];
 
 function fenceRange(body: string, markers: FenceMarkers): [number, number] | null {
@@ -34,24 +36,44 @@ function fenceRange(body: string, markers: FenceMarkers): [number, number] | nul
   return [begin, end + markers.end.length];
 }
 
+function managedSectionRange(body: string, markers: FenceMarkers): [number, number] | null {
+  const range = fenceRange(body, markers);
+  if (!range) return null;
+
+  const prefix = body.slice(0, range[0]);
+  const escapedHeading = markers.heading.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const headingMatch = prefix.match(
+    new RegExp(`(?:^|\\n)${escapedHeading}[ \\t]*\\n(?:[ \\t]*\\n)*$`),
+  );
+  if (!headingMatch) return range;
+
+  const leadingNewline = headingMatch[0].startsWith('\n') ? 1 : 0;
+  return [prefix.length - headingMatch[0].length + leadingNewline, range[1]];
+}
+
 /**
  * Markdown fences are canonical file-only state. A whole-page renderer may
- * refresh prose/frontmatter from the DB, but it must never delete or replace a
- * fence that was published while its earlier DB snapshot was waiting on the
- * page lock.
+ * refresh prose/frontmatter from the DB, but the current file's fence state —
+ * including canonical absence — always wins over an earlier DB snapshot.
  */
 export function preserveCanonicalFences(nextBody: string, currentBody: string): string {
   let merged = nextBody;
   for (const markers of MANAGED_FENCES) {
     const currentRange = fenceRange(currentBody, markers);
-    if (!currentRange) continue;
-    const canonicalFence = currentBody.slice(currentRange[0], currentRange[1]);
-    const nextRange = fenceRange(merged, markers);
-    if (nextRange) {
-      merged = merged.slice(0, nextRange[0]) + canonicalFence + merged.slice(nextRange[1]);
-    } else {
-      merged = `${merged.trimEnd()}\n\n${canonicalFence}\n`;
+    const nextRange = managedSectionRange(merged, markers);
+    if (!currentRange) {
+      if (nextRange) {
+        merged = merged.slice(0, nextRange[0]) + merged.slice(nextRange[1]);
+      }
+      continue;
     }
+
+    const canonicalFence = currentBody.slice(currentRange[0], currentRange[1]);
+    const canonicalSection = `${markers.heading}\n\n${canonicalFence}`;
+    if (nextRange) {
+      merged = merged.slice(0, nextRange[0]) + merged.slice(nextRange[1]);
+    }
+    merged = insertSectionBeforeTimeline(merged, canonicalSection);
   }
   return merged;
 }

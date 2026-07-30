@@ -29,6 +29,7 @@ import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { dispatchToolCall } from '../src/mcp/dispatch.ts';
 import { TAKES_FENCE_BEGIN, TAKES_FENCE_END } from '../src/core/takes-fence.ts';
+import { FACTS_FENCE_BEGIN, FACTS_FENCE_END } from '../src/core/facts-fence.ts';
 
 let engine: PGLiteEngine;
 
@@ -47,6 +48,15 @@ ${TAKES_FENCE_BEGIN}
 | 2 | Strong technical founder | take | garry | 0.85 | 2026-04 | OH |
 | 3 | Seemed burned out | hunch | brain | 0.4 | 2026-04 | OH |
 ${TAKES_FENCE_END}
+
+## Facts
+
+${FACTS_FENCE_BEGIN}
+| # | claim | kind | confidence | visibility | notability | valid_from | valid_until | source | context |
+|---|-------|------|------------|------------|------------|------------|-------------|--------|---------|
+| 1 | Public company fact | fact | 1.0 | world | medium | 2026-01-01 |  | public |  |
+| 2 | PRIVATE_FACT_HISTORY_PROOF | preference | 0.9 | private | high | 2026-01-01 |  | private |  |
+${FACTS_FENCE_END}
 
 ## Notes
 
@@ -93,6 +103,8 @@ describe('C4: get_page takes-fence redaction (#728)', () => {
     expect(page.compiled_truth).not.toContain(TAKES_FENCE_BEGIN);
     expect(page.compiled_truth).not.toContain(TAKES_FENCE_END);
     expect(page.compiled_truth).not.toContain('Seemed burned out');
+    expect(page.compiled_truth).not.toContain('PRIVATE_FACT_HISTORY_PROOF');
+    expect(page.compiled_truth).toContain('Public company fact');
     // Public summary survives — only the fence is removed.
     expect(page.compiled_truth).toContain('Public-facing summary');
     expect(page.compiled_truth).toContain('Other content below the fence');
@@ -111,6 +123,28 @@ describe('C4: get_page takes-fence redaction (#728)', () => {
     const page = parseResult(result) as { compiled_truth: string };
     expect(page.compiled_truth).not.toContain(TAKES_FENCE_BEGIN);
     expect(page.compiled_truth).not.toContain('Seemed burned out');
+  });
+
+  test('remote get_page redacts malformed private fences from the timeline channel', async () => {
+    const timelineSlug = 'people/timeline-private-c4';
+    await engine.putPage(timelineSlug, {
+      title: 'Timeline private fixture',
+      type: 'person',
+      compiled_truth: '# Public summary',
+      timeline: `## Facts\n\n${FACTS_FENCE_BEGIN}\n`
+        + '| # | claim | kind | confidence | visibility | notability | valid_from | valid_until | source | context |\n'
+        + '|---|-------|------|------------|------------|------------|------------|-------------|--------|---------|\n'
+        + '| 1 | PRIVATE_TIMELINE_PROOF | fact | 1.0 | private | high | 2026-01-01 |  | private |  |\n'
+        + `${FACTS_FENCE_END}\n\n## Timeline\n\n- public event`,
+    });
+
+    const result = await dispatchToolCall(engine, 'get_page', { slug: timelineSlug }, {
+      remote: true,
+    });
+    const page = parseResult(result) as { compiled_truth: string; timeline: string };
+    expect(page.compiled_truth).toContain('Public summary');
+    expect(page.timeline).not.toContain('PRIVATE_TIMELINE_PROOF');
+    expect(page.timeline).toContain('public event');
   });
 });
 
@@ -137,6 +171,22 @@ describe('C4: get_versions takes-fence redaction (#728)', () => {
     for (const v of versions) {
       expect(v.compiled_truth).not.toContain(TAKES_FENCE_BEGIN);
       expect(v.compiled_truth).not.toContain('Seemed burned out');
+      expect(v.compiled_truth).not.toContain('PRIVATE_FACT_HISTORY_PROOF');
+      expect(v.compiled_truth).toContain('Public company fact');
+    }
+  });
+
+  test('remote caller without a takes allow-list still gets both private channels redacted', async () => {
+    const result = await dispatchToolCall(engine, 'get_versions', { slug: PAGE_SLUG }, {
+      remote: true,
+    });
+    const versions = parseResult(result) as Array<{ compiled_truth: string }>;
+    expect(versions.length).toBeGreaterThan(0);
+    for (const v of versions) {
+      expect(v.compiled_truth).not.toContain(TAKES_FENCE_BEGIN);
+      expect(v.compiled_truth).not.toContain('Seemed burned out');
+      expect(v.compiled_truth).not.toContain('PRIVATE_FACT_HISTORY_PROOF');
+      expect(v.compiled_truth).toContain('Public company fact');
     }
   });
 
@@ -148,5 +198,6 @@ describe('C4: get_versions takes-fence redaction (#728)', () => {
     expect(versions.length).toBeGreaterThan(0);
     expect(versions[0].compiled_truth).toContain(TAKES_FENCE_BEGIN);
     expect(versions[0].compiled_truth).toContain('Seemed burned out');
+    expect(versions[0].compiled_truth).toContain('PRIVATE_FACT_HISTORY_PROOF');
   });
 });
