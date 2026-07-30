@@ -3954,13 +3954,18 @@ export class PostgresEngine implements BrainEngine {
     return { id, status: 'inserted' };
   }
 
-  async expireFact(id: number, opts?: { supersededBy?: number; at?: Date }): Promise<boolean> {
+  async expireFact(
+    id: number,
+    opts?: { supersededBy?: number; at?: Date; requireUnfenced?: boolean },
+  ): Promise<boolean> {
     const sql = this.sql;
     const at = opts?.at ?? new Date();
     const supersededBy = opts?.supersededBy ?? null;
+    const requireUnfenced = opts?.requireUnfenced === true;
     const result = await sql`
       UPDATE facts SET expired_at = ${at}, superseded_by = COALESCE(${supersededBy}, superseded_by)
       WHERE id = ${id} AND expired_at IS NULL
+        AND (${requireUnfenced} = false OR row_num IS NULL)
     `;
     return (result.count ?? 0) > 0;
   }

@@ -21,13 +21,14 @@
  * only does "row exists + repo is a real dir → render + atomic write".
  */
 
-import { existsSync, statSync, mkdirSync, writeFileSync, renameSync, unlinkSync } from 'fs';
+import { existsSync, statSync, mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'fs';
 import { dirname, join } from 'path';
 import { randomBytes } from 'crypto';
 import type { BrainEngine } from './engine.ts';
 import { serializePageToMarkdown, resolvePageFilePath } from './markdown.ts';
 import { isWriteTargetContained } from './path-confine.ts';
 import { withFilePageLock } from './page-lock.ts';
+import { preserveCanonicalFences } from './canonical-fences.ts';
 
 /** Minimal logger surface — structurally compatible with operations.ts `Logger`. */
 export interface WriteThroughLogger {
@@ -136,9 +137,12 @@ export async function writePageThrough(
       }
 
       const tags = await engine.getTags(slug, { sourceId });
-      const md = serializePageToMarkdown(writtenPage, tags, {
+      let md = serializePageToMarkdown(writtenPage, tags, {
         frontmatterOverrides: opts.frontmatterOverrides,
       });
+      if (existsSync(filePath)) {
+        md = preserveCanonicalFences(md, readFileSync(filePath, 'utf8'));
+      }
 
       mkdirSync(dirname(filePath), { recursive: true });
 

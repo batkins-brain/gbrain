@@ -96,6 +96,25 @@ describe('writePageThrough', () => {
     expect(fs.readdirSync(dir).some((f) => f.includes('.tmp.'))).toBe(false);
   });
 
+  test('whole-page rendering preserves a newer canonical facts fence', async () => {
+    await engine.setConfig('sync.repo_path', brainDir);
+    const slug = 'people/alice';
+    await seedPage(slug);
+    const expectedPath = resolvePageFilePath(brainDir, slug, 'default');
+    fs.mkdirSync(path.dirname(expectedPath), { recursive: true });
+    fs.writeFileSync(
+      expectedPath,
+      '# Alice\n\n<!--- gbrain:facts:begin -->\n| row_num | claim |\n|---:|---|\n| 1 | New canonical fact |\n<!--- gbrain:facts:end -->\n',
+    );
+
+    const res = await writePageThrough(engine, slug, { sourceId: 'default' });
+
+    expect(res.written).toBe(true);
+    const published = fs.readFileSync(expectedPath, 'utf8');
+    expect(published).toContain('# Body people/alice');
+    expect(published).toContain('New canonical fact');
+  });
+
   test('no sync.repo_path → skipped no_repo_configured', async () => {
     await engine.setConfig('sync.repo_path', '');
     const slug = 'wiki/ideas/x-1';

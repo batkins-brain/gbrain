@@ -433,6 +433,34 @@ describe('upsertFactRow', () => {
     expect(out).toContain('Prose here.');  // preamble preserved
   });
 
+  test('creates a new Facts section before the timeline channel', () => {
+    const body = '# Some Entity\n\nProse here.\n\n<!-- timeline -->\n## Timeline\n\n- private event\n';
+    const { body: out } = upsertFactRow(body, {
+      claim: 'A private fact',
+      kind: 'fact',
+      confidence: 1.0,
+      visibility: 'private',
+      notability: 'medium',
+    });
+
+    expect(out.indexOf(FACTS_FENCE_BEGIN)).toBeLessThan(out.indexOf('<!-- timeline -->'));
+    expect(out.slice(out.indexOf('<!-- timeline -->'))).not.toContain(FACTS_FENCE_BEGIN);
+  });
+
+  test('creates a new Facts section before a blank-line legacy timeline separator', () => {
+    const body = '# Some Entity\n\nProse here.\n\n---\n\n## Timeline\n\n- private event\n';
+    const { body: out } = upsertFactRow(body, {
+      claim: 'A private fact',
+      kind: 'fact',
+      confidence: 1.0,
+      visibility: 'private',
+      notability: 'medium',
+    });
+
+    expect(out.indexOf(FACTS_FENCE_BEGIN)).toBeLessThan(out.indexOf('---\n\n## Timeline'));
+    expect(out.slice(out.indexOf('---\n\n## Timeline'))).not.toContain(FACTS_FENCE_BEGIN);
+  });
+
   test('appends to existing fence with row_num = max + 1', () => {
     const body = wrapFenceBody(
       `| 1 | First | fact | 1.0 | world | medium | 2026-01-01 |  | src |  |
@@ -532,5 +560,18 @@ describe('stripFactsFence', () => {
     const stripped = stripFactsFence(body, { keepVisibility: [] });
     expect(stripped).not.toContain('something');
     expect(stripped).not.toContain(FACTS_FENCE_BEGIN);
+  });
+
+  test('fails closed on unbalanced fence markers', () => {
+    const malformed = `Public\n${FACTS_FENCE_BEGIN}\nPRIVATE_MALFORMED_FACT`;
+    expect(stripFactsFence(malformed, { keepVisibility: ['world'] })).toBe('');
+  });
+
+  test('fails closed on duplicated fence blocks', () => {
+    const block = wrapFenceBody(
+      `| 1 | private duplicate | fact | 1.0 | private | high | 2026-01-01 |  | src |  |`,
+    );
+    const duplicated = `${block}\n${block}`;
+    expect(stripFactsFence(duplicated, { keepVisibility: ['world'] })).toBe('');
   });
 });

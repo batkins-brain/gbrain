@@ -134,6 +134,8 @@ interface LegacyFactRow {
   claim_value: number | null;
   claim_unit: string | null;
   claim_period: string | null;
+  expired_at: Date | null;
+  superseded_by: string | null;
 }
 
 interface FencedFactRow extends LegacyFactRow {
@@ -372,6 +374,7 @@ interface NativeAtSymbols {
     flags: number,
   ) => number;
   unlinkat: (dirFd: number, path: Uint8Array, flags: number) => number;
+  fchmod: (fd: number, mode: number) => number;
 }
 
 let nativeAtLibrary: ReturnType<typeof dlopen> | null = null;
@@ -413,6 +416,10 @@ function getNativeAtSymbols(): NativeAtSymbols {
       args: [FFIType.i32, FFIType.cstring, FFIType.i32],
       returns: FFIType.i32,
     },
+    fchmod: {
+      args: [FFIType.i32, FFIType.u32],
+      returns: FFIType.i32,
+    },
   });
   nativeAtSymbols = nativeAtLibrary.symbols as unknown as NativeAtSymbols;
   return nativeAtSymbols;
@@ -440,6 +447,16 @@ function nativeMkdirAt(fd: number, name: string, mode: number): void {
     fchmodSync(childFd, mode);
   } finally {
     closeSync(childFd);
+  }
+}
+
+function setPrivateFileMode(fd: number, nativeBackend: boolean): void {
+  if (nativeBackend) {
+    if (getNativeAtSymbols().fchmod(fd, 0o600) < 0) {
+      throw new Error('descriptor-relative fchmod failed');
+    }
+  } else {
+    fchmodSync(fd, 0o600);
   }
 }
 
@@ -684,13 +701,18 @@ function writeOwnedTempFileAt(parent: AnchoredParent, name: string, body: string
     ? openSync(anchoredChildPath(parent, name), flags, 0o600)
     : nativeOpenAt(parent.fd, name, flags, 0o600);
   try {
-    if (!fstatSync(fd).isFile()) {
+    // Darwin arm64 passes variadic C arguments differently from fixed FFI
+    // arguments, so openat(..., O_CREAT, mode) may create with mode 000.
+    // The descriptor is already exclusively ours; establish and verify the
+    // private mode explicitly before any publication.
+    setPrivateFileMode(fd, !parent.descriptorBase);
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) {
       throw new Error(`migration temporary target is not a regular file: ${name}`);
     }
-    // Force owner-only mode after create. Darwin's openat(2) is variadic; the
-    // bun:ffi binding can silently drop the mode argument and leave mode 0
-    // files that later fail with EACCES for the same effective user.
-    fchmodSync(fd, 0o600);
+    if ((stat.mode & 0o777) !== 0o600) {
+      throw new Error(`migration temporary target mode is not private: ${name}`);
+    }
     writeFileSync(fd, body, 'utf-8');
   } finally {
     closeSync(fd);
@@ -782,6 +804,18 @@ function normalizedConfidence(value: number): number {
   return Number.parseFloat(Number(value).toFixed(2));
 }
 
+function migratedLegacyValidUntil(row: LegacyFactRow): string {
+  return dateOnly(row.valid_until) || dateOnly(row.expired_at);
+}
+
+function migratedLegacyContext(row: LegacyFactRow): string {
+  if (!row.expired_at) return row.context ?? '';
+  const marker = row.superseded_by
+    ? `legacy superseded fact id ${row.superseded_by} (v0.32.2)`
+    : 'legacy expired (v0.32.2)';
+  return row.context ? `${row.context}; ${marker}` : marker;
+}
+
 function dbFactIdentity(row: LegacyFactRow): string {
   return JSON.stringify({
     claim: row.fact,
@@ -800,9 +834,32 @@ function dbFactIdentity(row: LegacyFactRow): string {
   });
 }
 
-function fenceFactIdentity(row: ReturnType<typeof parseFactsFence>['facts'][number]): string {
+function migratedLegacyFactIdentity(row: LegacyFactRow): string {
+  return JSON.stringify({
+    claim: row.fact,
+    active: row.expired_at === null,
+    kind: row.kind,
+    confidence: normalizedConfidence(row.confidence),
+    visibility: row.visibility,
+    notability: row.notability,
+    validFrom: dateOnly(row.valid_from),
+    validUntil: migratedLegacyValidUntil(row),
+    source: row.source ?? '',
+    context: migratedLegacyContext(row),
+    claimMetric: row.claim_metric ?? '',
+    claimValue: row.claim_value ?? null,
+    claimUnit: row.claim_unit ?? '',
+    claimPeriod: row.claim_period ?? '',
+  });
+}
+
+function fenceFactIdentity(
+  row: ReturnType<typeof parseFactsFence>['facts'][number],
+  includeActive = false,
+): string {
   return JSON.stringify({
     claim: row.claim,
+    ...(includeActive ? { active: row.active } : {}),
     kind: row.kind,
     confidence: normalizedConfidence(row.confidence),
     visibility: row.visibility,
@@ -830,7 +887,8 @@ async function buildTargetPlan(
   const legacy = await engine.executeRaw<LegacyFactRow>(
     `SELECT id, source_id, entity_slug, fact, kind, visibility, notability,
             context, valid_from, valid_until, source, confidence,
-            claim_metric, claim_value, claim_unit, claim_period
+            claim_metric, claim_value, claim_unit, claim_period,
+            expired_at, superseded_by
        FROM facts
       WHERE row_num IS NULL
       ORDER BY source_id, entity_slug, id`,
@@ -1011,7 +1069,7 @@ async function phaseBFenceFacts(
 
     for (const target of plan) {
       const {
-        targetMarkdownSlug, originalEntitySlug, filePath, tmpPath, rows: group,
+        targetMarkdownSlug, originalEntitySlug, filePath, tmpPath,
       } = target;
 
       try {
@@ -1019,6 +1077,27 @@ async function phaseBFenceFacts(
         // key. Holding it across read, optimistic comparison, publication, and
         // DB stamping makes the comparison enforceable rather than advisory.
         await withFilePageLock(filePath, async () => {
+          await engine.transaction(async migrationEngine => {
+          // Refresh mutable legacy state after acquiring the canonical page
+          // lock, and keep row locks through publication + DB stamping. In
+          // particular, a concurrent legacy forget either commits first and
+          // renders inactive here, or waits and retries through the canonical
+          // fence path after row_num is stamped.
+          const group = await migrationEngine.executeRaw<LegacyFactRow>(
+            `SELECT id, source_id, entity_slug, fact, kind, visibility, notability,
+                    context, valid_from, valid_until, source, confidence,
+                    claim_metric, claim_value, claim_unit, claim_period,
+                    expired_at, superseded_by
+               FROM facts
+              WHERE source_id = $1
+                AND entity_slug = $2
+                AND row_num IS NULL
+              ORDER BY id
+              FOR UPDATE`,
+            [target.sourceId, target.originalEntitySlug],
+          );
+          if (group.length === 0) return;
+
           // Re-check immediately before access so a pre-existing intermediate
           // symlink cannot redirect either the canonical or quarantine write.
           if (
@@ -1076,10 +1155,11 @@ async function phaseBFenceFacts(
           // DB rows already stamped to this page own their row numbers. Validate
           // that the fence still carries the same full fact identity before
           // considering any unowned fence rows for crash recovery.
-          const assignedRows = await engine.executeRaw<FencedFactRow>(
+          const assignedRows = await migrationEngine.executeRaw<FencedFactRow>(
             `SELECT id, source_id, entity_slug, fact, kind, visibility, notability,
                     context, valid_from, valid_until, source, confidence,
                     claim_metric, claim_value, claim_unit, claim_period,
+                    expired_at, superseded_by,
                     row_num, source_markdown_slug
                FROM facts
               WHERE source_id = $1
@@ -1107,19 +1187,29 @@ async function phaseBFenceFacts(
           const availableByIdentity = new Map<string, number[]>();
           for (const fact of existingFence.facts) {
             if (occupiedRowNums.has(fact.rowNum)) continue;
-            const identity = fenceFactIdentity(fact);
+            const identity = fenceFactIdentity(fact, true);
             const queue = availableByIdentity.get(identity) ?? [];
             queue.push(fact.rowNum);
             availableByIdentity.set(identity, queue);
           }
 
-          const assignments: Array<{ id: string; row_num: number }> = [];
+          const assignments: Array<{
+            id: string;
+            row_num: number;
+            valid_until: string | null;
+            context: string | null;
+          }> = [];
           for (const row of group) {
-            const identity = dbFactIdentity(row);
+            const identity = migratedLegacyFactIdentity(row);
             const queue = availableByIdentity.get(identity);
             const recoveredRowNum = queue?.shift();
             if (recoveredRowNum !== undefined) {
-              assignments.push({ id: row.id, row_num: recoveredRowNum });
+              assignments.push({
+                id: row.id,
+                row_num: recoveredRowNum,
+                valid_until: migratedLegacyValidUntil(row) || null,
+                context: migratedLegacyContext(row) || null,
+              });
               occupiedRowNums.add(recoveredRowNum);
               continue;
             }
@@ -1130,10 +1220,11 @@ async function phaseBFenceFacts(
               confidence: row.confidence,
               visibility: row.visibility,
               notability: row.notability,
+              active:      row.expired_at === null,
               validFrom:  dateOnly(row.valid_from),
-              validUntil: dateOnly(row.valid_until) || undefined,
+              validUntil: migratedLegacyValidUntil(row) || undefined,
               source:     row.source,
-              context:    row.context ?? undefined,
+              context:    migratedLegacyContext(row) || undefined,
               claimMetric: row.claim_metric ?? undefined,
               claimValue:  row.claim_value ?? undefined,
               claimUnit:   row.claim_unit ?? undefined,
@@ -1141,7 +1232,12 @@ async function phaseBFenceFacts(
             });
             body = updated;
             occupiedRowNums.add(rowNum);
-            assignments.push({ id: row.id, row_num: rowNum });
+            assignments.push({
+              id: row.id,
+              row_num: rowNum,
+              valid_until: migratedLegacyValidUntil(row) || null,
+              context: migratedLegacyContext(row) || null,
+            });
           }
 
           // Parse in memory first: private bytes are not staged anywhere on
@@ -1188,9 +1284,12 @@ async function phaseBFenceFacts(
 
           // UPDATE the DB rows with their new row_nums + source_markdown_slug.
           for (const a of assignments) {
-            await engine.executeRaw(
-              `UPDATE facts SET row_num = $1, source_markdown_slug = $2 WHERE id = $3`,
-              [a.row_num, targetMarkdownSlug, a.id],
+            await migrationEngine.executeRaw(
+              `UPDATE facts
+                  SET row_num = $1, source_markdown_slug = $2,
+                      valid_until = $3, context = $4
+                WHERE id = $5`,
+              [a.row_num, targetMarkdownSlug, a.valid_until, a.context, a.id],
             );
           }
           outcome.fenced += assignments.length;
@@ -1198,6 +1297,7 @@ async function phaseBFenceFacts(
           } finally {
             closeAnchoredParent(parent);
           }
+          });
         }, testPageLockRoot ? { lockRoot: testPageLockRoot } : {});
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -1245,6 +1345,7 @@ async function phaseCVerify(
       `SELECT id, source_id, entity_slug, fact, kind, visibility, notability,
               context, valid_from, valid_until, source, confidence,
               claim_metric, claim_value, claim_unit, claim_period,
+              expired_at, superseded_by,
               row_num, source_markdown_slug
          FROM facts
         WHERE row_num IS NOT NULL
@@ -1295,7 +1396,11 @@ async function phaseCVerify(
           }
           const drifted = group.find(row => {
             const fenced = fenceByRowNum.get(Number(row.row_num));
-            return !fenced || fenceFactIdentity(fenced) !== dbFactIdentity(row);
+            return (
+              !fenced ||
+              fenceFactIdentity(fenced) !== dbFactIdentity(row) ||
+              (row.expired_at !== null && fenced.active !== false)
+            );
           });
           if (drifted) {
             mismatches.push(`${sourceMarkdownSlug} (identity drift at row=${drifted.row_num})`);

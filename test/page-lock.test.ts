@@ -17,8 +17,10 @@ import {
   acquireFilePageLock,
   acquirePageLock,
   filePageLockKey,
+  withFilePageLock,
   withPageLock,
 } from '../src/core/page-lock.ts';
+import { preserveCanonicalFences } from '../src/core/canonical-fences.ts';
 
 let tmp: string;
 
@@ -195,6 +197,34 @@ describe('file-path lock identity', () => {
     const contender = await acquireFilePageLock(join(root, 'people', 'alice.md'), { lockRoot });
     expect(contender).toBeNull();
     await holder!.release();
+  });
+
+  test('a stale whole-page renderer cannot delete a fence published while it waits', async () => {
+    const page = join(tmp, 'brain', 'people', 'alice.md');
+    const lockRoot = join(tmp, 'locks');
+    require('node:fs').mkdirSync(join(tmp, 'brain', 'people'), { recursive: true });
+    writeFileSync(page, '# Alice\n');
+    const staleDbRender = '# Alice\n\nDB prose snapshot.\n';
+    const migration = await acquireFilePageLock(page, { lockRoot });
+    expect(migration).not.toBeNull();
+
+    const reverseWriter = withFilePageLock(page, async () => {
+      const current = readFileSync(page, 'utf8');
+      writeFileSync(page, preserveCanonicalFences(staleDbRender, current));
+    }, { lockRoot, timeoutMs: 2_000, pollMs: 10 });
+
+    await new Promise(resolvePromise => setTimeout(resolvePromise, 30));
+    writeFileSync(
+      page,
+      '# Alice\n\n## Facts\n\n<!--- gbrain:facts:begin -->\n| row_num | claim |\n|---:|---|\n| 1 | Canonical fact |\n<!--- gbrain:facts:end -->\n',
+    );
+    await migration!.release();
+    await reverseWriter;
+
+    const published = readFileSync(page, 'utf8');
+    expect(published).toContain('DB prose snapshot.');
+    expect(published).toContain('Canonical fact');
+    expect(published).toContain('<!--- gbrain:facts:begin -->');
   });
 });
 

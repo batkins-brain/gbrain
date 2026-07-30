@@ -742,12 +742,16 @@ const get_page: Operation = {
     //  - stripFactsFence({keepVisibility: ['world']}): keeps world rows,
     //    drops private. World facts are public knowledge by definition;
     //    untrusted readers see them. Private facts never cross the boundary.
-    const isUntrustedReader = ctx.remote === true;
+    const isUntrustedReader = ctx.remote !== false;
     const visibleBody = isUntrustedReader
       ? {
           ...page,
           compiled_truth: stripFactsFence(
             stripTakesFence(page.compiled_truth),
+            { keepVisibility: ['world'] },
+          ),
+          timeline: stripFactsFence(
+            stripTakesFence(page.timeline),
             { keepVisibility: ['world'] },
           ),
         }
@@ -2544,12 +2548,17 @@ const get_versions: Operation = {
     // v0.31.8 (D20): thread ctx.sourceId.
     const sourceOpts = ctx.sourceId ? { sourceId: ctx.sourceId } : {};
     const versions = await ctx.engine.getVersions(p.slug as string, sourceOpts);
-    // Same takes-allow-list privacy boundary as get_page. Snapshots persist
-    // historical compiled_truth verbatim, including the takes fence, so
-    // a remote token bypassing get_page via /history would re-introduce
-    // the same leak across every prior version.
-    if (!ctx.takesHoldersAllowList) return versions;
-    return versions.map(v => ({ ...v, compiled_truth: stripTakesFence(v.compiled_truth) }));
+    // Same remote-reader privacy boundary as get_page. Snapshots persist
+    // historical compiled_truth verbatim, so /history must redact both
+    // managed private channels even when no takes holder allow-list is set.
+    if (ctx.remote === false) return versions;
+    return versions.map(v => ({
+      ...v,
+      compiled_truth: stripFactsFence(
+        stripTakesFence(v.compiled_truth),
+        { keepVisibility: ['world'] },
+      ),
+    }));
   },
   scope: 'read',
   cliHints: { name: 'history', positional: ['slug'] },

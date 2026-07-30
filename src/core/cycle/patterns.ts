@@ -28,6 +28,7 @@ import type { MinionJobInput, SubagentHandlerData } from '../minions/types.ts';
 import { serializeMarkdown } from '../markdown.ts';
 import type { Page, PageType } from '../types.ts';
 import { withFilePageLock } from '../page-lock.ts';
+import { preserveCanonicalFences } from '../canonical-fences.ts';
 
 export interface PatternsPhaseOpts {
   brainDir: string;
@@ -262,11 +263,7 @@ async function reverseWriteRefs(
     // v0.32.8 F6: guard against malformed source_id (would let join() break
     // out of brainDir). validateSourceId throws on `..`, `/`, etc.
     validateSourceId(source_id);
-    const page = await engine.getPage(slug, { sourceId: source_id });
-    if (!page) continue;
-    const tags = await engine.getTags(slug, { sourceId: source_id });
     try {
-      const md = renderPageToMarkdown(page, tags);
       // v0.32.8 F6: non-default sources land under brainDir/.sources/<id>/<slug>.md
       // so same-slug-different-source pages don't collide on disk. Default-source
       // pages stay at brainDir/<slug>.md so single-source brains see no change.
@@ -274,11 +271,20 @@ async function reverseWriteRefs(
       const filePath = source_id === 'default'
         ? join(brainDir, `${slug}.md`)
         : join(brainDir, '.sources', source_id, `${slug}.md`);
+      let wrote = false;
       await withFilePageLock(filePath, async () => {
+        const page = await engine.getPage(slug, { sourceId: source_id });
+        if (!page) return;
+        const tags = await engine.getTags(slug, { sourceId: source_id });
+        let md = renderPageToMarkdown(page, tags);
+        if (existsSync(filePath)) {
+          md = preserveCanonicalFences(md, readFileSync(filePath, 'utf8'));
+        }
         mkdirSync(dirname(filePath), { recursive: true });
         writeFileSync(filePath, md, 'utf8');
+        wrote = true;
       }, { timeoutMs: 5_000 });
-      count++;
+      if (wrote) count++;
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       process.stderr.write(`[dream] reverse-write ${slug}@${source_id} failed: ${msg}\n`);

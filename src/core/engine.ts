@@ -1762,8 +1762,14 @@ export interface BrainEngine {
   /**
    * Mark a fact expired. Never DELETE. Returns true iff a row was updated.
    * Idempotent-as-false (already expired returns false without changing state).
+   * `requireUnfenced` makes the update conditional on `row_num IS NULL`; the
+   * legacy forget path uses it to hand off safely when migration v0.32.2 wins
+   * the race and publishes the row into the canonical fence.
    */
-  expireFact(id: number, opts?: { supersededBy?: number; at?: Date }): Promise<boolean>;
+  expireFact(
+    id: number,
+    opts?: { supersededBy?: number; at?: Date; requireUnfenced?: boolean },
+  ): Promise<boolean>;
 
   /** List active facts about an entity within a source, newest first. */
   listFactsByEntity(
