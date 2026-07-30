@@ -1,15 +1,9 @@
 /**
- * Query-cache scope key (federation hardening).
- *
- * A federated search reads a different graph than a single-source one, so
- * the semantic cache must key them apart. `cacheScopeKey` produces an
- * order-independent key for federated scopes and leaves single-source
- * brains on their existing key (scalar id or 'default'), so single-source
- * cache hit-rate is unchanged.
+ * Query-cache scope key (federation hardening) + cache-hit source filter.
  */
 
 import { describe, test, expect } from 'bun:test';
-import { cacheScopeKey } from '../src/core/search/hybrid.ts';
+import { cacheScopeKey, filterResultsBySourceScope } from '../src/core/search/hybrid.ts';
 
 describe('cacheScopeKey', () => {
   test('unscoped → default (single-source unchanged)', () => {
@@ -24,7 +18,7 @@ describe('cacheScopeKey', () => {
   test('federated sourceIds → order-independent set key', () => {
     const k1 = cacheScopeKey({ sourceIds: ['team-b', 'team-a', 'host'] });
     const k2 = cacheScopeKey({ sourceIds: ['host', 'team-a', 'team-b'] });
-    expect(k1).toBe(k2); // order does not matter
+    expect(k1).toBe(k2);
     expect(k1).toBe('__set__:host,team-a,team-b');
   });
 
@@ -37,6 +31,43 @@ describe('cacheScopeKey', () => {
   test('federated set key is distinct from any single scalar key', () => {
     const set = cacheScopeKey({ sourceIds: ['host'] });
     const scalar = cacheScopeKey({ sourceId: 'host' });
-    expect(set).not.toBe(scalar); // a 1-element set still cannot serve a scalar read
+    expect(set).not.toBe(scalar);
+  });
+});
+
+function hit(source_id: string, slug: string) {
+  return {
+    slug,
+    source_id,
+    score: 1,
+    chunk_text: 'x',
+  } as any;
+}
+
+describe('filterResultsBySourceScope — TAN-576 cache-hit boundary', () => {
+  const rows = [
+    hit('default', 'inbox/a'),
+    hit('24-105', '24-105/rulings/layback-8010-10-allocated'),
+    hit('default', '24-105/findings/local-copy'),
+  ];
+
+  test('scalar sourceId drops out-of-scope rows', () => {
+    const filtered = filterResultsBySourceScope(rows, { sourceId: 'default' });
+    expect(filtered.map(r => `${r.source_id}:${r.slug}`)).toEqual([
+      'default:inbox/a',
+      'default:24-105/findings/local-copy',
+    ]);
+  });
+
+  test('federated sourceIds keep only members', () => {
+    const filtered = filterResultsBySourceScope(rows, { sourceIds: ['24-105', 'default'] });
+    expect(filtered).toHaveLength(3);
+    const only105 = filterResultsBySourceScope(rows, { sourceIds: ['24-105'] });
+    expect(only105.map(r => r.source_id)).toEqual(['24-105']);
+  });
+
+  test('unscoped leaves rows unchanged', () => {
+    expect(filterResultsBySourceScope(rows, {})).toHaveLength(3);
+    expect(filterResultsBySourceScope(rows, undefined)).toHaveLength(3);
   });
 });

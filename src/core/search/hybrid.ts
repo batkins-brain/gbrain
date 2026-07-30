@@ -1766,7 +1766,14 @@ export async function hybridSearchCached(
       // surface excluded slugs. Filter BEFORE the slice so excluded rows
       // don't consume the page window.
       const policyFiltered = filterHardExcluded(hit.results, cachedHardExcludes);
-      const sliced = policyFiltered.slice(offset, offset + limit);
+      // TAN-576 residual: stale cache rows stored under scalar "default"
+      // before federated scope keys can contain out-of-scope source_ids.
+      // Drop them; if nothing remains, treat as a miss and recompute fresh.
+      const scopeFiltered = filterResultsBySourceScope(policyFiltered, opts);
+      if (scopeFiltered.length === 0) {
+        cacheStatus = 'miss';
+      } else {
+      const sliced = scopeFiltered.slice(offset, offset + limit);
 
       // Budget enforcement — same pipeline tail as fresh path.
       const { results: budgeted, meta: budgetMeta } = enforceTokenBudget(sliced, opts?.tokenBudget);
@@ -1799,6 +1806,7 @@ export async function hybridSearchCached(
         // swallow — telemetry is best-effort
       }
       return budgeted;
+      }
     }
   }
 
@@ -1896,6 +1904,27 @@ function rrfKey(r: SearchResult): string {
  *   - scalar sourceId           → the id itself (single-source unchanged)
  *   - unscoped                  → `'default'` (single-source brains unchanged)
  */
+/**
+ * TAN-576 residual — keep cache hits inside the requested source scope.
+ *
+ * Stale semantic-cache rows written under scalar `default` before federated
+ * scope keys existed can still contain out-of-scope `source_id` pages. Fresh
+ * SQL paths already filter; cache hits must too.
+ */
+export function filterResultsBySourceScope(
+  results: SearchResult[],
+  opts?: { sourceId?: string; sourceIds?: string[] },
+): SearchResult[] {
+  if (opts?.sourceIds && opts.sourceIds.length > 0) {
+    const allowed = new Set(opts.sourceIds);
+    return results.filter(r => allowed.has(r.source_id ?? 'default'));
+  }
+  if (typeof opts?.sourceId === 'string' && opts.sourceId.length > 0) {
+    return results.filter(r => (r.source_id ?? 'default') === opts.sourceId);
+  }
+  return results;
+}
+
 export function cacheScopeKey(opts?: { sourceId?: string; sourceIds?: string[] }): string {
   if (opts?.sourceIds && opts.sourceIds.length > 0) {
     return '__set__:' + [...opts.sourceIds].sort().join(',');
