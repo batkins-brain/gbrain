@@ -5505,6 +5505,51 @@ export const MIGRATIONS: Migration[] = [
         WHERE dimension IS NOT NULL;
     `,
   },
+  {
+    version: 123,
+    name: 'graph_reference_observations',
+    // TAN-610-IMPL-1 — no-write metric substrate for live graph harness.
+    // Persisted `links` only store FK-resolved endpoints, so unresolved targets,
+    // broken references, and cross-source ambiguity cannot be measured from the
+    // links table alone. This observation table holds scanner/read-scan findings
+    // without mutating pages or links. Observation writes remain a separate
+    // approved read-scan gate; this migration only creates the substrate.
+    // Migration-created (absent from static schema.sql) so fresh + upgraded
+    // brains both receive it through initSchema/runMigrations.
+    idempotent: true,
+    sql: `
+      CREATE TABLE IF NOT EXISTS graph_reference_observations (
+        observation_id TEXT PRIMARY KEY,
+        source_id TEXT NOT NULL,
+        from_slug TEXT NOT NULL,
+        raw_target TEXT NOT NULL,
+        resolution_status TEXT NOT NULL
+          CHECK (resolution_status IN ('resolved', 'unresolved', 'ambiguous', 'broken')),
+        to_source_id TEXT,
+        to_slug TEXT,
+        candidate_source_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+        evidence_span TEXT,
+        scanner_version TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_graph_ref_obs_source_status
+        ON graph_reference_observations (source_id, resolution_status);
+
+      CREATE INDEX IF NOT EXISTS idx_graph_ref_obs_source_from
+        ON graph_reference_observations (source_id, from_slug);
+
+      CREATE INDEX IF NOT EXISTS idx_graph_ref_obs_observed_at
+        ON graph_reference_observations (source_id, observed_at DESC);
+    `,
+    verify: async (engine) => {
+      const rows = await engine.executeRaw<{ exists: boolean }>(
+        `SELECT to_regclass('public.graph_reference_observations') IS NOT NULL AS exists`,
+      );
+      return rows[0]?.exists === true;
+    },
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

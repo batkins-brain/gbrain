@@ -321,7 +321,11 @@ describe('graph-integration harness', () => {
   test('--live-read-only requires --source and scopes SQL by source', async () => {
     const fixturePath = Bun.pathToFileURL('/tmp/tan610-fixture-live.jsonl').pathname;
     await Bun.write(fixturePath, FIXTURE);
-    const executeRaw = mock(async (sql: string, params: unknown[]) => {
+    const executeRaw = mock(async (sql: string, params: unknown[] = []) => {
+      if (sql.includes('to_regclass') && sql.includes('graph_reference_observations')) {
+        expect(params).toEqual([]);
+        return [{ exists: false }];
+      }
       expect(params).toEqual(['24-105']);
       if (sql.includes('FROM pages')) {
         expect(sql).toContain('WHERE p.source_id = $1');
@@ -330,6 +334,9 @@ describe('graph-integration harness', () => {
         return [
           { slug: 'source/24-105-root', type: 'source', title: '24-105 Root', source_id: '24-105', frontmatter: { source_id: 'stale-other-source', authority_state: 'active' } },
         ];
+      }
+      if (sql.includes('FROM graph_reference_observations')) {
+        return [];
       }
       expect(sql).toContain('WHERE fp.source_id = $1');
       expect(sql).toContain('fp.deleted_at IS NULL');
@@ -347,7 +354,8 @@ describe('graph-integration harness', () => {
     } finally {
       console.log = originalLog;
     }
-    expect(executeRaw).toHaveBeenCalledTimes(2);
+    // pages + links + observation-table existence probe (table absent → no observation SELECT)
+    expect(executeRaw).toHaveBeenCalledTimes(3);
     const report = JSON.parse(log.mock.calls.flat().join('\n'));
     expect(report.live_source_scope).toBe('24-105');
     expect(report.live_read_only.unresolved_targets).toBeNull();

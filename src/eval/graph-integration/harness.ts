@@ -57,15 +57,27 @@ export interface GraphGraphEdge extends GraphFixtureEdge {
   to_type?: GraphFixtureNode['type'];
 }
 
+export interface GraphObservationMetricOverrides {
+  unresolved_targets: number;
+  broken_references: number;
+  cross_source_ambiguity: number;
+}
+
 export interface GraphGraphSnapshot {
   nodes: GraphFixtureNode[];
   edges: GraphGraphEdge[];
   /**
    * Metrics that cannot be observed from this snapshot's backing store.
    * The persisted links table contains only resolved FK edges, so database
-   * snapshots mark unresolved/broken/ambiguity metrics as fixture-only.
+   * snapshots mark unresolved/broken/ambiguity metrics as fixture-only unless
+   * graph_reference_observations rows supply observationMetrics.
    */
   fixtureOnlyMetrics?: Array<keyof GraphMetricCounts>;
+  /**
+   * When present, promotes the three observation-backed metrics to numeric
+   * live values and removes them from fixture-only coverage.
+   */
+  observationMetrics?: GraphObservationMetricOverrides;
 }
 
 export interface GraphMetricCounts {
@@ -351,6 +363,14 @@ export function compareSnapshots(dryRun: GraphGraphSnapshot, live?: GraphGraphSn
   const liveCounts = live ? metricCounts(live) : null;
   const metrics = Object.keys(dry) as (keyof GraphMetricCounts)[];
   const fixtureOnly = new Set(live?.fixtureOnlyMetrics ?? []);
+  if (live?.observationMetrics && liveCounts) {
+    liveCounts.unresolved_targets = live.observationMetrics.unresolved_targets;
+    liveCounts.broken_references = live.observationMetrics.broken_references;
+    liveCounts.cross_source_ambiguity = live.observationMetrics.cross_source_ambiguity;
+    fixtureOnly.delete('unresolved_targets');
+    fixtureOnly.delete('broken_references');
+    fixtureOnly.delete('cross_source_ambiguity');
+  }
   const measured = hasLive ? metrics.filter(metric => !fixtureOnly.has(metric)) : [];
   const liveValues: GraphLiveMetricCounts | null = liveCounts
     ? Object.fromEntries(
@@ -370,10 +390,19 @@ export function compareSnapshots(dryRun: GraphGraphSnapshot, live?: GraphGraphSn
   if (!hasLive) {
     notes.push('fixture-only report: live-read-only comparison omitted by default; pass --live-read-only to compare against the engine');
   } else {
+    if (live?.observationMetrics) {
+      notes.push(
+        'observation-backed metrics measured from graph_reference_observations: '
+        + 'unresolved_targets, broken_references, cross_source_ambiguity',
+      );
+    }
     if (fixtureOnly.size > 0) {
       notes.push(
         `fixture-only metrics omitted from live comparison: ${[...fixtureOnly].join(', ')}; `
-        + 'the persisted links table contains only resolved, source-qualified foreign-key edges',
+        + 'the persisted links table contains only resolved, source-qualified foreign-key edges'
+        + (fixtureOnly.has('unresolved_targets')
+          ? '; load graph_reference_observations rows to measure unresolved/broken/ambiguity live'
+          : ''),
       );
     }
     if (!fixtureOnly.has('broken_references') && liveCounts!.broken_references > dry.broken_references) {
