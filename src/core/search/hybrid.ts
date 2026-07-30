@@ -1915,7 +1915,9 @@ export function filterResultsBySourceScope(
   results: SearchResult[],
   opts?: { sourceId?: string; sourceIds?: string[] },
 ): SearchResult[] {
-  if (opts?.sourceIds && opts.sourceIds.length > 0) {
+  // Explicit empty federated grant must fail closed (no rows), not widen.
+  if (Array.isArray(opts?.sourceIds)) {
+    if (opts.sourceIds.length === 0) return [];
     const allowed = new Set(opts.sourceIds);
     return results.filter(r => allowed.has(r.source_id ?? 'default'));
   }
@@ -1926,7 +1928,9 @@ export function filterResultsBySourceScope(
 }
 
 export function cacheScopeKey(opts?: { sourceId?: string; sourceIds?: string[] }): string {
-  if (opts?.sourceIds && opts.sourceIds.length > 0) {
+  // Explicit empty federated grant is not the scalar default brain.
+  if (Array.isArray(opts?.sourceIds)) {
+    if (opts.sourceIds.length === 0) return '__set__:';
     return '__set__:' + [...opts.sourceIds].sort().join(',');
   }
   return opts?.sourceId ?? 'default';

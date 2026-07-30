@@ -33,6 +33,11 @@ describe('cacheScopeKey', () => {
     const scalar = cacheScopeKey({ sourceId: 'host' });
     expect(set).not.toBe(scalar);
   });
+
+  test('empty sourceIds does not collapse to default', () => {
+    expect(cacheScopeKey({ sourceIds: [] })).toBe('__set__:');
+    expect(cacheScopeKey({ sourceIds: [] })).not.toBe('default');
+  });
 });
 
 function hit(source_id: string, slug: string) {
@@ -69,5 +74,10 @@ describe('filterResultsBySourceScope — TAN-576 cache-hit boundary', () => {
   test('unscoped leaves rows unchanged', () => {
     expect(filterResultsBySourceScope(rows, {})).toHaveLength(3);
     expect(filterResultsBySourceScope(rows, undefined)).toHaveLength(3);
+  });
+
+  test('empty federated sourceIds fails closed (no rows)', () => {
+    const filtered = filterResultsBySourceScope(rows, { sourceIds: [] });
+    expect(filtered).toEqual([]);
   });
 });
