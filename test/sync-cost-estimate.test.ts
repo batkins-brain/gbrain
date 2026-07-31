@@ -54,18 +54,20 @@ describe('estimateInlineNewTokens — ladder', () => {
     expect(r.changedSources).toBe(1);
   });
 
-  test('[D2A headline] HEAD==last_commit + current chunker + DIRTY tree → 0 (unchanged)', () => {
+  test('[D2A headline] HEAD==last_commit + current chunker + DIRTY tree → priced (attached working-tree changes count)', () => {
     writeFileSync(join(repo, 'topics/a.md'), 'body');
     const head = commitAll('base');
-    // Dirty the tree (untracked scratch + uncommitted edit) — attached sync
-    // imports nothing, so the estimate must be 0. This is the exact pre-fix
-    // false-fire shape.
+    // Dirty the tree (untracked scratch + uncommitted edit). Attached sync
+    // now reads the live working tree the same way a detached checkout does
+    // (capture writers leave real uncommitted documents in the canonical TF
+    // Brain checkout before review/publish), so this must price the same as
+    // the delta rung below, not report unchanged.
     writeFileSync(join(repo, 'scratch.tmp'), 'agent scratch');
     writeFileSync(join(repo, 'topics/a.md'), 'uncommitted edit');
     const r = estimateInlineNewTokens([src({ last_commit: head, chunker_version: CURRENT })], CURRENT);
-    expect(r.tokens).toBe(0);
-    expect(r.estimateKind).toBe('unchanged');
-    expect(r.unchangedSources).toBe(1);
+    expect(r.tokens).toBeGreaterThan(0);
+    expect(r.estimateKind).toBe('delta');
+    expect(r.changedSources).toBe(1);
   });
 
   test('first sync (last_commit null) → full-tree ceiling', () => {
