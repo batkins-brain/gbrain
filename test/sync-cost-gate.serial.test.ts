@@ -174,23 +174,21 @@ describe('v0.41.31 — sync --all cost gate wiring', () => {
     expect(stdout).toContain('"estimateKind":"unchanged"');
   }, 60_000);
 
-  test('headline regression: HEAD==last_commit + DIRTY untracked file → $0, no gate (the false-fire)', async () => {
-    // The exact pre-fix false-fire: a busy brain's working tree is never
-    // git-clean, but the commits are caught up. The OLD estimator priced the
-    // whole tree (158M-token phantom); the new one mirrors execution → $0.
+  test('headline regression: HEAD==last_commit + DIRTY tree → syncable Markdown is priced, scratch is ignored', async () => {
+    // Capture writers leave real Markdown pages uncommitted in the canonical
+    // worktree. The estimator and executor must price/import that page, while
+    // unrelated non-syncable scratch remains ignored.
     await runSources(engine, ['add', 'vault', '--path', repoPath, '--no-federated']);
     await engine.executeRaw(`UPDATE sources SET last_commit = $1, chunker_version = $2 WHERE id = 'vault'`, [headSha, String(CHUNKER_VERSION)]);
-    // Dirty the tree with an untracked non-syncable scratch file (agents/crons
-    // write constantly) — attached-HEAD sync never imports it.
     writeFileSync(join(repoPath, 'scratch.tmp'), 'uncommitted agent scratch');
-    writeFileSync(join(repoPath, 'topics/foo.md'), 'uncommitted edit, not staged');
+    writeFileSync(join(repoPath, 'topics/foo.md'), 'uncommitted capture page');
     await engine.setConfig('sync.cost_gate_min_usd', '0');
 
     const { exitCode, stdout } = await runSyncCaptured(['--all', '--serial', '--json', '--no-pull']);
 
     expect(exitCode).not.toBe(2);
-    expect(stdout).not.toContain('"gate":"auto_deferred_embeds"');
-    expect(stdout).toContain('"estimateKind":"unchanged"');
+    expect(stdout).toContain('"gate":"auto_deferred_embeds"');
+    expect(stdout).toContain('"estimateKind":"delta"');
   }, 60_000);
 
   test('spend.posture=tokenmax → proceeds inline, gate:posture_tokenmax (informational)', async () => {
