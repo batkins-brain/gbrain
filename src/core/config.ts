@@ -870,6 +870,10 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'models.chat',
   'models.eval.longmemeval',
   'facts.extraction_model',
+  // Life Chronicle automatic event extraction (v0.42.56.0).
+  // Registered here so the normal CLI path can enable the backstop without
+  // --force; the reader defaults absent/false values to disabled.
+  'auto_chronicle',
   // Dream cycle config
   'dream.synthesize.session_corpus_dir',
   'dream.synthesize.meeting_transcripts_dir',
