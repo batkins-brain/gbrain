@@ -78,6 +78,16 @@ describe('runChronicleExtract', () => {
     expect(day[0].page_slug).toBe('meetings/2026-06-18-sync'); // projection keyed to depth
     expect(day[0].event_slug?.startsWith('life/events/2026-06-18-')).toBe(true);
     expect(day[0].kind).toBe('commitment');
+
+    const eventSlug = day[0].event_slug!;
+    const eventPage = await engine.getPage(eventSlug, { sourceId: 'default' });
+    expect(eventPage).toBeTruthy();
+    expect(eventPage!.type).toBe('event');
+    expect(eventPage!.frontmatter?.captured_via).toBe('life-chronicle:auto');
+    const eventFm = eventPage!.frontmatter?.event as { when?: string; depth?: string } | undefined;
+    expect(eventFm?.when).toBe('2026-06-18T15:30:00Z');
+    expect(eventFm?.depth).toBe('meetings/2026-06-18-sync');
+    expect(eventPage!.compiled_truth).toContain('[[meetings/2026-06-18-sync]]');
   });
 
   test('is idempotent: running twice yields one event + one projection', async () => {
