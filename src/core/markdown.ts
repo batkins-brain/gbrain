@@ -634,6 +634,7 @@ function extractTags(frontmatter: Record<string, unknown>): string[] {
 // ---------------------------------------------------------------------------
 
 import { join } from 'node:path';
+import { resolveSlugPathOnDisk } from './slug-path.ts';
 
 /** Options for serializePageToMarkdown. */
 export interface SerializePageOpts {
@@ -699,7 +700,12 @@ export function resolvePageFilePath(
   slug: string,
   sourceId: string,
 ): string {
-  return sourceId === 'default'
-    ? join(brainDir, `${slug}.md`)
-    : join(brainDir, '.sources', sourceId, `${slug}.md`);
+  // Slugs are lowercased by construction, so the slug portion is resolved
+  // against the tree's real casing (see src/core/slug-path.ts). The
+  // `.sources/<source_id>/` prefix is gbrain-owned layout, not user content,
+  // so it keeps its literal spelling.
+  const root = sourceId === 'default'
+    ? brainDir
+    : join(brainDir, '.sources', sourceId);
+  return resolveSlugPathOnDisk(root, slug);
 }

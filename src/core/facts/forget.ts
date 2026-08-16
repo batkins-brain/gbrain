@@ -37,6 +37,7 @@ import { join } from 'node:path';
 
 import type { BrainEngine } from '../engine.ts';
 import { withFilePageLock } from '../page-lock.ts';
+import { resolveSlugPathOnDisk } from '../slug-path.ts';
 import { parseFactsFence, renderFactsTable, type ParsedFact } from '../facts-fence.ts';
 
 export interface ForgetFactResult {
@@ -133,7 +134,11 @@ export async function forgetFactInFence(
 
   const slug = row.source_markdown_slug!;
   const targetRowNum = row.row_num!;
-  const filePath = join(localPath, `${slug}.md`);
+  // Must mirror writeFactsToFence's resolution exactly: the fence this row
+  // was written into lives at the vault's real casing, not the lowercased
+  // slug's. Resolving differently here would miss the file and silently
+  // demote every forget to the legacy DB-only path.
+  const filePath = resolveSlugPathOnDisk(localPath, slug);
   const tmpPath = `${filePath}.tmp`;
 
   if (!existsSync(filePath)) {

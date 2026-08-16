@@ -26,6 +26,7 @@ import { dirname, join } from 'path';
 import { randomBytes } from 'crypto';
 import type { BrainEngine } from './engine.ts';
 import { serializePageToMarkdown, resolvePageFilePath } from './markdown.ts';
+import { resolveSlugPathOnDisk } from './slug-path.ts';
 import { isWriteTargetContained } from './path-confine.ts';
 import { withFilePageLock } from './page-lock.ts';
 import { preserveCanonicalFences } from './canonical-fences.ts';
@@ -98,7 +99,10 @@ export async function writePageThrough(
       if (!existsSync(sourceLocalPath) || !statSync(sourceLocalPath).isDirectory()) {
         return { written: false, skipped: 'repo_not_found' };
       }
-      filePath = join(sourceLocalPath, `${slug}.md`);
+      // Case-preserving: the slug is lowercased by construction, so joining
+      // it raw would shadow an existing differently-cased note (see
+      // src/core/slug-path.ts). Containment is still checked below.
+      filePath = resolveSlugPathOnDisk(sourceLocalPath, slug);
       writeRoot = sourceLocalPath;
     } else {
       const repoPath = await engine.getConfig('sync.repo_path');
