@@ -2,6 +2,30 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.57.0] - 2026-08-16
+
+**Facts now land in the note you meant, instead of a look-alike folder created next to it.** If your brain has folders with capital letters in them, gbrain could quietly write extracted facts into a second, all-lowercase copy of that folder that it made itself. Say your vault holds `00_INDEX/Home.md`. A fact meant for that note went to a new `00_index/home.md` instead. Your real note never changed, the new file was untracked so `git clean` would delete it, and nothing warned you. On a Mac or Windows brain the two names collide instead of splitting, which showed up as a sync conflict.
+
+Why it happened: a page's slug is always lowercase on purpose, because it is an identity, the way a URL slug is. The write path built a file path out of that identity, so the capitals were gone by the time it touched the disk. Now the write path checks what is actually on disk and uses the real spelling of each folder and file it finds. Nothing gets renamed or re-cased; only genuinely new folders are created with the plain lowercase name.
+
+### Fixed
+- **Fact write-back follows the real folders on disk.** `resolveSlugPathOnDisk` walks a slug one segment at a time and adopts the spelling already present, so `00_index/home` resolves onto `00_INDEX/Home.md`. Casing is matched per segment, so a path that mixes `20_WORKING`, `Historical_Ingestion`, and a genuinely lowercase `quarantined_sources` all resolves correctly. An exact match always wins; a single case-variant is adopted; anything ambiguous or missing keeps the literal name, which is the old behavior. It reads the directory rather than testing whether the lowercase path exists, because on Mac and Windows that test says yes when only the capitalized folder is there and hands back the wrong spelling. Path resolution never throws, so it can't be the reason a fact write fails.
+- **`gbrain forget` finds the same file the writer used.** The forget path resolves identically. Without that, every forget on a capitalized note would have quietly fallen back to the database-only path and left the fence in the file untouched.
+- **`put_page` and the dream-cycle reverse-render share the fix.** `resolvePageFilePath` and the write-through sink both route through the same resolver, so no write path can invent a lowercase twin.
+
+### To take advantage of v0.42.57.0
+`gbrain upgrade` is all that's needed. There's no migration and no config to set: the next fact write to a capitalized note goes to the right file on its own.
+
+If you want to check whether an older gbrain already left look-alike folders in your brain, this lists any two paths that differ only by capitalization:
+
+```bash
+cd <your brain repo>
+find . -path ./.git -prune -o -print | sed 's|^\./||' \
+  | awk '{l=tolower($0); if (seen[l]!="" && seen[l]!=$0) print seen[l]" <-> "$0; else seen[l]=$0}'
+```
+
+Anything it prints is a leftover from the old behavior. The facts in those files are also indexed in your database, so nothing is lost by folding the `## Facts` block back into the correctly-named note and deleting the stray one. Check `git status` first: the stray copies are usually untracked.
+
 ## [0.42.56.0] - 2026-07-02
 
 **Life Chronicle: gbrain gains a temporal spine. Meetings and transcripts project into a queryable timeline, entities carry a bi-temporal ontology (sourced, confidence-weighted properties that supersede over time), and a low-friction diary captures interiority — so an agent can reconstruct "what happened the week of X", answer "when did I last interact with Y", and see how an entity's role or stance changed, instead of re-deriving chronology from scratch every session.** Built entirely on existing primitives (pages, the `facts` table, `timeline_entries`) — no new datastore. Auto-emission is off by default; opt in per below.
