@@ -2,8 +2,34 @@
 
 All notable changes to GBrain will be documented in this file.
 
-## [0.42.60.0] - 2026-08-17
+## [0.42.61.0] - 2026-08-17
 
+**Write-through now asks whether it is allowed to write there, not just whether the path is inside the repo.** A source's `local_path` says where GBrain may READ and sync from. Until now it also, implicitly, said where GBrain may WRITE. Those are not the same question, and treating them as one meant a write-back could land anywhere inside a source tree — including folders whose owner considers them human-governed, and notes whose own frontmatter asks agents not to edit them.
+
+Containment is not authorization. A path can be safely inside the repo and still be somewhere nobody authorized a write.
+
+Sources now declare the much smaller subset they accept writes into, and write-through refuses everything else before it touches the filesystem.
+
+### Fixed
+- **Write-target authorization runs before any file mutation.** `authorizeWriteTarget` (`src/core/write-policy.ts`) is evaluated in `writePageThrough` ahead of the first `mkdir`, so a refused write creates no directories, no temp siblings, and leaves an existing target byte-identical. The existing containment check stays as defence in depth; it is no longer the only gate.
+- **Escape attempts are resolved, not string-matched.** The target is realpath-resolved against each configured root before comparison, so `..` segments, alternate separators, and symlinked intermediate directories cannot walk out of an authorized root. A configured root that is itself a symlink pointing outside the source is refused.
+
+### Added
+- **Per-source `write_roots`.** A list of repo-relative subtrees that accept write-through, stored in the existing `sources.config` JSONB — no second policy system. Absolute paths and `.`/`..` segments are rejected as misconfiguration rather than resolved.
+- **Distinct, machine-stable refusal codes** on `WriteThroughResult.skipped`: `write_policy_unset`, `write_policy_empty`, `write_root_malformed`, `write_root_escapes_source`, `target_outside_write_roots`. An empty list is deliberately different from an unset one — it records that someone chose to pin a source read-only.
+
+### Changed
+- **BREAKING for write-through: unset `write_roots` now denies.** This is deliberately the opposite of the usual "unset means unrestricted" default. An unconfigured source is one nobody has decided about yet, and the cost of guessing wrong is writing into someone's reviewed knowledge. Reads, search, retrieval, ingestion and `gbrain sync` are untouched.
+
+### To take advantage of v0.42.61.0
+`gbrain upgrade`, then declare the roots each source accepts writes into. Until you do, write-through is a no-op for that source and the DB remains the durable sink — nothing is lost, and the next sync reconciles.
+
+```bash
+gbrain sources list          # confirm which sources have a local_path
+```
+
+Set `write_roots` in the source's config to the subtrees you want writable — commonly just an inbox or capture directory, not the whole tree. If a write is refused, the result's `skipped` field names which check tripped.
+## [0.42.60.0] - 2026-08-17
 **When a sync refuses to delete, it now writes down why.** v0.42.59.0 added a floor guard so a full sync cannot wipe a source just because the file listing came back empty. That stopped the damage, but the refusal was only printed to the terminal, with no timestamp and nowhere on disk. If it fired overnight from a scheduled job, the reason it fired was gone by morning.
 
 A refusal is the interesting event. It means the conditions that would have caused data loss just happened, and were caught. That is exactly what you want a record of.

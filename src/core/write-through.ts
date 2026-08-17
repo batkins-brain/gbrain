@@ -28,6 +28,7 @@ import type { BrainEngine } from './engine.ts';
 import { serializePageToMarkdown, resolvePageFilePath } from './markdown.ts';
 import { resolveSlugPathOnDisk } from './slug-path.ts';
 import { isWriteTargetContained } from './path-confine.ts';
+import { authorizeWriteTarget, readWriteRoots, type WriteDenyReason } from './write-policy.ts';
 import { withFilePageLock } from './page-lock.ts';
 import { preserveCanonicalFences } from './canonical-fences.ts';
 
@@ -52,7 +53,7 @@ export interface WriteThroughResult {
    *   - path_escapes_source_root: the computed file path resolves outside the
    *     source's working tree (hostile slug row / symlinked subtree) — refused.
    */
-  skipped?: 'no_repo_configured' | 'repo_not_found' | 'source_repo_belongs_to_other_source' | 'page_not_found_after_write' | 'path_escapes_source_root';
+  skipped?: 'no_repo_configured' | 'repo_not_found' | 'source_repo_belongs_to_other_source' | 'page_not_found_after_write' | 'path_escapes_source_root' | WriteDenyReason;
   /** Set when the render/write/rename itself threw (EACCES, ENOTDIR, disk full). */
   error?: string;
 }
@@ -90,11 +91,12 @@ export async function writePageThrough(
     //      git repo (the reported bug). Skip instead.
     let filePath: string;
     let writeRoot: string;
-    const srcRows = await engine.executeRaw<{ local_path: string | null }>(
-      `SELECT local_path FROM sources WHERE id = $1`,
+    const srcRows = await engine.executeRaw<{ local_path: string | null; config: unknown }>(
+      `SELECT local_path, config FROM sources WHERE id = $1`,
       [sourceId],
     );
     const sourceLocalPath = srcRows[0]?.local_path ?? null;
+    const writeRoots = readWriteRoots(srcRows[0]?.config);
     if (sourceLocalPath) {
       if (!existsSync(sourceLocalPath) || !statSync(sourceLocalPath).isDirectory()) {
         return { written: false, skipped: 'repo_not_found' };
@@ -132,6 +134,19 @@ export async function writePageThrough(
     // under the source tree from escaping to an arbitrary filesystem location.
     if (!isWriteTargetContained(filePath, writeRoot)) {
       return { written: false, skipped: 'path_escapes_source_root' };
+    }
+
+    // #28: containment is not authorization. The check above proves only that
+    // the path stays inside the source tree, which is the READ/sync scope. A
+    // write additionally needs the target to sit under a root the operator
+    // explicitly authorized for writing. Evaluated here, before any mkdir or
+    // file write, and fail-closed: an unconfigured source writes nothing.
+    const authorization = authorizeWriteTarget(writeRoot, filePath, writeRoots);
+    if (!authorization.allowed) {
+      opts.logger?.warn?.(
+        `write-through refused for ${slug}: ${authorization.reason} — ${authorization.detail}`,
+      );
+      return { written: false, skipped: authorization.reason! };
     }
 
     return await withFilePageLock(filePath, async () => {

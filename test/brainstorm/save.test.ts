@@ -23,6 +23,7 @@ import {
   type SaveOutcome,
 } from '../../src/commands/brainstorm.ts';
 import { serializeMarkdown } from '../../src/core/markdown.ts';
+import { authorizeTestWriteRoots } from '../helpers/authorize-write-roots.ts';
 
 let engine: PGLiteEngine;
 let tmpRoot: string;
@@ -61,6 +62,7 @@ const sampleContent = () =>
 describe('persistSavedIdea', () => {
   test('both sinks: canonical DB import (chunks written) + file rendered from row', async () => {
     await engine.setConfig('sync.repo_path', brainDir);
+    await authorizeTestWriteRoots(engine);
     const slug = buildIdeaSlug('why X', 'lsd', 'nonce01');
     const o = await persistSavedIdea(engine, { slug, content: sampleContent(), provenanceVia: 'lsd' });
 
@@ -80,6 +82,7 @@ describe('persistSavedIdea', () => {
 
   test('no repo configured → DB canonical, writeThrough skipped, exit 0', async () => {
     await engine.setConfig('sync.repo_path', '');
+    await authorizeTestWriteRoots(engine);
     const slug = buildIdeaSlug('why Y', 'lsd', 'nonce02');
     const o = await persistSavedIdea(engine, { slug, content: sampleContent(), provenanceVia: 'lsd' });
 
@@ -109,6 +112,7 @@ describe('persistSavedIdea', () => {
 
   test('[REGRESSION] repo set but file write fails (ENOTDIR) → DB saved, exit 0, warns', async () => {
     await engine.setConfig('sync.repo_path', brainDir);
+    await authorizeTestWriteRoots(engine);
     fs.writeFileSync(path.join(brainDir, 'wiki'), 'blocker'); // blocks wiki/ideas/
     const slug = buildIdeaSlug('why W', 'lsd', 'nonce04'); // wiki/ideas/...-nonce04
     const o = await persistSavedIdea(engine, { slug, content: sampleContent(), provenanceVia: 'lsd' });

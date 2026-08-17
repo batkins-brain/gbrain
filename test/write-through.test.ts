@@ -66,9 +66,23 @@ function walkFiles(dir: string): string[] {
   return out;
 }
 
+/**
+ * #28: write-through now requires the source to declare `write_roots`; being
+ * inside the repo is no longer authorization. These tests exercise the write
+ * PATH, not the policy, so they declare the roots they use. Policy behavior
+ * itself is pinned in test/write-policy.test.ts.
+ */
+async function authorizeRoots(roots: string[], sourceId = 'default'): Promise<void> {
+  await engine.executeRaw(
+    `UPDATE sources SET config = $1::text::jsonb WHERE id = $2`,
+    [JSON.stringify({ write_roots: roots }), sourceId],
+  );
+}
+
 describe('writePageThrough', () => {
   test('writes the file rendered from the saved row; no .tmp leftover', async () => {
     await engine.setConfig('sync.repo_path', brainDir);
+    await authorizeRoots(['wiki', 'people', 'internal', '.sources']);
     const slug = 'wiki/ideas/2026-01-01-lsd-foo-abc123';
     await seedPage(slug);
 
@@ -98,6 +112,7 @@ describe('writePageThrough', () => {
 
   test('whole-page rendering preserves a newer canonical facts fence', async () => {
     await engine.setConfig('sync.repo_path', brainDir);
+    await authorizeRoots(['wiki', 'people', 'internal', '.sources']);
     const slug = 'people/alice';
     await seedPage(slug);
     const expectedPath = resolvePageFilePath(brainDir, slug, 'default');
@@ -117,6 +132,7 @@ describe('writePageThrough', () => {
 
   test('no sync.repo_path → skipped no_repo_configured', async () => {
     await engine.setConfig('sync.repo_path', '');
+    await authorizeRoots(['wiki', 'people', 'internal', '.sources']);
     const slug = 'wiki/ideas/x-1';
     await seedPage(slug);
     const res = await writePageThrough(engine, slug);
@@ -127,6 +143,7 @@ describe('writePageThrough', () => {
     const fileAsRepo = path.join(tmpRoot, 'not-a-dir');
     fs.writeFileSync(fileAsRepo, 'x');
     await engine.setConfig('sync.repo_path', fileAsRepo);
+    await authorizeRoots(['wiki', 'people', 'internal', '.sources']);
     const slug = 'wiki/ideas/x-2';
     await seedPage(slug);
     const res = await writePageThrough(engine, slug);
@@ -135,6 +152,7 @@ describe('writePageThrough', () => {
 
   test('row missing → skipped page_not_found_after_write', async () => {
     await engine.setConfig('sync.repo_path', brainDir);
+    await authorizeRoots(['wiki', 'people', 'internal', '.sources']);
     const res = await writePageThrough(engine, 'wiki/ideas/does-not-exist');
     expect(res).toEqual({ written: false, skipped: 'page_not_found_after_write' });
   });
@@ -151,6 +169,7 @@ describe('writePageThrough', () => {
     // while the default source (re-seeded by resetPgliteState) has no
     // local_path of its own.
     await engine.setConfig('sync.repo_path', siblingDir);
+    await authorizeRoots(['wiki', 'people', 'internal', '.sources']);
 
     const slug = 'internal/cross-cutting-note';
     await seedPage(slug); // sourceId 'default'
@@ -171,6 +190,7 @@ describe('writePageThrough', () => {
       `INSERT INTO sources (id, name, local_path, config) VALUES ('alpha', 'Alpha', $1, '{}'::jsonb)`,
       [alphaDir],
     );
+    await authorizeRoots(['notes'], 'alpha');
     // Must NOT be used — the assigned source has its own tree.
     await engine.setConfig('sync.repo_path', globalDir);
 
@@ -193,6 +213,7 @@ describe('writePageThrough', () => {
 
   test('[REGRESSION] mkdir ENOTDIR (parent is a file) → error, no partial .md, no .tmp', async () => {
     await engine.setConfig('sync.repo_path', brainDir);
+    await authorizeRoots(['wiki', 'people', 'internal', '.sources']);
     // Block the `wiki/` directory by putting a FILE named "wiki" under the repo,
     // so `mkdir -p <repo>/wiki/ideas` throws ENOTDIR deterministically.
     fs.writeFileSync(path.join(brainDir, 'wiki'), 'blocker');

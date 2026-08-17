@@ -16,6 +16,7 @@ import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import { resetPgliteState } from '../helpers/reset-pglite.ts';
 import matter from 'gray-matter';
 import { runCapture, __testing } from '../../src/commands/capture.ts';
+import { authorizeTestWriteRoots } from '../helpers/authorize-write-roots.ts';
 
 let engine: PGLiteEngine;
 let tmpRoot: string;
@@ -37,6 +38,7 @@ beforeEach(async () => {
   brainDir = path.join(tmpRoot, 'brain');
   fs.mkdirSync(brainDir, { recursive: true });
   await engine.setConfig('sync.repo_path', brainDir);
+    await authorizeTestWriteRoots(engine);
 });
 
 describe('capture — defaultSlug helper', () => {
