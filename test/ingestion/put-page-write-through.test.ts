@@ -16,6 +16,7 @@ import { resetPgliteState } from '../helpers/reset-pglite.ts';
 import { operations } from '../../src/core/operations.ts';
 import type { OperationContext } from '../../src/core/operations.ts';
 import { resetGateway } from '../../src/core/ai/gateway.ts';
+import { authorizeTestWriteRoots } from '../helpers/authorize-write-roots.ts';
 
 let engine: PGLiteEngine;
 let tmpRoot: string;
@@ -51,6 +52,7 @@ beforeEach(async () => {
   fs.mkdirSync(brainDir, { recursive: true });
   // Wire sync.repo_path so write-through can find the repo.
   await engine.setConfig('sync.repo_path', brainDir);
+    await authorizeTestWriteRoots(engine);
 });
 
 afterEach(() => {
@@ -186,6 +188,7 @@ describe('put_page write-through — config edge cases', () => {
 
   test('repo path points at a missing directory → skipped repo_not_found', async () => {
     await engine.setConfig('sync.repo_path', path.join(tmpRoot, 'does-not-exist'));
+    await authorizeTestWriteRoots(engine);
     const ctx = makeCtx();
     const result = (await putPage.handler(ctx, {
       slug: 'inbox/missing-repo',
@@ -202,6 +205,7 @@ describe('put_page write-through — multi-source filing', () => {
     await engine.executeRaw(
       "INSERT INTO sources (id, name) VALUES ('team-x', 'team-x')",
     );
+    await authorizeTestWriteRoots(engine, 'team-x');
     const ctx = makeCtx({ sourceId: 'team-x' });
     const result = (await putPage.handler(ctx, {
       slug: 'shared/page',
@@ -221,6 +225,7 @@ describe('put_page write-through — failure isolation', () => {
     const blockFile = path.join(tmpRoot, 'block');
     fs.writeFileSync(blockFile, 'i am a file, not a dir');
     await engine.setConfig('sync.repo_path', blockFile);
+    await authorizeTestWriteRoots(engine);
 
     const ctx = makeCtx();
     const result = (await putPage.handler(ctx, {
