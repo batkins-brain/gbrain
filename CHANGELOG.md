@@ -2,6 +2,33 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.60.0] - 2026-08-17
+
+**When a sync refuses to delete, it now writes down why.** v0.42.59.0 added a floor guard so a full sync cannot wipe a source just because the file listing came back empty. That stopped the damage, but the refusal was only printed to the terminal, with no timestamp and nowhere on disk. If it fired overnight from a scheduled job, the reason it fired was gone by morning.
+
+A refusal is the interesting event. It means the conditions that would have caused data loss just happened, and were caught. That is exactly what you want a record of.
+
+Each refusal now appends one line of JSON to `~/.gbrain/audit/reconcile-refusal-YYYY-Www.jsonl`, next to the stub-guard log that already lives there.
+
+### Added
+- **Reconcile refusals are recorded durably.** One JSONL line per refusal, carrying UTC timestamp, which guard tripped, source id, the working-tree path that was read and whether it still resolved, checkout HEAD and branch where available, the enumerated/file-backed/stale counts and ratio, pid and parent pid, hostname, sync strategy, and the invocation. ISO-week rotated, same convention as the existing audit logs.
+- **The invocation is rebuilt from an allow-list, not copied from argv.** Only recognized sync flags are kept; `--source`/`--strategy`/`--concurrency` keep their values only when those look like plain identifiers. Anything unrecognized is dropped rather than escaped, so a stray connection string or token in the command line cannot reach the log. No page content, no bind parameters, no environment dump.
+
+### Notes
+- Observability only. It runs after the guard has already decided, changes no thresholds, no reconcile decisions, and no source-enumeration or stale-page logic, and touches no database. `src/core/reconcile-floor.ts` is byte-identical to the previous release.
+- Best-effort by contract: an unwritable directory, a full disk, or an unavailable `git` warns on stderr and is otherwise ignored. An audit sink that could fail a sync would be a worse bug than the one it documents.
+
+### To take advantage of v0.42.60.0
+`gbrain upgrade`. Nothing to configure. If you want the log somewhere else, `GBRAIN_AUDIT_DIR` already relocates it along with the other audit logs.
+
+To check whether a refusal has happened:
+
+```bash
+cat ~/.gbrain/audit/reconcile-refusal-*.jsonl
+```
+
+An empty or absent file means the guard has never had to refuse, which is the expected state.
+
 ## [0.42.59.0] - 2026-08-17
 
 **A sync can no longer delete a whole source because it read an empty folder.** When `gbrain sync` does a full re-sync, it works out which pages to drop by listing the files on disk and removing any page whose file is no longer there. That is fine when a file was really deleted. It is not fine when the listing comes back empty for some other reason, because then every single page looks deleted. A missing mount, a half-finished checkout, a permissions hiccup, or a wrong path all look identical to "this repo is empty now", and the old behavior was to delete the entire source.
