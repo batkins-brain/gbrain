@@ -3,6 +3,7 @@ import { execFileSync } from 'child_process';
 import { join, relative } from 'path';
 import type { BrainEngine } from '../core/engine.ts';
 import { DELETE_BATCH_SIZE } from '../core/engine-constants.ts';
+import { assessReconcileSweep, type ReconcileRefusal } from '../core/reconcile-floor.ts';
 import { importFile } from '../core/import-file.ts';
 import { collectSyncableFiles } from './import.ts';
 import { createInterface } from 'readline';
@@ -191,6 +192,8 @@ export interface SyncResult {
   added: number;
   modified: number;
   deleted: number;
+  /** Set when the reconcile floor guard refused to delete (see reconcile-floor.ts). */
+  reconcileRefused?: ReconcileRefusal;
   renamed: number;
   chunksCreated: number;
   /** Pages re-embedded during this sync's auto-embed step. 0 if --no-embed or skipped. */
@@ -714,6 +717,13 @@ async function runInlineCostGate(
 
 export interface SyncOpts {
   repoPath?: string;
+  /**
+   * Override the full-sync reconcile floor guard (CLI --allow-bulk-delete).
+   * Required to delete when the working tree enumerated 0 files, or when the
+   * sweep would remove more than half of a source's file-backed pages.
+   * See src/core/reconcile-floor.ts for why absence is weak evidence.
+   */
+  allowBulkDelete?: boolean;
   dryRun?: boolean;
   full?: boolean;
   noPull?: boolean;
@@ -3128,6 +3138,8 @@ async function performFullSync(
   // Skipped on the legacy no-sourceId path (the batch delete primitives require
   // a sourceId; matches every other source-scoped feature).
   let reconciledDeletes = 0;
+  /** Set when the floor guard refused the sweep, so callers can surface it. */
+  let reconcileRefusal: ReconcileRefusal | null = null;
   if (opts.sourceId) {
     const sid = opts.sourceId;
     const reconcileSyncOpts = opts.strategy ? { strategy: opts.strategy } : undefined;
@@ -3148,7 +3160,27 @@ async function performFullSync(
         && isSyncable(r.source_path, reconcileSyncOpts)
         && !current.has(r.source_path))
       .map(r => r.slug);
-    if (staleSlugs.length > 0) {
+
+    // FLOOR GUARD (2026-08-17). Conditions 1-3 above pick WHICH pages are
+    // eligible; nothing bounded HOW MANY. An empty `current` — a missing mount,
+    // a half-checked-out tree, a wrong repoPath — made every file-backed page
+    // look stale, and the sweep deleted a production brain down to the 34 pages
+    // it structurally spares. Absence is weak evidence for deletion; refuse to
+    // act on it at scale unless a human passes --allow-bulk-delete.
+    const floor = assessReconcileSweep(
+      {
+        enumeratedCount: current.size,
+        fileBackedCount: rows.length,
+        staleCount: staleSlugs.length,
+      },
+      { allowBulkDelete: opts.allowBulkDelete },
+    );
+    if (!floor.allowed) {
+      slog(`  SKIPPED reconcile deletes — ${floor.message}`);
+      reconcileRefusal = floor.reason ?? null;
+    }
+
+    if (floor.allowed && staleSlugs.length > 0) {
       const deleteScopedOpts = { sourceId: sid };
       for (let i = 0; i < staleSlugs.length; i += DELETE_BATCH_SIZE) {
         const batch = staleSlugs.slice(i, i + DELETE_BATCH_SIZE);
@@ -3198,6 +3230,7 @@ async function performFullSync(
     added: result.imported,
     modified: 0,
     deleted: reconciledDeletes,
+    ...(reconcileRefusal ? { reconcileRefused: reconcileRefusal } : {}),
     renamed: 0,
     chunksCreated: result.chunksCreated,
     embedded,
@@ -3349,6 +3382,11 @@ Options:
                        PGLite is single-writer: stop 'gbrain serve' before a
                        large sync (see docs/architecture/serve-sync-concurrency.md).
                        GBRAIN_SYNC_TRACE=1 names the file being imported (hang triage).
+  --allow-bulk-delete  Permit the full-sync reconcile sweep to delete when the
+                       working tree enumerated 0 files, or when it would remove
+                       more than half a source's file-backed pages. Without it
+                       the sweep refuses and says so. Only pass this when the
+                       deletion is genuinely intended.
   --all                Sync every registered source instead of just the
                        default (multi-source brains).
   --parallel N         (with --all) Run up to N sources concurrently.
@@ -3386,6 +3424,9 @@ See also:
   const skipFailed = args.includes('--skip-failed');
   const retryFailed = args.includes('--retry-failed');
   const noSchemaPack = args.includes('--no-schema-pack'); // v0.41.37.0 #1569
+  // 2026-08-17: override the reconcile floor guard. Needed only when the
+  // deletion really is intended (you emptied the repo, or removed most of it).
+  const allowBulkDelete = args.includes('--allow-bulk-delete');
   const syncAll = args.includes('--all');
   const jsonOut = args.includes('--json');
   const yesFlag = args.includes('--yes');
@@ -3725,7 +3766,7 @@ See also:
         dryRun, full, noPull,
         noEmbed: effectiveNoEmbed,
         noExtract,
-        skipFailed, retryFailed, noSchemaPack,
+        skipFailed, retryFailed, noSchemaPack, allowBulkDelete,
         sourceId: src.id,
         strategy: cfg.strategy,
         concurrency,
@@ -3940,7 +3981,7 @@ See also:
   const singleSourceInterrupt = new AbortController();
   const onSingleSourceSigint = () => { try { singleSourceInterrupt.abort(new Error('SIGINT')); } catch { /* */ } };
   const opts: SyncOpts = {
-    repoPath, dryRun, full, noPull, noEmbed, noExtract, skipFailed, retryFailed, noSchemaPack, sourceId,
+    repoPath, dryRun, full, noPull, noEmbed, noExtract, skipFailed, retryFailed, noSchemaPack, allowBulkDelete, sourceId,
     strategy: strategyArg, concurrency,
     signal: composeAbortSignals(singleSourceInterrupt.signal, singleSourceController?.signal),
   };
@@ -4167,6 +4208,8 @@ export async function syncOneSource(
     noSchemaPack?: boolean;
     /** v0.42.7 #1696: propagate --no-extract into every per-source sync. */
     noExtract?: boolean;
+    /** 2026-08-17: propagate --allow-bulk-delete into every per-source sync. */
+    allowBulkDelete?: boolean;
   },
 ): Promise<{ result: SyncResult; log: string }> {
   const cfg = (src.config || {}) as { strategy?: 'markdown' | 'code' | 'auto' };
@@ -4181,6 +4224,7 @@ export async function syncOneSource(
     skipFailed: shared.skipFailed,
     retryFailed: shared.retryFailed,
     noSchemaPack: shared.noSchemaPack,
+    allowBulkDelete: shared.allowBulkDelete,
     sourceId: src.id,
     strategy: cfg.strategy,
     concurrency: shared.concurrency,
