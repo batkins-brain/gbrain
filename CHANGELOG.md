@@ -2,6 +2,35 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.59.0] - 2026-08-17
+
+**A sync can no longer delete a whole source because it read an empty folder.** When `gbrain sync` does a full re-sync, it works out which pages to drop by listing the files on disk and removing any page whose file is no longer there. That is fine when a file was really deleted. It is not fine when the listing comes back empty for some other reason, because then every single page looks deleted. A missing mount, a half-finished checkout, a permissions hiccup, or a wrong path all look identical to "this repo is empty now", and the old behavior was to delete the entire source.
+
+That is not hypothetical. On 2026-08-17 it emptied a brain here, 11,496 pages down to 34. The only survivors were the pages created directly rather than from a file, because those are the one kind the sweep never touches.
+
+The sweep now refuses to act on that kind of weak evidence. If the file listing is empty while the source still has file-backed pages, it stops and tells you. If it would remove more than half of a source's file-backed pages, it stops and tells you that too. Ordinary deletions, the case it exists for, are untouched.
+
+### Fixed
+- **The full-sync reconcile sweep has a floor.** `assessReconcileSweep` (`src/core/reconcile-floor.ts`) refuses the sweep when the working-tree enumeration returns 0 files while the source still has file-backed pages, and when the sweep would delete more than 50% of them. Sources under 10 file-backed pages are exempt from the percentage rule, where the ratio is noise rather than signal. The decision is a pure function over three counts, so the dangerous path is testable without a database, and the 2026-08-17 shape is pinned as a regression test.
+- **The refusal is loud and names the numbers.** Sync prints which check tripped, how many pages it would have deleted out of how many, and what to check (the source's `local_path` being present, mounted and fully checked out). `SyncResult.reconcileRefused` carries the reason for callers that consume the result.
+
+### Added
+- **`gbrain sync --allow-bulk-delete`** overrides both checks, for when the deletion really is intended. Unlike the test-database guard added in 0.42.57.0, an escape hatch is correct here: genuinely removing most of a repo is a real thing people do, and sync has to be able to follow. What must not happen is doing it silently, by default, on the strength of an empty directory read.
+
+### To take advantage of v0.42.59.0
+`gbrain upgrade`. There is no migration and nothing to configure; the next full sync is guarded automatically.
+
+If a sync now stops with a reconcile refusal, that is the guard doing its job. Check the source's checkout before overriding:
+
+```bash
+gbrain sources list          # confirm local_path for the source
+ls <local_path>              # confirm the files are actually there
+```
+
+If the files are genuinely gone and you do want the pages removed, re-run with `--allow-bulk-delete`.
+
+Note that the incremental (non-full) sync path is deliberately not gated by this. It deletes what git's diff reports as deleted, which is a positive statement from a source of truth rather than an inference from an empty read, and bounding it would refuse legitimate large commits.
+
 ## [0.42.58.0] - 2026-08-17
 
 **When a git pull fails during sync, gbrain now tells you why.** Every sync of a git-backed source printed the same line — `Warning: git pull failed: git pull failed in <path>: Command failed: git -C <path> -c http` — no matter what actually went wrong. Five sources failing for three unrelated reasons all looked identical, and looked transient. They were not.
