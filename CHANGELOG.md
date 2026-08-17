@@ -2,7 +2,7 @@
 
 All notable changes to GBrain will be documented in this file.
 
-## [0.42.60.0] - 2026-08-17
+## [0.42.61.0] - 2026-08-17
 
 **Write-through now asks whether it is allowed to write there, not just whether the path is inside the repo.** A source's `local_path` says where GBrain may READ and sync from. Until now it also, implicitly, said where GBrain may WRITE. Those are not the same question, and treating them as one meant a write-back could land anywhere inside a source tree — including folders whose owner considers them human-governed, and notes whose own frontmatter asks agents not to edit them.
 
@@ -21,7 +21,7 @@ Sources now declare the much smaller subset they accept writes into, and write-t
 ### Changed
 - **BREAKING for write-through: unset `write_roots` now denies.** This is deliberately the opposite of the usual "unset means unrestricted" default. An unconfigured source is one nobody has decided about yet, and the cost of guessing wrong is writing into someone's reviewed knowledge. Reads, search, retrieval, ingestion and `gbrain sync` are untouched.
 
-### To take advantage of v0.42.60.0
+### To take advantage of v0.42.61.0
 `gbrain upgrade`, then declare the roots each source accepts writes into. Until you do, write-through is a no-op for that source and the DB remains the durable sink — nothing is lost, and the next sync reconciles.
 
 ```bash
@@ -29,6 +29,31 @@ gbrain sources list          # confirm which sources have a local_path
 ```
 
 Set `write_roots` in the source's config to the subtrees you want writable — commonly just an inbox or capture directory, not the whole tree. If a write is refused, the result's `skipped` field names which check tripped.
+## [0.42.60.0] - 2026-08-17
+**When a sync refuses to delete, it now writes down why.** v0.42.59.0 added a floor guard so a full sync cannot wipe a source just because the file listing came back empty. That stopped the damage, but the refusal was only printed to the terminal, with no timestamp and nowhere on disk. If it fired overnight from a scheduled job, the reason it fired was gone by morning.
+
+A refusal is the interesting event. It means the conditions that would have caused data loss just happened, and were caught. That is exactly what you want a record of.
+
+Each refusal now appends one line of JSON to `~/.gbrain/audit/reconcile-refusal-YYYY-Www.jsonl`, next to the stub-guard log that already lives there.
+
+### Added
+- **Reconcile refusals are recorded durably.** One JSONL line per refusal, carrying UTC timestamp, which guard tripped, source id, the working-tree path that was read and whether it still resolved, checkout HEAD and branch where available, the enumerated/file-backed/stale counts and ratio, pid and parent pid, hostname, sync strategy, and the invocation. ISO-week rotated, same convention as the existing audit logs.
+- **The invocation is rebuilt from an allow-list, not copied from argv.** Only recognized sync flags are kept; `--source`/`--strategy`/`--concurrency` keep their values only when those look like plain identifiers. Anything unrecognized is dropped rather than escaped, so a stray connection string or token in the command line cannot reach the log. No page content, no bind parameters, no environment dump.
+
+### Notes
+- Observability only. It runs after the guard has already decided, changes no thresholds, no reconcile decisions, and no source-enumeration or stale-page logic, and touches no database. `src/core/reconcile-floor.ts` is byte-identical to the previous release.
+- Best-effort by contract: an unwritable directory, a full disk, or an unavailable `git` warns on stderr and is otherwise ignored. An audit sink that could fail a sync would be a worse bug than the one it documents.
+
+### To take advantage of v0.42.60.0
+`gbrain upgrade`. Nothing to configure. If you want the log somewhere else, `GBRAIN_AUDIT_DIR` already relocates it along with the other audit logs.
+
+To check whether a refusal has happened:
+
+```bash
+cat ~/.gbrain/audit/reconcile-refusal-*.jsonl
+```
+
+An empty or absent file means the guard has never had to refuse, which is the expected state.
 
 ## [0.42.59.0] - 2026-08-17
 

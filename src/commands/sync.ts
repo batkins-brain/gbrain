@@ -4,6 +4,7 @@ import { join, relative } from 'path';
 import type { BrainEngine } from '../core/engine.ts';
 import { DELETE_BATCH_SIZE } from '../core/engine-constants.ts';
 import { assessReconcileSweep, type ReconcileRefusal } from '../core/reconcile-floor.ts';
+import { logReconcileRefusal } from '../core/reconcile-refusal-audit.ts';
 import { importFile } from '../core/import-file.ts';
 import { collectSyncableFiles } from './import.ts';
 import { createInterface } from 'readline';
@@ -3178,6 +3179,22 @@ async function performFullSync(
     if (!floor.allowed) {
       slog(`  SKIPPED reconcile deletes — ${floor.message}`);
       reconcileRefusal = floor.reason ?? null;
+      // Observability only: the refusal has ALREADY been decided above. This
+      // records why, durably, because stdout is not a forensic sink and the
+      // conditions that produce a refusal are the open 2026-08-17 question.
+      // Best-effort by contract — it cannot throw and cannot change behaviour.
+      // Only record a reason the guard actually returned. Defaulting here
+      // would fabricate an attribution, which is worse than no record.
+      if (floor.reason) logReconcileRefusal({
+        reason: floor.reason,
+        sourceId: sid,
+        repoPath,
+        enumeratedCount: floor.enumeratedCount,
+        fileBackedCount: floor.fileBackedCount,
+        staleCount: floor.staleCount,
+        ratio: floor.ratio,
+        strategy: opts.strategy ?? null,
+      });
     }
 
     if (floor.allowed && staleSlugs.length > 0) {
