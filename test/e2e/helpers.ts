@@ -67,6 +67,57 @@ export function hasDatabase(): boolean {
 }
 
 /**
+ * A database name we are willing to destroy.
+ *
+ * setupDB() TRUNCATEs every table in ALL_TABLES with CASCADE. Until 2026-08-16
+ * the only thing standing between that and a production brain was
+ * `hasDatabase()`, which checks that DATABASE_URL is *set* and never which
+ * database it points at. On that date an e2e run against the host's live
+ * database emptied it: 0 pages, 0 chunks, 0 facts, 0 takes, and two leftover
+ * `e2e-timeout-*` sources as the fingerprint.
+ *
+ * Note that `.env.testing` cannot protect you either -- it is loaded with
+ * `if (!process.env[key])`, so an ambient DATABASE_URL takes precedence over
+ * the test config rather than being overridden by it.
+ */
+const TEST_DB_NAME = /(^|[_-])test([_-]|\d*$)/i;
+
+/** Split a connection URL into its non-secret parts. Never returns credentials. */
+export function describeDbTarget(url: string): { host: string; port: string; database: string } {
+  try {
+    const u = new URL(url);
+    return {
+      host: u.hostname || '(unknown)',
+      port: u.port || '5432',
+      database: decodeURIComponent(u.pathname.replace(/^\//, '')) || '(none)',
+    };
+  } catch {
+    return { host: '(unparseable)', port: '(unparseable)', database: '(unparseable)' };
+  }
+}
+
+/**
+ * Refuse to run destructive E2E setup against anything that is not obviously a
+ * test database. Throws with the target named -- host, port and database only,
+ * never the credentials.
+ */
+export function assertTestDatabase(url: string): void {
+  const { host, port, database } = describeDbTarget(url);
+  if (TEST_DB_NAME.test(database)) return;
+  throw new Error(
+    `Refusing to run E2E setup against database "${database}" at ${host}:${port}.\n` +
+      `setupDB() TRUNCATEs every table; this target does not look like a test database.\n` +
+      `The database name must match ${TEST_DB_NAME} (e.g. gbrain_test).\n` +
+      `Start a throwaway instance and point DATABASE_URL at it:\n` +
+      `  docker run -d --name gbrain-test-pg -e POSTGRES_USER=postgres \\\n` +
+      `    -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=gbrain_test \\\n` +
+      `    -p 5435:5432 pgvector/pgvector:pg16\n` +
+      `  DATABASE_URL=postgresql://postgres:postgres@localhost:5435/gbrain_test bun test\n` +
+      `There is deliberately no override flag: an escape hatch here is the defect.`,
+  );
+}
+
+/**
  * Connect to DB, run schema init, truncate all tables.
  * Call in beforeAll() of each test file.
  */
@@ -74,6 +125,10 @@ export async function setupDB(): Promise<PostgresEngine> {
   if (!DATABASE_URL) {
     throw new Error('DATABASE_URL not set. Copy .env.testing.example to .env.testing and configure it.');
   }
+
+  // Checked BEFORE connecting, so a wrong target is rejected without this
+  // process ever opening a session on it.
+  assertTestDatabase(DATABASE_URL);
 
   // Disconnect any prior connection (clean slate)
   await db.disconnect();
