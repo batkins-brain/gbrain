@@ -140,6 +140,33 @@ export class GitOperationError extends Error {
   }
 }
 
+/**
+ * Render the reason a git child process failed.
+ *
+ * execFileSync throws an Error whose `.message` is only "Command failed: <argv>"
+ * — the actual diagnosis ("no tracking information", "Diverging branches can't
+ * be fast-forwarded", "Permission denied") lands on `.stderr` and was being
+ * discarded. Sync consequently logged an unactionable, argv-truncated
+ * "git pull failed in <path>: Command failed: git -C <path> -c http" for every
+ * source, which hid two genuinely broken checkouts behind noise that looked
+ * transient.
+ *
+ * Credentials are redacted: a remote URL can carry user:token, and this string
+ * goes to logs.
+ */
+const GIT_CREDS_IN_URL = /:\/\/[^:/@\s]+:[^@/\s]+@/g;
+
+export function gitFailureDetail(e: unknown): string {
+  const err = e as { stderr?: Buffer | string; stdout?: Buffer | string; message?: string };
+  const decode = (v: Buffer | string | undefined): string =>
+    !v ? '' : (typeof v === 'string' ? v : v.toString('utf-8'));
+  const raw = (decode(err?.stderr) || decode(err?.stdout) || '').trim();
+  if (!raw) return err?.message ?? String(e);
+  const redacted = raw.replace(GIT_CREDS_IN_URL, '://***:***@');
+  const capped = redacted.length > 1200 ? `${redacted.slice(0, 1200)} ...[truncated]` : redacted;
+  return `${err?.message ?? ''}\n${capped}`.trim();
+}
+
 export const GIT_ENV = {
   // Confine to the gbrain SSRF model — no credential helpers, no SSH askpass,
   // no GUI prompts. Inherit PATH so git itself is findable.
@@ -208,7 +235,7 @@ export function cloneRepo(url: string, destDir: string, opts: CloneOpts = {}): v
   } catch (e) {
     throw new GitOperationError(
       'clone',
-      `git clone failed for ${url}: ${(e as Error).message}`,
+      `git clone failed for ${url}: ${gitFailureDetail(e)}`,
       e,
     );
   }
@@ -226,7 +253,7 @@ export function pullRepo(repoPath: string, opts: { timeoutMs?: number } = {}): v
   } catch (e) {
     throw new GitOperationError(
       'pull',
-      `git pull failed in ${repoPath}: ${(e as Error).message}`,
+      `git pull failed in ${repoPath}: ${gitFailureDetail(e)}`,
       e,
     );
   }
@@ -251,7 +278,7 @@ export function fetchRemote(repoPath: string, branch: string, opts: { timeoutMs?
   } catch (e) {
     throw new GitOperationError(
       'fetch',
-      `git fetch failed in ${repoPath}: ${(e as Error).message}`,
+      `git fetch failed in ${repoPath}: ${gitFailureDetail(e)}`,
       e,
     );
   }
@@ -361,7 +388,7 @@ function runGit(
     );
     return out.toString().trim();
   } catch (e) {
-    throw new GitOperationError(op, `git ${subcommand} failed in ${repoPath}: ${(e as Error).message}`, e);
+    throw new GitOperationError(op, `git ${subcommand} failed in ${repoPath}: ${gitFailureDetail(e)}`, e);
   }
 }
 

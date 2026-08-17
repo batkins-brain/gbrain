@@ -1667,7 +1667,11 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       if (msg.includes('non-fast-forward') || msg.includes('diverged')) {
         serr(`Warning: git pull failed (remote diverged). Syncing from local state.`);
       } else {
-        serr(`Warning: git pull failed: ${msg.slice(0, 100)}`);
+        // 100 chars was shorter than the message PREFIX ("git pull failed in
+        // <path>: Command failed: git -C <path> -c http"), so every pull failure
+        // rendered as an identical, unactionable stub and five sources looked
+        // like one transient fault. The reason git actually gave now survives.
+        serr(`Warning: git pull failed: ${msg.slice(0, 600)}`);
       }
     }
   }

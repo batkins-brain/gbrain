@@ -2,6 +2,18 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.58.0] - 2026-08-17
+
+**When a git pull fails during sync, gbrain now tells you why.** Every sync of a git-backed source printed the same line — `Warning: git pull failed: git pull failed in <path>: Command failed: git -C <path> -c http` — no matter what actually went wrong. Five sources failing for three unrelated reasons all looked identical, and looked transient. They were not.
+
+Two truncations stacked. `execFileSync` throws an error whose message is only `Command failed: <argv>`; the real diagnosis lands on stderr, which the clone/pull/fetch wrappers discarded. Then the sync warning applied a 100-character slice that was shorter than the message prefix, cutting off anything that had survived. The reason git gave you never reached your terminal.
+
+Now it does. The same command that printed the stub above prints `remote: Write access to repository not granted.` and `fatal: unable to access '...': The requested URL returned error: 403`. In the case that prompted this, that one line identified an ambient `GITHUB_TOKEN` shadowing a working `gh auth git-credential` helper — plus two checkouts that separately had no upstream and a diverged branch. None of it was visible before.
+
+### Fixed
+- **`gitFailureDetail(e)` renders the child process's stderr.** Prefers `stderr`, falls back to `stdout`, then the original message. Routed through all four `GitOperationError` sites (clone, pull, fetch, and the shared subcommand path) so no git failure can silently drop its reason again. Credentials embedded in an echoed remote URL are redacted to `://***:***@` because this string goes to logs, and the output is capped at 1200 characters so a pathological stderr can't flood a sync run.
+- **The sync pull warning no longer truncates below its own prefix.** `msg.slice(0, 100)` became `msg.slice(0, 600)`. The 100-character budget was shorter than the fixed prefix, so the variable part — the part that tells you what happened — was always the part discarded. The diverged-remote branch of that check is unchanged and still prints its own dedicated message.
+
 ## [0.42.57.0] - 2026-08-16
 
 **Facts now land in the note you meant, instead of a look-alike folder created next to it.** If your brain has folders with capital letters in them, gbrain could quietly write extracted facts into a second, all-lowercase copy of that folder that it made itself. Say your vault holds `00_INDEX/Home.md`. A fact meant for that note went to a new `00_index/home.md` instead. Your real note never changed, the new file was untracked so `git clean` would delete it, and nothing warned you. On a Mac or Windows brain the two names collide instead of splitting, which showed up as a sync conflict.
