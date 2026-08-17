@@ -38,6 +38,7 @@ import { join, dirname } from 'node:path';
 
 import type { BrainEngine, NewFact, FactVisibility } from '../engine.ts';
 import { withFilePageLock } from '../page-lock.ts';
+import { resolveSlugPathOnDisk } from '../slug-path.ts';
 import { gbrainPath } from '../config.ts';
 import { upsertFactRow, parseFactsFence } from '../facts-fence.ts';
 import { extractFactsFromFenceText } from './extract-from-fence.ts';
@@ -166,7 +167,11 @@ export async function writeFactsToFence(
     return { inserted: 0, ids: [] };
   }
 
-  const filePath = join(target.localPath, `${target.slug}.md`);
+  // Slugs are lowercased by construction (validateSlug / pathToSlug), so the
+  // path has to be resolved against the vault's ACTUAL directory + file
+  // casing. A naive join here writes `00_index/home.md` next to the real
+  // `00_INDEX/Home.md` — a shadow page whose facts never reach the note.
+  const filePath = resolveSlugPathOnDisk(target.localPath, target.slug);
   const tmpPath = `${filePath}.tmp`;
 
   return withFilePageLock(
