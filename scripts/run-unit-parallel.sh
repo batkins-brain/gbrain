@@ -13,8 +13,10 @@
 #
 # Env overrides:
 #   SHARDS=N                     same as --shards
-#   GBRAIN_TEST_SHARD_TIMEOUT    per-shard wallclock cap, seconds (default 600)
+#   GBRAIN_TEST_SHARD_TIMEOUT    per-shard wallclock cap, seconds (default 1500)
 #   GBRAIN_TEST_MAX_CONCURRENCY  passed through to bun test (default 4)
+#   GBRAIN_TEST_MEMORY_MB        virtual-memory cap per shard (default 4096;
+#                                Linux only; set to 0 to disable)
 #
 # Output files (workspace-local; falls back to /tmp if .context/ unwritable):
 #   .context/test-failures.log   failure blocks (cleared at start)
@@ -79,6 +81,11 @@ INTRA_CONC="${MAX_CONCURRENCY_OVERRIDE:-${GBRAIN_TEST_MAX_CONCURRENCY:-4}}"
 # 4-shard wallclock; real hangs still hit it. Override via
 # GBRAIN_TEST_SHARD_TIMEOUT=N.
 SHARD_TIMEOUT="${GBRAIN_TEST_SHARD_TIMEOUT:-1500}"
+# Four 4 GiB shard ceilings leave headroom for the host services that share
+# the developer/CI machine while still allowing a shard's PGLite + Bun
+# workload to complete. Set to 0 explicitly on platforms where the limit is
+# not desired; the cap is applied only on Linux.
+SHARD_MEMORY_MB="${GBRAIN_TEST_MEMORY_MB:-4096}"
 
 # ──────────────────────────────────────────────────────────────────────────
 # Output directories. Prefer workspace-local .context/, fall back to /tmp.
@@ -108,6 +115,24 @@ if command -v gtimeout >/dev/null 2>&1; then TIMEOUT_BIN="gtimeout"
 elif command -v timeout >/dev/null 2>&1; then TIMEOUT_BIN="timeout"
 fi
 
+# Run each shard in a bounded address space. The previous runner only had a
+# wall-clock timeout; a Bun process that ignored SIGTERM could therefore keep
+# consuming memory until the host became unusable. `ulimit -v` is deliberately
+# Linux-only: macOS does not provide a reliable equivalent here, and the
+# existing timeout fallback still protects that platform from hangs.
+run_bounded_shard() {
+  if [ "$(uname -s)" = "Linux" ] && [ "$SHARD_MEMORY_MB" -gt 0 ] 2>/dev/null; then
+    ulimit -v "$((SHARD_MEMORY_MB * 1024))" 2>/dev/null || true
+  fi
+  exec env SHARD="$1/$N" bash scripts/run-unit-shard.sh --max-concurrency="$INTRA_CONC"
+}
+run_bounded_serial() {
+  if [ "$(uname -s)" = "Linux" ] && [ "$SHARD_MEMORY_MB" -gt 0 ] 2>/dev/null; then
+    ulimit -v "$((SHARD_MEMORY_MB * 1024))" 2>/dev/null || true
+  fi
+  exec bash scripts/run-serial-tests.sh
+}
+
 START_TS=$(date +%s)
 echo "[unit-parallel] N=$N shards | --max-concurrency=$INTRA_CONC | timeout=${SHARD_TIMEOUT}s | logs=$LOG_DIR" >&2
 
@@ -129,14 +154,18 @@ for i in $(seq 1 "$N"); do
   (
     SHARD_LOG="$LOG_DIR/shard-$i.log"
     if [ -n "$TIMEOUT_BIN" ]; then
-      "$TIMEOUT_BIN" "${SHARD_TIMEOUT}s" \
-        env SHARD="$i/$N" \
-        bash scripts/run-unit-shard.sh --max-concurrency="$INTRA_CONC" \
+      "$TIMEOUT_BIN" --signal=TERM --kill-after=5s "${SHARD_TIMEOUT}s" \
+        bash -c 'run_bounded_shard() {
+          if [ "$(uname -s)" = "Linux" ] && [ "$2" -gt 0 ] 2>/dev/null; then
+            ulimit -v "$(( $2 * 1024 ))" 2>/dev/null || true
+          fi
+          exec env SHARD="$1/$3" bash scripts/run-unit-shard.sh --max-concurrency="$4"
+        }
+        run_bounded_shard "$@"' \
+        _ "$i" "$SHARD_MEMORY_MB" "$N" "$INTRA_CONC" \
         > "$SHARD_LOG" 2>&1
     else
-      env SHARD="$i/$N" \
-        bash scripts/run-unit-shard.sh --max-concurrency="$INTRA_CONC" \
-        > "$SHARD_LOG" 2>&1 &
+      run_bounded_shard "$i" > "$SHARD_LOG" 2>&1 &
       pid=$!
       ( sleep "$SHARD_TIMEOUT" && kill -TERM "$pid" 2>/dev/null && \
         sleep 5 && kill -KILL "$pid" 2>/dev/null ) &
@@ -374,7 +403,7 @@ SERIAL_FILES_COUNT=0
 SERIAL_FILES_COUNT=$(find test -name '*.serial.test.ts' -not -path 'test/e2e/*' 2>/dev/null | wc -l | tr -d ' ')
 if [ "$SERIAL_FILES_COUNT" -gt 0 ]; then
   echo "════════════ serial pass ($SERIAL_FILES_COUNT files) ════════════"
-  bash scripts/run-serial-tests.sh > "$LOG_DIR/serial.log" 2>&1
+  run_bounded_serial > "$LOG_DIR/serial.log" 2>&1
   SERIAL_RC=$?
   cat "$LOG_DIR/serial.log"
   if [ "$SERIAL_RC" != "0" ]; then
