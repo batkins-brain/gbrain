@@ -64,14 +64,12 @@ function unique<T>(items: T[]): T[] {
 }
 
 /**
- * Working-tree manifest for a DETACHED HEAD (relocated from sync.ts:557 so the
- * estimator can price detached sources identically to how the executor imports
- * them). On a detached HEAD, sync syncs from the live working tree: tracked
- * changes (`git diff --name-status -M HEAD`) PLUS untracked files (`ls-files
- * --others --exclude-standard`). Attached HEADs never call this — their
- * incremental path imports ONLY the commit diff (untracked/dirty files are not
- * imported), which is why the estimator must not price dirty files on an
- * attached repo (issue #2139 phantom-cost class).
+ * Working-tree manifest (relocated from sync.ts:557 so the estimator and
+ * executor use the same rules). Sync reads the live working tree for both
+ * attached and detached heads: tracked changes (`git diff --name-status -M
+ * HEAD`) plus untracked files (`ls-files --others --exclude-standard`). This
+ * is required for the canonical TF Brain checkout, where capture writers leave
+ * documents uncommitted until the human review/publish step.
  */
 export function buildDetachedWorkingTreeManifest(
   repoPath: string,

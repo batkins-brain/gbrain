@@ -423,22 +423,20 @@ export function estimateInlineNewTokens(
     // Rung 3: caught up to the fetch target AND no detached working-tree changes.
     // Mirrors the executor's `up_to_date` predicate — a dirty-but-committed-current
     // tree imports nothing, so it must price $0 (the heart of the false-fire fix).
-    const detachedManifest = resolved.detached
-      ? buildDetachedWorkingTreeManifest(localPath)
-      : null;
-    const detachedHasChanges = detachedManifest !== null &&
-      (detachedManifest.added.length > 0 ||
-        detachedManifest.modified.length > 0 ||
-        detachedManifest.deleted.length > 0 ||
-        detachedManifest.renamed.length > 0);
-    if (src.last_commit === resolved.target && !detachedHasChanges) {
+    const workingTreeManifest = buildDetachedWorkingTreeManifest(localPath);
+    const workingTreeHasChanges =
+      workingTreeManifest.added.length > 0 ||
+      workingTreeManifest.modified.length > 0 ||
+      workingTreeManifest.deleted.length > 0 ||
+      workingTreeManifest.renamed.length > 0;
+    if (src.last_commit === resolved.target && !workingTreeHasChanges) {
       unchangedSources++;
       continue;
     }
 
     // Rung 5/6: the delta itself — SAME helper the executor diffs with.
     const delta = computeSyncDelta(localPath, src.last_commit, resolved.target, {
-      detachedManifest,
+      detachedManifest: workingTreeManifest,
     });
     if (delta.status === 'unavailable') {
       ceiling(localPath, strategy, 'git_unavailable');
@@ -1800,14 +1798,17 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   const currentVersion = String(CHUNKER_VERSION);
   const versionMismatch = storedVersion !== null && storedVersion !== currentVersion;
   const versionNeverSet = storedVersion === null && opts.sourceId !== undefined;
-  const detachedWorkingTreeManifest = detachedHead ? buildDetachedWorkingTreeManifest(repoPath) : null;
-  const hasDetachedWorkingTreeChanges = detachedWorkingTreeManifest !== null &&
-    (detachedWorkingTreeManifest.added.length > 0 ||
-      detachedWorkingTreeManifest.modified.length > 0 ||
-      detachedWorkingTreeManifest.deleted.length > 0 ||
-      detachedWorkingTreeManifest.renamed.length > 0);
+  // Capture writers leave newly written documents in the attached canonical
+  // worktree before review/publish. Include that live delta in the same
+  // up-to-date gate and manifest used for import.
+  const workingTreeManifest = buildDetachedWorkingTreeManifest(repoPath);
+  const hasWorkingTreeChanges =
+    workingTreeManifest.added.length > 0 ||
+    workingTreeManifest.modified.length > 0 ||
+    workingTreeManifest.deleted.length > 0 ||
+    workingTreeManifest.renamed.length > 0;
 
-  if (lastCommit === headCommit && !versionMismatch && !versionNeverSet && !hasDetachedWorkingTreeChanges) {
+  if (lastCommit === headCommit && !versionMismatch && !versionNeverSet && !hasWorkingTreeChanges) {
     // TAN-607 / false-fresh: a verified no-op sync must still bookmark
     // last_sync_at. Doctor lag and operator freshness read last_sync_at;
     // fanout "fresh" previously used last_full_cycle_at only. Without this
@@ -1861,7 +1862,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   // `unavailable`, fall back to the authoritative full reconcile instead of
   // throwing — a slow correct reconcile beats a hard error or a silent walk.
   const delta = computeSyncDelta(repoPath, lastCommit, pin, {
-    detachedManifest: detachedWorkingTreeManifest,
+    detachedManifest: workingTreeManifest,
   });
   if (delta.status === 'unavailable') {
     serr(
